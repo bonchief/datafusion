@@ -14,9 +14,9 @@ use super::metrics::ExecutionPlanMetricsSet;
 use super::metrics::{BaselineMetrics, SplitMetrics};
 use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use crate::displayable;
-use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::{Result, exec_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
@@ -731,12 +731,13 @@ impl RecordBatchStream for BatchSplitStream {
 
 /// A stream that holds a memory reservation for its lifetime,
 /// shrinking the reservation as batches are consumed.
-/// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
+/// The reservation must cover the batches as a [`RecordBatchMemoryCounter`] counts them in order.
 /// On error, the reservation is *NOT* freed, until the stream is dropped.
 pub(crate) struct ReservationStream {
     schema: SchemaRef,
     inner: SendableRecordBatchStream,
     reservation: MemoryReservation,
+    counter: RecordBatchMemoryCounter,
 }
 
 impl ReservationStream {
@@ -749,6 +750,7 @@ impl ReservationStream {
             schema,
             inner,
             reservation,
+            counter: RecordBatchMemoryCounter::new(),
         }
     }
 }
@@ -766,8 +768,8 @@ impl Stream for ReservationStream {
             Poll::Ready(res) => {
                 match res {
                     Some(Ok(batch)) => {
-                        self.reservation
-                            .shrink(get_record_batch_memory_size(&batch));
+                        let size = self.counter.count_batch(&batch);
+                        self.reservation.shrink(size);
                         Poll::Ready(Some(Ok(batch)))
                     }
                     Some(Err(err)) => Poll::Ready(Some(Err(err))),
@@ -799,6 +801,7 @@ impl RecordBatchStream for ReservationStream {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::spill::get_record_batch_memory_size;
     use crate::test::exec::{
         BlockingExec, MockExec, PanicExec, assert_strong_count_converges_to_zero,
     };

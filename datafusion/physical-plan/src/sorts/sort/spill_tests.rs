@@ -530,8 +530,8 @@ async fn test_chunked_string_view_spill_can_use_workspace() -> Result<()> {
     check_chunked_string_view_workspace(true).await
 }
 
-/// Prepared runs retain their workspace loans until merging starts. Looking
-/// ahead during the merge returns enough workspace for its batch and cursors.
+/// Prepared runs charge the string buffers their chunks share once, so they
+/// borrow none of the merge workspace, and the merge completes within it.
 async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
     let batch_size = 1024;
     let values: ArrayRef = Arc::new(StringViewArray::from_iter_values(
@@ -588,9 +588,9 @@ async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
     })
     .await
     .expect("sort jobs must finish before merging");
-    // Temporarily borrow the unused workspace: both runs hold their full loans,
-    // leaving only the extra batch. Dropping the temporary returns it immediately.
-    assert_eq!(sorter.merge_pool.borrow(usize::MAX).size(), first_bytes);
+    // Temporarily borrow the unused workspace: no run took a loan, so all of
+    // it is free. Dropping the temporary returns it immediately.
+    assert_eq!(sorter.merge_pool.borrow(usize::MAX).size(), workspace);
     if consume_output {
         let output: Vec<RecordBatch> = stream.try_collect().await?;
         let expected = sort_batch(
@@ -1111,94 +1111,4 @@ async fn test_final_spilled_merge_releases_unused_workspace_multithreaded() -> R
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_final_spilled_merge_retains_workspace_between_passes() -> Result<()> {
     check_final_spilled_merge_releases_unused_workspace(true).await
-}
-
-#[tokio::test]
-async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result<()> {
-    let options = ExecutionOptions::default();
-    let rows = 4096;
-    let batch_size = 1024;
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "key",
-        DataType::Utf8View,
-        false,
-    )]));
-    let values: ArrayRef = Arc::new(StringViewArray::from_iter_values(
-        (0..rows)
-            .rev()
-            .map(|i| format!("row-{i:08}-{}", "x".repeat(87))),
-    ));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])?;
-    let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(Column::new(
-        "key", 0,
-    )))]
-    .into();
-    let input_bytes = get_reserved_bytes_for_record_batch(&batch)?;
-    let expected = sort_batch_chunked(&batch, &ordering, batch_size)?;
-    let sorted_bytes = expected
-        .iter()
-        .map(get_record_batch_memory_size)
-        .sum::<usize>();
-    let first_bytes = get_record_batch_memory_size(&expected[0]);
-    assert!(sorted_bytes > input_bytes);
-    let initial_loan = sorted_bytes - input_bytes;
-    assert!(initial_loan <= options.sort_spill_reservation_bytes);
-    assert!(
-        initial_loan > first_bytes,
-        "cancellation must leave a positive workspace loan"
-    );
-    let remaining_loan = initial_loan - first_bytes;
-
-    let capacity = options.sort_spill_reservation_bytes + input_bytes;
-    let pool = AdjustablePool::new(capacity);
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
-        .build_arc()?;
-    let mut sorter = ExternalSorter::new(
-        0,
-        Arc::clone(&schema),
-        ordering,
-        batch_size,
-        options.sort_spill_reservation_bytes,
-        options.sort_in_place_threshold_bytes,
-        options.spill_compression,
-        &ExecutionPlanMetricsSet::new(),
-        Arc::clone(&runtime),
-    )?;
-    sorter.insert_batch(batch).await?;
-    assert_eq!(pool.reserved(), capacity);
-
-    // Follow spill preparation through the one-input branch, retaining the
-    // workspace but assigning it no merge cursors.
-    sorter.merge_reservation.free();
-    let merge_pool = Arc::clone(&sorter.merge_pool);
-    assert_eq!(sorter.in_mem_batches.len(), 1);
-    let mut stream = sorter.in_mem_sort_stream(false, false).await?;
-    assert!(sorter.in_mem_batches.is_empty());
-    drop(sorter);
-
-    let first_batch = stream
-        .try_next()
-        .await?
-        .expect("the sorted stream must produce a batch");
-    assert_eq!(first_batch, expected[0]);
-    assert_eq!(first_batch.num_rows(), batch_size);
-    assert_eq!(pool.reserved(), capacity);
-
-    // Check actual loan accounting rather than inferring a loan from the input
-    // type. Only the workspace not held by the remaining output is available.
-    let unused_workspace = merge_pool.borrow(usize::MAX);
-    assert_eq!(
-        unused_workspace.size(),
-        options.sort_spill_reservation_bytes - remaining_loan
-    );
-    drop(unused_workspace);
-    drop(merge_pool);
-    assert_eq!(pool.reserved(), capacity);
-
-    // The stream is the remaining owner of the positive loan. Drop it without
-    // consuming the remaining batches and require both reservations to retire.
-    drop(stream);
-    assert_released(&pool, &runtime).await;
-    Ok(())
 }
