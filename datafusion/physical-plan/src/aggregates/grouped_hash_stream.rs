@@ -1277,6 +1277,7 @@ impl GroupedHashAggregateStream {
                 self.spill_state.spills.push(SortedSpillFile {
                     file: spillfile,
                     max_record_batch_memory,
+                    shared_dictionary_bytes: 0,
                 })
             }
             None => {

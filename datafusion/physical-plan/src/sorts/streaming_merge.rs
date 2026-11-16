@@ -52,6 +52,11 @@ pub struct SortedSpillFile {
 
     /// how much memory the largest memory batch is taking
     pub max_record_batch_memory: usize,
+
+    /// The bytes of `max_record_batch_memory` that are dictionary values shared by every
+    /// batch of the file, or 0. A reader holds them once for the file, so a merge
+    /// reserves them once, not once for each batch that it buffers.
+    pub shared_dictionary_bytes: usize,
 }
 
 impl std::fmt::Debug for SortedSpillFile {
@@ -380,6 +385,7 @@ mod tests {
                 .map(RecordBatch::get_array_memory_size)
                 .max()
                 .unwrap(),
+            shared_dictionary_bytes: 0,
         };
         let sorted_spill_files = vec![spill(&wide), spill(&narrow)];
         let merged = StreamingMergeBuilder::new()
@@ -505,6 +511,7 @@ mod tests {
             sorted_spill_files.push(SortedSpillFile {
                 file,
                 max_record_batch_memory: batch.get_array_memory_size(),
+                shared_dictionary_bytes: 0,
             });
         }
 

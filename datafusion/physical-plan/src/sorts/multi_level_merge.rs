@@ -320,6 +320,7 @@ impl MultiLevelMergeBuilder {
                 SortedSpillFile {
                     file: spill_file,
                     max_record_batch_memory,
+                    shared_dictionary_bytes: 0,
                 },
                 batch_size_limit,
             ));
@@ -609,11 +610,16 @@ impl MultiLevelMergeBuilder {
                 break;
             }
 
+            let shared = spill
+                .shared_dictionary_bytes
+                .min(spill.max_record_batch_memory);
+            let own = spill.max_record_batch_memory - shared;
             let per_spill = get_reserved_bytes_for_record_batch_size(
-                spill.max_record_batch_memory,
+                own,
                 // Size will be the same as the sliced size, bc it is a spilled batch.
-                spill.max_record_batch_memory,
-            ) * buffer_len;
+                own,
+            ) * buffer_len
+                + shared;
             total_needed += per_spill;
 
             // If a run cannot shrink, allow only the minimum merge without
@@ -872,6 +878,7 @@ impl MultiLevelMergeBuilder {
             SortedSpillFile {
                 file,
                 max_record_batch_memory: new_max,
+                shared_dictionary_bytes: 0,
             },
             new_batch_size_limit,
         ));
@@ -997,7 +1004,9 @@ mod tests {
 
     use crate::expressions::PhysicalSortExpr;
     use crate::spill::spill_manager::GetSlicedSize;
-    use arrow::array::{AsArray, Int64Array};
+    use arrow::array::{
+        ArrayRef, AsArray, DictionaryArray, Int32Array, Int64Array, StringArray,
+    };
     use arrow::compute::concat_batches;
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion_execution::memory_pool::{
@@ -1047,6 +1056,7 @@ mod tests {
         SortedSpillFile {
             file,
             max_record_batch_memory,
+            shared_dictionary_bytes: 0,
         }
     }
 
@@ -1178,6 +1188,7 @@ mod tests {
             files.push(SortedSpillFile {
                 file,
                 max_record_batch_memory,
+                shared_dictionary_bytes: 0,
             });
         }
         let small = files[0].max_record_batch_memory;
@@ -1362,6 +1373,84 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// Every batch of a bounded spill file keeps all the values of a dictionary that the
+    /// batches share, and the reader holds those values once for the file. The merge
+    /// reserves them once for each run. Two runs then fit in a pool that is too small
+    /// when the values count once for each buffered batch, so no run is re-spilled.
+    #[tokio::test]
+    async fn shared_dictionary_is_reserved_once_per_run() -> Result<()> {
+        let env = Arc::new(RuntimeEnv::default());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let spill_manager = Arc::new(
+            build_spill_manager(&env, &schema).with_max_batch_bytes(Some(64 * 1024)),
+        );
+        // Each run has four batches of 1024 rows over the same 64 values of 16 KiB.
+        let run = |offset: i64| -> Result<SortedSpillFile> {
+            let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+                (0..64).map(|v| format!("{offset}{v:04}{}", "x".repeat(16 * 1024))),
+            ));
+            let mut file = spill_manager.create_in_progress_file("test input run")?;
+            let mut max_record_batch_memory = 0;
+            for b in 0..4 {
+                let x = Int64Array::from_iter_values(
+                    (0..1024).map(|r| (b * 1024 + r) * 2 + offset),
+                );
+                let keys = Int32Array::from_iter_values((0..1024).map(|r| r % 64));
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(x),
+                        Arc::new(DictionaryArray::new(keys, Arc::clone(&values))),
+                    ],
+                )?;
+                max_record_batch_memory =
+                    max_record_batch_memory.max(file.append_batch(&batch)?);
+            }
+            let shared_dictionary_bytes = file.shared_dictionary_bytes();
+            Ok(SortedSpillFile {
+                file: file.finish()?.expect("the run has rows"),
+                max_record_batch_memory,
+                shared_dictionary_bytes,
+            })
+        };
+        let runs = vec![run(0)?, run(1)?];
+        let values_size = runs[0].shared_dictionary_bytes;
+        assert!(values_size >= 64 * 16 * 1024);
+        let m = runs[0].max_record_batch_memory;
+        assert!(m < values_size + 64 * 1024);
+
+        // Counting the values for each buffered batch, the smallest merge of the two
+        // runs needs `2 * 2 * m`. Counting them once for each run, it needs about half.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(3 * m));
+        let spilled_rows = spill_manager.metrics.spilled_rows.clone();
+        let builder = build_merge_builder(
+            Arc::unwrap_or_clone(spill_manager),
+            Arc::clone(&schema),
+            runs,
+            &pool,
+            1024,
+        );
+        let batches: Vec<RecordBatch> = builder
+            .create_spillable_merge_stream()
+            .try_collect()
+            .await?;
+
+        let merged = concat_batches(&schema, &batches)?;
+        let expected = Int64Array::from_iter_values(0..8192);
+        assert_eq!(merged.column(0).as_primitive::<Int64Type>(), &expected);
+        // Only the two input runs were written.
+        assert_eq!(spilled_rows.value(), 8192);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 
@@ -1562,6 +1651,7 @@ mod tests {
                     Ok(SortedSpillFile {
                         file,
                         max_record_batch_memory,
+                        shared_dictionary_bytes: 0,
                     })
                 })
                 .collect()
@@ -1651,6 +1741,7 @@ mod tests {
                     Ok(SortedSpillFile {
                         file,
                         max_record_batch_memory,
+                        shared_dictionary_bytes: 0,
                     })
                 })
                 .collect()
@@ -1872,6 +1963,7 @@ mod tests {
                         .disk_manager
                         .create_tmp_file(&format!("spill fan-in test {idx}"))?,
                     max_record_batch_memory: 1,
+                    shared_dictionary_bytes: 0,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
