@@ -19,7 +19,7 @@ use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::{Result, exec_err};
 use hashbrown::hash_table::HashTable;
 use std::fmt::Debug;
-use std::mem;
+use std::mem::{self, MaybeUninit};
 use std::sync::Arc;
 
 const BYTE_VIEW_STARTING_BLOCK_SIZE: usize = 8 * 1024;
@@ -123,7 +123,8 @@ impl ArrowBytesViewSet {
 ///
 /// A map starts in hashbrown's table, probed one row at a time. A map whose
 /// table outgrows one core's share of L2 ([`l2_cache_bytes`]) moves,
-/// once, at the start of the next batch, to [`Table`]: a SwissTable-style
+/// once, at the start of the next batch or when a reservation alone outgrows
+/// it, to [`Table`]: a SwissTable-style
 /// table of our own whose probe can prefetch the memory a later row's probe
 /// reads, which hashbrown cannot since it exposes no addresses. It stays there
 /// until [`Self::take`] or [`Self::clear_and_release`];
@@ -231,6 +232,13 @@ where
     pub fn reserve_groups(&mut self, capacity: usize) {
         if self.block_size == 0 && capacity != 0 {
             self.block_size = BYTE_VIEW_STARTING_BLOCK_SIZE;
+        }
+        // A reservation that alone outgrows the gate goes to the prefetched
+        // table now, rather than sizing hashbrown's table only to copy it.
+        if self.table.is_none()
+            && buckets_for(capacity) * (size_of::<Entry<V>>() + 1) > l2_cache_bytes()
+        {
+            self.table = Some(Box::new(Table::from_hashbrown(&mem::take(&mut self.map))));
         }
         match &mut self.table {
             Some(table) => table.reserve(capacity),
@@ -879,7 +887,7 @@ where
             + self.table.as_ref().map_or(0, |table| {
                 size_of::<Table<V>>()
                     + table.ctrl.allocated_size()
-                    + table.entries.allocated_size()
+                    + table.entries.len() * size_of::<Entry<V>>()
             })
     }
 
@@ -970,17 +978,19 @@ where
 /// stops at the first group with an empty bucket; a new key goes into the
 /// first empty bucket its probe meets. At most seven eighths of the buckets
 /// are full, nothing is removed but by [`Self::clear`], and `items` counts the
-/// full buckets. An entry whose control byte is empty holds no key and is
-/// never compared. Growth places each entry again from the hash it holds,
-/// without reading or hashing a key.
+/// full buckets. An entry is written exactly when its control byte becomes
+/// full, and read only where the control byte is full, so a new table, like
+/// hashbrown's, writes one byte per bucket rather than a whole entry. Growth
+/// places each entry again from the hash it holds, without reading or hashing
+/// a key.
 struct Table<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
     /// One control byte per bucket and a copy of the first [`GROUP`]
     ctrl: Vec<u8>,
-    /// One entry per bucket, meaningful only where `ctrl` is full
-    entries: Vec<Entry<V>>,
+    /// One entry per bucket, initialised where `ctrl` is full
+    entries: Box<[MaybeUninit<Entry<V>>]>,
     /// Full buckets: the distinct non-null keys
     items: usize,
 }
@@ -993,7 +1003,7 @@ where
     fn from_hashbrown(map: &HashTable<Entry<V>>) -> Self {
         let mut table = Self {
             ctrl: Vec::new(),
-            entries: Vec::new(),
+            entries: Box::new_uninit_slice(0),
             items: 0,
         };
         table.resize(buckets_for(map.capacity().max(map.len())));
@@ -1038,7 +1048,9 @@ where
             let mut hits = match_tag(group, tag);
             while hits != 0 {
                 let bucket = (pos + (hits.trailing_zeros() / 8) as usize) & mask;
-                let entry = &self.entries[bucket];
+                // SAFETY: the bucket's control byte equals a tag, which is
+                // below EMPTY, so the bucket is full and its entry written.
+                let entry = unsafe { self.entries[bucket].assume_init_ref() };
                 if eq(entry) {
                     return Ok(entry.payload);
                 }
@@ -1067,7 +1079,7 @@ where
     #[inline(always)]
     fn put(&mut self, bucket: usize, entry: Entry<V>) {
         self.set_ctrl(bucket, tag(entry.hash));
-        self.entries[bucket] = entry;
+        self.entries[bucket].write(entry);
         self.items += 1;
     }
 
@@ -1094,11 +1106,13 @@ where
             return;
         }
         self.ctrl = vec![EMPTY; buckets + GROUP];
-        self.entries = vec![Entry::default(); buckets];
+        self.entries = Box::new_uninit_slice(buckets);
         for (byte, entry) in ctrl.iter().zip(&entries) {
             if byte & EMPTY == 0 {
+                // SAFETY: the control byte is full, so the entry was written.
+                let entry = unsafe { entry.assume_init_read() };
                 let bucket = self.vacant(entry.hash);
-                self.entries[bucket] = *entry;
+                self.entries[bucket].write(entry);
                 self.set_ctrl(bucket, *byte);
             }
         }
@@ -1144,7 +1158,9 @@ where
         }
         let bucket = (home + (hits.trailing_zeros() / 8) as usize) & mask;
         prefetch(self.entries.as_ptr().wrapping_add(bucket));
-        self.entries.get(bucket)
+        // SAFETY: the bucket's control byte equals a tag, which is below
+        // EMPTY, so the bucket is full and its entry written.
+        Some(unsafe { self.entries[bucket].assume_init_ref() })
     }
 }
 
