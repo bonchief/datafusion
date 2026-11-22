@@ -5,10 +5,11 @@
 //! [`ArrowBytesViewMap`] and [`ArrowBytesViewSet`] for storing maps/sets of values from
 //! `StringViewArray`/`BinaryViewArray`.
 use crate::binary_map::{OutputType, single_null_buffer};
+use crate::prefetch::{DISTANCE, l2_cache_bytes, prefetch};
 use arrow::array::cast::AsArray;
 use arrow::array::{
-    Array, ArrayRef, BinaryViewArray, BinaryViewBuilder, ByteView, StringViewBuilder,
-    make_view,
+    Array, ArrayRef, BinaryViewArray, BinaryViewBuilder, ByteView, GenericByteViewArray,
+    StringViewBuilder, make_view,
 };
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
@@ -116,14 +117,53 @@ impl ArrowBytesViewSet {
 /// This map is used by the special `COUNT DISTINCT` aggregate function to
 /// store the distinct values, and by the `GROUP BY` operator to store
 /// group values when they are a single string array.
+///
+/// # Layout and invariants
+///
+/// Each distinct non-null key has an index: its position in `views`, which is
+/// the order it was first seen. `views`, `hashes` and `payloads` all have one
+/// element per index. The NULL key, if seen, also takes an index (so it is
+/// emitted in its place), with hash 0 and a default payload there; its real
+/// payload is in `null`, and no slot names it.
+///
+/// `slots` is an open-addressed table with linear probing. Its length is zero
+/// or a power of two, and at most three quarters of it is occupied, so every
+/// probe ends at an empty slot. A slot is zero (empty) or `tag | (index + 1)`:
+/// the top 16 bits of the key's hash, and the index in the low 48 bits (an
+/// index cannot reach 2^48 − 1, since `views` would then hold 4 PiB). A key's
+/// probe starts at `hash & (len − 1)`. Every distinct non-null key is in
+/// exactly one slot, and `items` counts them.
+///
+/// A key matches a slot when the tag, then the stored view's length, then (for
+/// a key longer than 12 bytes) its 4-byte prefix and finally its bytes are
+/// equal; a key of 12 bytes or fewer is wholly inside its view, so the views
+/// are compared instead. Because the hash is kept in `hashes`, growth places
+/// every index again without reading or hashing a key.
+///
+/// # Staged probe
+///
+/// Probing one row at a time takes up to three dependent cache misses per row:
+/// the slot, the stored view (and payload), and the stored key bytes. When a
+/// batch is longer than `3 * DISTANCE` rows and the bytes a probe touches
+/// (slots, views, payloads and key bytes) exceed the core's L2 cache, the batch
+/// is probed in stages instead: while row `i` is looked up, the slot of row
+/// `i + 3D` is prefetched, the view and payload that row `i + 2D`'s tag selects
+/// are prefetched, and the key bytes of row `i + D`'s candidate are prefetched
+/// when its length and prefix already match, so the misses of different rows
+/// overlap. The earlier stages only prefetch; every lookup, insert and payload
+/// call still happens for row `i` in row order, exactly as on the plain path.
+/// Results, payloads, group order and memory use are therefore identical on
+/// both paths.
 pub struct ArrowBytesViewMap<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
     /// Should the output be StringView or BinaryView?
     output_type: OutputType,
-    /// Underlying hash set for each distinct value
-    map: hashbrown::hash_table::HashTable<Entry<V>>,
+    /// Open-addressed table of `tag | (index + 1)`, see the type docs
+    slots: Vec<u64>,
+    /// Number of occupied slots: the distinct non-null keys
+    items: usize,
     /// Hash table capacity to re-create the map with in [`Self::take`], so a
     /// map built with [`Self::with_capacity`] keeps its pre-allocation when it
     /// is emptied and reused
@@ -131,6 +171,10 @@ where
 
     /// Views for all stored values (in insertion order)
     views: Vec<u128>,
+    /// Hash of the key at each index, read only to place the keys on growth
+    hashes: Vec<u64>,
+    /// Payload of the key at each index
+    payloads: Vec<V>,
     /// In-progress buffer for out-of-line string data
     in_progress: Vec<u8>,
     /// Completed buffers containing string data
@@ -177,9 +221,12 @@ where
     pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
         Self {
             output_type,
-            map: hashbrown::hash_table::HashTable::with_capacity(map_capacity),
+            slots: vec![EMPTY; slots_for(map_capacity)],
+            items: 0,
             initial_map_capacity: map_capacity,
             views: Vec::new(),
+            hashes: Vec::new(),
+            payloads: Vec::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
             block_size: if map_capacity == 0 {
@@ -198,10 +245,14 @@ where
         if self.block_size == 0 && capacity != 0 {
             self.block_size = BYTE_VIEW_STARTING_BLOCK_SIZE;
         }
-        self.map
-            .reserve(capacity.saturating_sub(self.map.len()), |entry| entry.hash);
-        self.views
-            .reserve_exact(capacity.saturating_sub(self.views.len()));
+        let slots = slots_for(capacity);
+        if slots > self.slots.len() {
+            self.resize(slots);
+        }
+        let more = capacity.saturating_sub(self.views.len());
+        self.views.reserve_exact(more);
+        self.hashes.reserve_exact(more);
+        self.payloads.reserve_exact(more);
         self.hashes_buffer
             .reserve_exact(capacity.saturating_sub(self.hashes_buffer.len()));
     }
@@ -211,8 +262,12 @@ where
     pub fn take_with_capacity(&mut self, capacity: usize) -> ArrayRef {
         let mut outgoing = Self::new(self.output_type);
         mem::swap(self, &mut outgoing);
-        mem::swap(&mut self.map, &mut outgoing.map);
-        self.map.clear();
+        mem::swap(&mut self.slots, &mut outgoing.slots);
+        self.slots.fill(EMPTY);
+        mem::swap(&mut self.hashes, &mut outgoing.hashes);
+        self.hashes.clear();
+        mem::swap(&mut self.payloads, &mut outgoing.payloads);
+        self.payloads.clear();
         mem::swap(&mut self.hashes_buffer, &mut outgoing.hashes_buffer);
         self.hashes_buffer.clear();
         self.initial_map_capacity = outgoing.initial_map_capacity;
@@ -280,12 +335,28 @@ where
         MP: FnMut(Option<&[u8]>) -> V,
         OP: FnMut(V),
     {
+        self.insert(values, None, make_payload_fn, observe_payload_fn)
+    }
+
+    /// [`Self::insert_if_new`], probing in stages when `staged` says so, or
+    /// when it is `None` and the staged probe pays (see the type docs)
+    fn insert<MP, OP>(
+        &mut self,
+        values: &ArrayRef,
+        staged: Option<bool>,
+        make_payload_fn: MP,
+        observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+    {
         // Sanity check array type
         match self.output_type {
             OutputType::BinaryView => {
                 assert!(matches!(values.data_type(), DataType::BinaryView));
                 self.insert_if_new_inner::<MP, OP, BinaryViewType>(
                     values,
+                    staged,
                     make_payload_fn,
                     observe_payload_fn,
                 )
@@ -294,6 +365,7 @@ where
                 assert!(matches!(values.data_type(), DataType::Utf8View));
                 self.insert_if_new_inner::<MP, OP, StringViewType>(
                     values,
+                    staged,
                     make_payload_fn,
                     observe_payload_fn,
                 )
@@ -313,6 +385,7 @@ where
     fn insert_if_new_inner<MP, OP, B>(
         &mut self,
         values: &ArrayRef,
+        staged: Option<bool>,
         mut make_payload_fn: MP,
         mut observe_payload_fn: OP,
     ) where
@@ -321,10 +394,10 @@ where
         B: ByteViewType,
     {
         // step 1: compute hashes
-        let batch_hashes = &mut self.hashes_buffer;
-        batch_hashes.clear();
-        batch_hashes.resize(values.len(), 0);
-        create_hashes([values], &self.random_state, batch_hashes)
+        let mut hashes = mem::take(&mut self.hashes_buffer);
+        hashes.clear();
+        hashes.resize(values.len(), 0);
+        create_hashes([values], &self.random_state, &mut hashes)
             // hash is supported for all types and create_hashes only
             // returns errors for unsupported types
             .unwrap();
@@ -332,113 +405,291 @@ where
         // step 2: insert each value into the set, if not already present
         let values = values.as_byte_view::<B>();
 
-        // Get raw views buffer for direct comparison
-        let input_views = values.views();
-
         // Ensure lengths are equivalent
-        assert_eq!(values.len(), self.hashes_buffer.len());
+        assert_eq!(values.len(), hashes.len());
 
-        for i in 0..values.len() {
-            let view_u128 = input_views[i];
-            let hash = self.hashes_buffer[i];
-
-            // handle null value via validity bitmap check
-            if values.is_null(i) {
-                let payload = if let Some(&(payload, _offset)) = self.null.as_ref() {
-                    payload
-                } else {
-                    let payload = make_payload_fn(None);
-                    let null_index = self.views.len();
-                    self.views.push(0);
-                    self.null = Some((payload, null_index));
-                    payload
-                };
-                observe_payload_fn(payload);
-                continue;
+        let staged = staged.unwrap_or_else(|| self.stage_pays(values.len()));
+        if staged {
+            let views = values.views();
+            for (i, &hash) in hashes.iter().enumerate() {
+                if let Some(&ahead) = hashes.get(i + 3 * DISTANCE) {
+                    self.prefetch_slot(ahead);
+                }
+                if let Some(&ahead) = hashes.get(i + 2 * DISTANCE) {
+                    self.prefetch_entry(ahead);
+                }
+                if let Some(&ahead) = hashes.get(i + DISTANCE) {
+                    self.prefetch_key(ahead, views[i + DISTANCE]);
+                }
+                self.insert_row(
+                    values,
+                    i,
+                    hash,
+                    &mut make_payload_fn,
+                    &mut observe_payload_fn,
+                );
             }
+        } else {
+            for (i, &hash) in hashes.iter().enumerate() {
+                self.insert_row(
+                    values,
+                    i,
+                    hash,
+                    &mut make_payload_fn,
+                    &mut observe_payload_fn,
+                );
+            }
+        }
+        self.hashes_buffer = hashes;
+    }
 
-            // Extract length from the view (first 4 bytes of u128 in little-endian)
-            let len = view_u128 as u32;
-
-            // Check if value already exists
-            let maybe_payload = {
-                // Borrow completed and in_progress for comparison
-                let completed = &self.completed;
-                let in_progress = &self.in_progress;
-
-                self.map
-                    .find(hash, |header| {
-                        if header.hash != hash || header.view as u32 != len {
-                            return false;
-                        }
-
-                        // Fast path: inline strings can be compared directly
-                        if len <= 12 {
-                            return header.view == view_u128;
-                        }
-
-                        // For larger strings: first compare the 4-byte prefix
-                        let stored_prefix = (header.view >> 32) as u32;
-                        let input_prefix = (view_u128 >> 32) as u32;
-                        if stored_prefix != input_prefix {
-                            return false;
-                        }
-
-                        // Prefix matched - compare full bytes
-                        let byte_view = ByteView::from(header.view);
-                        let stored_len = byte_view.length as usize;
-                        let buffer_index = byte_view.buffer_index as usize;
-                        let offset = byte_view.offset as usize;
-
-                        let stored_value = if buffer_index < completed.len() {
-                            &completed[buffer_index].as_slice()
-                                [offset..offset + stored_len]
-                        } else {
-                            &in_progress[offset..offset + stored_len]
-                        };
-                        let input_value: &[u8] = values.value(i).as_ref();
-                        stored_value == input_value
-                    })
-                    .map(|entry| entry.payload)
-            };
-
-            let payload = if let Some(payload) = maybe_payload {
+    /// Looks up row `i` of `values` and inserts it if it is new: the one step
+    /// both the plain and the staged probe take for every row, in row order.
+    #[inline(always)]
+    fn insert_row<MP, OP, B>(
+        &mut self,
+        values: &GenericByteViewArray<B>,
+        i: usize,
+        hash: u64,
+        make_payload_fn: &mut MP,
+        observe_payload_fn: &mut OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+        B: ByteViewType,
+    {
+        // handle null value via validity bitmap check
+        if values.is_null(i) {
+            let payload = if let Some(&(payload, _offset)) = self.null.as_ref() {
                 payload
             } else {
-                // no existing value, make a new one
-                let (new_view, payload) = if len <= 12 {
-                    // Inline path: bytes are already packed in view_u128.
-                    // The inline ByteView format is [len:u32 LE][data:12 bytes zero-padded],
-                    // so extracting bytes from the u128 avoids a round-trip through
-                    // values.value(i) (which reads the views buffer and returns the same slice).
-                    let view_bytes = view_u128.to_le_bytes();
-                    let value = &view_bytes[4..4 + len as usize];
-                    let payload = make_payload_fn(Some(value));
-                    // For inline strings, the stored view is identical to the input view:
-                    // make_view(value, 0, 0) produces the same u128 as view_u128.
-                    //
-                    // SAFETY: view_u128 was a valid view, and the enclosing `len <= 12`
-                    // ensures it is inline
-                    let new_view = unsafe { self.append_inline_view(view_u128) };
-                    (new_view, payload)
-                } else {
-                    let value: &[u8] = values.value(i).as_ref();
-                    let payload = make_payload_fn(Some(value));
-                    let new_view = self.append_value(value);
-                    (new_view, payload)
-                };
-
-                let new_header = Entry {
-                    view: new_view,
-                    hash,
-                    payload,
-                };
-
-                self.map.insert_unique(hash, new_header, |h| h.hash);
+                let payload = make_payload_fn(None);
+                let null_index = self.views.len();
+                self.views.push(0);
+                self.hashes.push(0);
+                self.payloads.push(V::default());
+                self.null = Some((payload, null_index));
                 payload
             };
             observe_payload_fn(payload);
+            return;
         }
+
+        let view = values.views()[i];
+        // Extract length from the view (first 4 bytes of u128 in little-endian)
+        let len = view as u32;
+        let value: &[u8] = if len <= 12 {
+            &[]
+        } else {
+            values.value(i).as_ref()
+        };
+
+        let payload = match self.find(hash, view, value) {
+            Ok(index) => self.payloads[index],
+            Err(vacant) => {
+                let slot = if self.items < max_items(self.slots.len()) {
+                    vacant
+                } else {
+                    self.resize(slots_for(self.items + 1));
+                    self.vacant(hash)
+                };
+                let index = self.views.len();
+                let payload = if len <= 12 {
+                    // Inline path: bytes are already packed in view.
+                    // The inline ByteView format is [len:u32 LE][data:12 bytes zero-padded],
+                    // so extracting bytes from the u128 avoids a round-trip through
+                    // values.value(i) (which reads the views buffer and returns the same slice).
+                    let view_bytes = view.to_le_bytes();
+                    let payload = make_payload_fn(Some(&view_bytes[4..4 + len as usize]));
+                    // For inline strings, the stored view is identical to the input view:
+                    // make_view(value, 0, 0) produces the same u128 as view.
+                    //
+                    // SAFETY: view was a valid view, and the enclosing `len <= 12`
+                    // ensures it is inline
+                    unsafe { self.append_inline_view(view) };
+                    payload
+                } else {
+                    let payload = make_payload_fn(Some(value));
+                    self.append_value(value);
+                    payload
+                };
+                self.hashes.push(hash);
+                self.payloads.push(payload);
+                self.slots[slot] = slot_of(hash, index);
+                self.items += 1;
+                payload
+            }
+        };
+        observe_payload_fn(payload);
+    }
+
+    /// Finds the index of the key with `hash`, input `view` and, when it is
+    /// longer than 12 bytes, bytes `value`; or, if it is absent, the empty slot
+    /// its probe ended at. With no slots the position is meaningless, and the
+    /// caller grows the table before it inserts.
+    #[inline(always)]
+    fn find(&self, hash: u64, view: u128, value: &[u8]) -> Result<usize, usize> {
+        if self.slots.is_empty() {
+            return Err(0);
+        }
+        let mask = self.slots.len() - 1;
+        let tag = tag(hash);
+        let mut pos = hash as usize & mask;
+        loop {
+            let slot = self.slots[pos];
+            if slot == EMPTY {
+                return Err(pos);
+            }
+            if slot & !INDEX_MASK == tag {
+                let index = index_of(slot);
+                if self.matches(self.views[index], view, value) {
+                    return Ok(index);
+                }
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    /// Whether the key stored with view `stored` is the input key with `view`
+    /// and, for a key longer than 12 bytes, bytes `value`.
+    #[inline(always)]
+    fn matches(&self, stored: u128, view: u128, value: &[u8]) -> bool {
+        let len = view as u32;
+        if stored as u32 != len {
+            return false;
+        }
+        // Fast path: inline strings can be compared directly
+        if len <= 12 {
+            return stored == view;
+        }
+        // For larger strings: first compare the 4-byte prefix
+        if (stored >> 32) as u32 != (view >> 32) as u32 {
+            return false;
+        }
+        // Prefix matched - compare full bytes
+        self.stored_value(stored) == value
+    }
+
+    /// The bytes of a stored view longer than 12 bytes.
+    fn stored_value(&self, stored: u128) -> &[u8] {
+        let byte_view = ByteView::from(stored);
+        let len = byte_view.length as usize;
+        let buffer_index = byte_view.buffer_index as usize;
+        let offset = byte_view.offset as usize;
+        if buffer_index < self.completed.len() {
+            &self.completed[buffer_index].as_slice()[offset..offset + len]
+        } else {
+            &self.in_progress[offset..offset + len]
+        }
+    }
+
+    /// The first empty slot of `hash`'s probe. The table has a slot and room.
+    fn vacant(&self, hash: u64) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut pos = hash as usize & mask;
+        while self.slots[pos] != EMPTY {
+            pos = (pos + 1) & mask;
+        }
+        pos
+    }
+
+    /// Replaces the table with `len` slots, a power of two that holds every
+    /// key, and places each key again from its stored hash, in index order.
+    fn resize(&mut self, len: usize) {
+        let mut slots = vec![EMPTY; len];
+        let mask = len - 1;
+        let null = self.null.map(|(_, index)| index);
+        for (index, &hash) in self.hashes.iter().enumerate() {
+            if Some(index) == null {
+                continue;
+            }
+            let mut pos = hash as usize & mask;
+            while slots[pos] != EMPTY {
+                pos = (pos + 1) & mask;
+            }
+            slots[pos] = slot_of(hash, index);
+        }
+        self.slots = slots;
+    }
+
+    /// Whether a batch of `rows` should take the staged probe: it has rows
+    /// beyond the look-ahead, and the memory a probe reads is larger than L2.
+    fn stage_pays(&self, rows: usize) -> bool {
+        if rows <= 3 * DISTANCE {
+            return false;
+        }
+        let keys = self.in_progress.len()
+            + self.completed.iter().map(Buffer::len).sum::<usize>();
+        let probed = self.slots.len() * size_of::<u64>()
+            + self.views.len() * size_of::<u128>()
+            + self.payloads.len() * size_of::<V>()
+            + keys;
+        probed > l2_cache_bytes()
+    }
+
+    /// Staged probe, first stage: prefetch the home slot of `hash`.
+    #[inline(always)]
+    fn prefetch_slot(&self, hash: u64) {
+        if !self.slots.is_empty() {
+            let pos = hash as usize & (self.slots.len() - 1);
+            prefetch(self.slots.as_ptr().wrapping_add(pos));
+        }
+    }
+
+    /// The index named by the first slot matching `hash`'s tag within
+    /// [`HINT_SLOTS`] of its home, for the prefetching stages. It is only a
+    /// guess: the lookup of the row decides.
+    #[inline(always)]
+    fn candidate(&self, hash: u64) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let tag = tag(hash);
+        let home = hash as usize & mask;
+        (0..HINT_SLOTS)
+            .map(|step| self.slots[(home + step) & mask])
+            .take_while(|slot| *slot != EMPTY)
+            .find(|slot| slot & !INDEX_MASK == tag)
+            .map(index_of)
+    }
+
+    /// Staged probe, second stage: prefetch the view and payload that the
+    /// slot matching `hash`'s tag names.
+    #[inline(always)]
+    fn prefetch_entry(&self, hash: u64) {
+        if let Some(index) = self.candidate(hash) {
+            prefetch(self.views.as_ptr().wrapping_add(index));
+            if size_of::<V>() != 0 {
+                prefetch(self.payloads.as_ptr().wrapping_add(index));
+            }
+        }
+    }
+
+    /// Staged probe, third stage: when the candidate for an input key longer
+    /// than 12 bytes has its length and prefix, prefetch the stored bytes the
+    /// lookup will compare: the first and the last line they occupy.
+    #[inline(always)]
+    fn prefetch_key(&self, hash: u64, view: u128) {
+        let len = view as u32;
+        if len <= 12 {
+            return;
+        }
+        let Some(index) = self.candidate(hash) else {
+            return;
+        };
+        let stored = self.views[index];
+        if stored as u32 != len || (stored >> 32) as u32 != (view >> 32) as u32 {
+            return;
+        }
+        let byte_view = ByteView::from(stored);
+        let base = match self.completed.get(byte_view.buffer_index as usize) {
+            Some(buffer) => buffer.as_ptr(),
+            None => self.in_progress.as_ptr(),
+        };
+        let start = base.wrapping_add(byte_view.offset as usize);
+        prefetch(start);
+        prefetch(start.wrapping_add(len as usize - 1));
     }
 
     /// Returns the bytes for the key at `index`, irrespective of nullness.
@@ -450,13 +701,7 @@ where
             // SAFETY: `view` is a valid inline view with `length` bytes.
             unsafe { BinaryViewArray::inline_value(view, length) }
         } else {
-            let buffer_index = byte_view.buffer_index as usize;
-            let offset = byte_view.offset as usize;
-            if buffer_index < self.completed.len() {
-                &self.completed[buffer_index][offset..offset + length]
-            } else {
-                &self.in_progress[offset..offset + length]
-            }
+            self.stored_value(*view)
         }
     }
 
@@ -598,12 +843,12 @@ where
 
     /// Is the set empty?
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.null.is_none()
+        self.items == 0 && self.null.is_none()
     }
 
     /// Number of non null entries
     pub fn non_null_len(&self) -> usize {
-        self.map.len()
+        self.items
     }
 
     /// Return the total size, in bytes, of memory used to store the data in
@@ -611,18 +856,14 @@ where
     pub fn size(&self) -> usize {
         // All fields below own their allocations. Count retained capacity rather
         // than used length because this value drives memory accounting.
-        //
-        // `HashTable::allocation_size` reports the whole hashbrown allocation,
-        // which is the entry array plus the control bytes plus the trailing
-        // group, so it is larger than `capacity() * size_of::<Entry<V>>()`. It
-        // is a constant time layout calculation, not a walk of the table.
-        let map_size = self.map.allocation_size();
-        let views_size = self.views.allocated_size();
+        let views_size = self.views.allocated_size()
+            + self.hashes.allocated_size()
+            + self.payloads.allocated_size();
         let in_progress_size = self.in_progress.allocated_size();
         let completed_size = self.completed.allocated_size()
             + self.completed.iter().map(Buffer::capacity).sum::<usize>();
 
-        map_size
+        self.slots.allocated_size()
             + views_size
             + in_progress_size
             + completed_size
@@ -636,8 +877,8 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowBytesMap")
-            .field("map", &"<map>")
-            .field("map_allocation_size", &self.map.allocation_size())
+            .field("slots", &self.slots.len())
+            .field("items", &self.items)
             .field("views_len", &self.views.len())
             .field("completed_buffers", &self.completed.len())
             .field("random_state", &self.random_state)
@@ -646,26 +887,56 @@ where
     }
 }
 
-/// Entry in the hash table -- see [`ArrowBytesViewMap`] for more details
-///
-/// Stores the view pointing to our internal buffers, eliminating the need
-/// for a separate builder index. For inline strings (<=12 bytes), the view
-/// contains the entire value. For out-of-line strings, the view contains
-/// buffer_index and offset pointing directly to our storage.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-struct Entry<V>
-where
-    V: Debug + PartialEq + Eq + Clone + Copy + Default,
-{
-    /// The u128 view pointing to our internal buffers. For inline strings,
-    /// this contains the complete value. For larger strings, this contains
-    /// the buffer_index/offset into our completed/in_progress buffers.
-    view: u128,
+/// An empty slot. An occupied slot holds `index + 1` in its low bits, so it is
+/// never zero.
+const EMPTY: u64 = 0;
 
-    hash: u64,
+/// The low 48 bits of a slot: one more than the index of its key.
+const INDEX_MASK: u64 = (1 << 48) - 1;
 
-    /// value stored by the entry
-    payload: V,
+/// Slots a prefetching stage reads past a key's home slot while looking for
+/// its candidate: one cache line. Probes are short at three quarters load, and
+/// a stage that gives up only leaves that row unprefetched.
+const HINT_SLOTS: usize = 8;
+
+/// The top 16 bits of `hash`, in place: the part of a slot that tells keys
+/// apart before their views are read.
+#[inline(always)]
+fn tag(hash: u64) -> u64 {
+    hash & !INDEX_MASK
+}
+
+/// The slot for the key at `index` with `hash`.
+#[inline(always)]
+fn slot_of(hash: u64, index: usize) -> u64 {
+    tag(hash) | (index as u64 + 1)
+}
+
+/// The index an occupied slot names.
+#[inline(always)]
+fn index_of(slot: u64) -> usize {
+    ((slot & INDEX_MASK) - 1) as usize
+}
+
+/// The most keys `slots` slots hold: three quarters, so every probe meets an
+/// empty slot.
+#[inline(always)]
+fn max_items(slots: usize) -> usize {
+    slots - slots / 4
+}
+
+/// The smallest table, a power of two of at least 8 slots, that holds
+/// `entries` keys; none for no keys.
+fn slots_for(entries: usize) -> usize {
+    if entries == 0 {
+        return 0;
+    }
+    entries
+        .saturating_add(entries / 3)
+        .saturating_add(1)
+        .max(8)
+        .checked_next_power_of_two()
+        .unwrap_or(1 << (usize::BITS - 1))
 }
 
 #[cfg(test)]
@@ -861,19 +1132,11 @@ mod tests {
         assert_eq!(set.len(), 10);
     }
 
-    /// A lower bound on the bytes a hashbrown table holding `entries` entries
-    /// of type `T` must allocate: one entry slot and one control byte each.
-    /// Derived independently of the production accounting so it can bracket it.
-    fn min_table_bytes<T>(entries: usize) -> usize {
-        entries * (size_of::<T>() + 1)
-    }
-
     #[test]
     fn map_new_does_not_allocate() {
         let map = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
 
-        assert_eq!(map.map.capacity(), 0);
-        assert_eq!(map.map.allocation_size(), 0);
+        assert_eq!(map.slots.capacity(), 0);
         assert_eq!(map.size(), 0);
     }
 
@@ -884,29 +1147,13 @@ mod tests {
             INITIAL_MAP_CAPACITY,
         );
 
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
-        assert_eq!(map.size(), map.map.allocation_size());
-
-        // Before this accounting was corrected the map reported exactly
-        // `capacity() * size_of::<Entry<V>>()`, which leaves out the control
-        // bytes and undercounts the real allocation by roughly half.
-        let lower_bound = min_table_bytes::<Entry<()>>(map.map.capacity());
-        assert!(
-            map.size() >= lower_bound,
-            "expected {} to be at least {lower_bound}",
-            map.size()
-        );
-        assert!(
-            map.size() <= 2 * lower_bound + 64,
-            "expected {} to be within a small factor of {lower_bound}",
-            map.size()
-        );
-        assert!(
-            map.size() > map.map.capacity() * size_of::<Entry<()>>(),
-            "expected {} to exceed {}",
-            map.size(),
-            map.map.capacity() * size_of::<Entry<()>>()
-        );
+        // Room for the capacity at no more than three quarters load, in a
+        // power of two of slots.
+        let slots = map.slots.len();
+        assert!(slots.is_power_of_two());
+        assert!(slots * 3 >= INITIAL_MAP_CAPACITY * 4);
+        assert!(slots < INITIAL_MAP_CAPACITY * 4);
+        assert_eq!(map.size(), slots * size_of::<u64>());
     }
 
     #[test]
@@ -915,13 +1162,13 @@ mod tests {
             OutputType::Utf8View,
             INITIAL_MAP_CAPACITY,
         );
-        let capacity = preallocated.map.capacity();
+        let capacity = preallocated.slots.len();
         preallocated.take();
-        assert_eq!(preallocated.map.capacity(), capacity);
+        assert_eq!(preallocated.slots.len(), capacity);
 
         let mut lazy = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
         lazy.take();
-        assert_eq!(lazy.map.capacity(), 0);
+        assert_eq!(lazy.slots.len(), 0);
     }
 
     #[test]
@@ -935,20 +1182,19 @@ mod tests {
         ));
         map.insert_if_new(&values, |_| (), |_| ());
 
-        let warm_size = map.map.allocation_size();
-        assert!(warm_size > 0);
+        assert!(map.slots.len() * 3 >= 1_000 * 4);
 
         // `take` deliberately keeps the map warm, so it does not release the
         // configured capacity.
         map.take();
         let taken_size = map.size();
         assert!(
-            taken_size >= min_table_bytes::<Entry<()>>(INITIAL_MAP_CAPACITY),
+            taken_size >= INITIAL_MAP_CAPACITY * size_of::<u64>(),
             "expected take to retain the warm up allocation, got {taken_size}"
         );
 
         map.clear_and_release();
-        assert_eq!(map.map.allocation_size(), 0);
+        assert_eq!(map.slots.capacity(), 0);
         let released_size = map.size();
         assert!(
             released_size < 128,
@@ -958,7 +1204,7 @@ mod tests {
         // The configured capacity survives, so the map warms back up when it is
         // emitted from again.
         map.take();
-        assert!(map.map.capacity() >= INITIAL_MAP_CAPACITY);
+        assert!(map.slots.len() * 3 >= INITIAL_MAP_CAPACITY * 4);
     }
 
     #[test]
@@ -995,8 +1241,10 @@ mod tests {
                 .any(|buffer| buffer.capacity() > buffer.len())
         );
 
-        let expected_size = map.map.allocation_size()
+        let expected_size = map.slots.allocated_size()
             + map.views.allocated_size()
+            + map.hashes.allocated_size()
+            + map.payloads.allocated_size()
             + map.in_progress.allocated_size()
             + map.completed.allocated_size()
             + map.completed.iter().map(Buffer::capacity).sum::<usize>()
@@ -1004,7 +1252,8 @@ mod tests {
         assert_eq!(map.size(), expected_size);
 
         // Verify the retained-capacity delta independently from the production formula.
-        let legacy_size = map.map.allocation_size()
+        let legacy_size = map.slots.len() * size_of::<u64>()
+            + map.hashes.capacity() * size_of::<u64>()
             + map.views.len() * size_of::<u128>()
             + map.in_progress.capacity()
             + map.completed.iter().map(Buffer::len).sum::<usize>()
@@ -1144,5 +1393,168 @@ mod tests {
             "bcdefghijklmnop1234567",
         ]));
         assert_eq!(&test_map.into_array(), &expected_output);
+    }
+
+    /// Deterministic keys for the staged probe tests: NULLs, inline keys,
+    /// keys of exactly 12 bytes and long keys sharing a long prefix, each
+    /// repeated about twice.
+    fn mixed_keys(rows: usize, seed: u64) -> ArrayRef {
+        let mut state = seed;
+        let keys = (0..rows).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let pick = state >> 33;
+            let key = pick % (rows as u64 / 2 + 1);
+            match pick % 7 {
+                0 => None,
+                1 | 2 => Some(format!("{key}")),
+                3 => Some(format!("{key:012}")),
+                _ => Some(format!("https://example.com/a/long/shared/prefix/{key}")),
+            }
+        });
+        Arc::new(StringViewArray::from_iter(keys))
+    }
+
+    /// Each row's payload, the values payloads were made for, the state and
+    /// the reported size after inserting `batches` with the probe forced to
+    /// `staged`.
+    type Run = (Vec<usize>, Vec<Option<Vec<u8>>>, ArrayRef, usize);
+
+    fn run(batches: &[ArrayRef], staged: bool) -> Run {
+        let mut map = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+        let mut seen = vec![];
+        let mut made = vec![];
+        for batch in batches {
+            let mut next = map.len();
+            map.insert(
+                batch,
+                Some(staged),
+                |value| {
+                    made.push(value.map(<[u8]>::to_vec));
+                    next += 1;
+                    next - 1
+                },
+                |payload| seen.push(payload),
+            );
+        }
+        let size = map.size();
+        (seen, made, map.into_state(), size)
+    }
+
+    #[test]
+    fn staged_probe_matches_plain_probe() {
+        // A batch shorter than the look-ahead, then batches that grow the
+        // table many times from empty while they are probed.
+        let batches = [
+            mixed_keys(5, 1),
+            mixed_keys(2048, 2),
+            mixed_keys(2048, 3),
+            mixed_keys(3 * DISTANCE + 1, 4),
+        ];
+        let plain = run(&batches, false);
+        let staged = run(&batches, true);
+        assert_eq!(plain.0, staged.0);
+        assert_eq!(plain.1, staged.1);
+        assert_eq!(&plain.2, &staged.2);
+        assert_eq!(plain.3, staged.3);
+
+        // And both are right: a row's payload is the number of distinct keys
+        // seen before its key first appeared, and the state lists the
+        // distinct keys in that order.
+        let mut first = HashMap::<Option<String>, usize>::new();
+        let mut order = vec![];
+        let expected = batches
+            .iter()
+            .flat_map(|batch| batch.as_string_view().iter().collect::<Vec<_>>())
+            .map(|key| {
+                let key = key.map(str::to_string);
+                let next = first.len();
+                *first.entry(key.clone()).or_insert_with(|| {
+                    order.push(key);
+                    next
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(staged.0, expected);
+        let state: ArrayRef = Arc::new(StringViewArray::from(order));
+        assert_eq!(&staged.2, &state);
+    }
+
+    #[test]
+    fn take_with_capacity_empties_and_keeps_the_table() {
+        let values = mixed_keys(1000, 5);
+        let mut map = ArrowBytesViewMap::<()>::with_capacity(
+            OutputType::Utf8View,
+            INITIAL_MAP_CAPACITY,
+        );
+        map.insert(&values, Some(true), |_| (), |_| ());
+        let len = map.len();
+        let slots = map.slots.len();
+
+        let state = map.take_with_capacity(64);
+        assert_eq!(state.len(), len);
+        assert!(map.is_empty());
+        assert_eq!(map.slots.len(), slots);
+        assert!(map.slots.iter().all(|slot| *slot == EMPTY));
+
+        // Every key is new again, and the emitted keys are the same keys.
+        let mut made = 0;
+        map.insert(&values, Some(true), |_| made += 1, |_| ());
+        assert_eq!(made, len);
+        assert_eq!(&map.take_with_capacity(0), &state);
+    }
+
+    /// Quadratic when every hash collides, so skipped under that feature, as
+    /// the count distinct tests are.
+    #[cfg(not(feature = "force_hash_collisions"))]
+    #[test]
+    fn growth_keeps_every_key_findable() {
+        let mut map = ArrowBytesViewMap::<usize>::new(OutputType::BinaryView);
+        let keys = (0..20_000u32)
+            .map(|key| format!("{key:0>width$}", width = 1 + key as usize % 40))
+            .collect::<Vec<_>>();
+        let values: ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            keys.iter().map(String::as_bytes),
+        ));
+        let mut next = 0;
+        map.insert_if_new(
+            &values,
+            |_| {
+                next += 1;
+                next - 1
+            },
+            |_| (),
+        );
+        assert_eq!(map.non_null_len(), keys.len());
+        assert!(map.items <= max_items(map.slots.len()));
+
+        let mut seen = vec![];
+        map.insert(&values, Some(true), |_| 0, |payload| seen.push(payload));
+        assert_eq!(seen, (0..keys.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn staged_probe_pays_only_beyond_l2() {
+        let map = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+        assert!(!map.stage_pays(8192));
+
+        let big = ArrowBytesViewMap::<usize>::with_capacity(
+            OutputType::Utf8View,
+            l2_cache_bytes() / size_of::<u64>(),
+        );
+        assert!(big.stage_pays(8192));
+        assert!(!big.stage_pays(3 * DISTANCE));
+    }
+
+    #[test]
+    fn slots_for_keeps_load_under_three_quarters() {
+        assert_eq!(slots_for(0), 0);
+        for entries in (1..5000).chain([1 << 20, (1 << 20) + 1]) {
+            let slots = slots_for(entries);
+            assert!(slots.is_power_of_two());
+            assert!(max_items(slots) >= entries);
+            assert!(max_items(slots) < slots);
+        }
     }
 }
