@@ -274,7 +274,11 @@ fn regex_replace_posix_groups(replacement: &str) -> String {
 /// group's span of a matching value (empty when the group does not take part
 /// in the match) and an unmatched value unchanged. The result is a substring
 /// of the input, which a `Utf8View` result points at instead of copying.
-struct Extract {
+///
+/// Public so that a caller running `regexp_replace` over values of its own,
+/// such as binary values it has checked are UTF-8, answers as this does.
+#[derive(Clone, Debug)]
+pub struct Extract {
     re: Regex,
     locs: CaptureLocations,
     group: usize,
@@ -296,6 +300,7 @@ struct Extract {
 /// Ported from rust-lang/regex#1350 (`LiteralPrefixCapture`, open), which
 /// makes the `regex` crate's own engine do this, with the group and the
 /// tail taken from the pattern instead of fixed to group 1 and `.*`.
+#[derive(Clone, Debug)]
 struct Prefix {
     /// Distinct literals in the regex's order of preference.
     literals: Vec<Vec<u8>>,
@@ -316,6 +321,7 @@ const MAX_LITERALS: usize = 32;
 /// shorter pattern decides the match. It spares searching the rest of the
 /// value when [`Tail`] checks it with `memchr` instead. Group 0, the whole
 /// match, differs between the two, so a replacement by it never uses this.
+#[derive(Clone, Debug)]
 struct Short {
     re: Regex,
     locs: CaptureLocations,
@@ -324,6 +330,7 @@ struct Short {
 
 /// The bytes the stripped repetition's class leaves out: none, or some of
 /// `\n` and `\r`, as `.` does with and without the `s` and `R` flags.
+#[derive(Clone, Copy, Debug)]
 enum Tail {
     Any,
     One(u8),
@@ -333,7 +340,7 @@ enum Tail {
 impl Extract {
     /// Decides whether `pattern`, as `re` was compiled from it, and
     /// `replacement`, in the `regex` crate's syntax, qualify; see [`Extract`].
-    fn new(re: &Regex, pattern: &str, replacement: &str) -> Option<Self> {
+    pub fn new(re: &Regex, pattern: &str, replacement: &str) -> Option<Self> {
         let group = group(re, replacement)?;
         // `Regex::new` parses with the parser's default options.
         let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
@@ -360,7 +367,7 @@ impl Extract {
 
     /// The group's span in `val`, empty when the pattern matches without the
     /// group, or `None` when it does not match.
-    fn find(&mut self, val: &str) -> Option<(usize, usize)> {
+    pub fn find(&mut self, val: &str) -> Option<(usize, usize)> {
         if let Some(prefix) = &self.prefix {
             return prefix.find(val.as_bytes());
         }
