@@ -142,6 +142,13 @@ pub trait GroupValues: Send {
     ///
     /// [`EmitTo::First`]: datafusion_expr::EmitTo::First
     fn shrink_to_fit(&mut self) {}
+
+    /// Releases the scratch buffers sized for the last input batch, keeping
+    /// the stored groups and the capacity reserved for them. A table that
+    /// waits between batches, such as an eager bucket's, holds no scratch.
+    ///
+    /// The default does nothing.
+    fn release_scratch(&mut self) {}
 }
 
 /// Return a specialized implementation of [`GroupValues`] for the given schema.

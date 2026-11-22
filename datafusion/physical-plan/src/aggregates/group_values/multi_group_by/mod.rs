@@ -1250,6 +1250,14 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         true
     }
 
+    fn release_scratch(&mut self) {
+        self.hashes_buffer = Vec::new();
+        if !STREAMING {
+            self.emit_group_index_list_buffer = Vec::new();
+            self.vectorized_operation_buffers.clear_shrink(0);
+        }
+    }
+
     fn shrink_to_fit(&mut self) {
         self.map.shrink_to_fit(|(hash, _)| *hash);
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();

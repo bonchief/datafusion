@@ -217,6 +217,8 @@ impl BucketedAggregation {
                 bucket_table.aggregate_batch(batch)?;
             }
             drop(batches);
+            // The table waits for its next chunk without the scratch of this one
+            bucket_table.release_scratch();
             if can_split && bucket_table.building_group_count() >= self.threshold {
                 buckets.stop_eager(index, bucket_table.take_state_batch()?, rows);
             } else {

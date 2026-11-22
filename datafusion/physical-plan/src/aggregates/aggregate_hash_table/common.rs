@@ -454,15 +454,22 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     }
 
     /// Reserves fixed row capacity without changing the number of groups.
+    /// The group index of each input row is scratch for one batch, so it is
+    /// not reserved for the groups.
     pub(in crate::aggregates) fn reserve_groups(&mut self, capacity: usize) {
         let state = self.state.building_mut();
         state.group_values.reserve_groups(capacity);
-        state
-            .batch_group_indices
-            .reserve_exact(capacity.saturating_sub(state.batch_group_indices.len()));
         for acc in &mut state.accumulators {
             acc.accumulator.reserve_groups(capacity);
         }
+    }
+
+    /// Releases the scratch the table sized for its last input batch, see
+    /// [`GroupValues::release_scratch`].
+    pub(in crate::aggregates) fn release_scratch(&mut self) {
+        let state = self.state.building_mut();
+        state.batch_group_indices = Vec::new();
+        state.group_values.release_scratch();
     }
 
     /// Emits all states and reserves a fixed capacity for the next table.
