@@ -122,7 +122,7 @@ impl ArrowBytesViewSet {
 /// # Lookup tables
 ///
 /// A map starts in hashbrown's table, probed one row at a time. A map whose
-/// table outgrows the core's L2 cache ([`l2_cache_bytes`]) moves,
+/// table outgrows one core's share of L2 ([`l2_cache_bytes`]) moves,
 /// once, at the start of the next batch, to [`Table`]: a SwissTable-style
 /// table of our own whose probe can prefetch the memory a later row's probe
 /// reads, which hashbrown cannot since it exposes no addresses. It stays there
@@ -152,8 +152,11 @@ where
 {
     /// Should the output be StringView or BinaryView?
     output_type: OutputType,
-    /// Underlying hash set for each distinct value
-    lookup: Lookup<V>,
+    /// Underlying hash set for each distinct value, while the map is below
+    /// the gate; empty, holding no allocation, once `table` is set
+    map: HashTable<Entry<V>>,
+    /// The prefetchable table, once the map has outgrown L2
+    table: Option<Box<Table<V>>>,
     /// Hash table capacity to re-create the map with in [`Self::take`], so a
     /// map built with [`Self::with_capacity`] keeps its pre-allocation when it
     /// is emptied and reused
@@ -207,7 +210,8 @@ where
     pub fn with_capacity(output_type: OutputType, map_capacity: usize) -> Self {
         Self {
             output_type,
-            lookup: Lookup::Plain(HashTable::with_capacity(map_capacity)),
+            map: HashTable::with_capacity(map_capacity),
+            table: None,
             initial_map_capacity: map_capacity,
             views: Vec::new(),
             in_progress: Vec::new(),
@@ -228,11 +232,11 @@ where
         if self.block_size == 0 && capacity != 0 {
             self.block_size = BYTE_VIEW_STARTING_BLOCK_SIZE;
         }
-        match &mut self.lookup {
-            Lookup::Plain(map) => {
-                map.reserve(capacity.saturating_sub(map.len()), |entry| entry.hash)
-            }
-            Lookup::Prefetched(table) => table.reserve(capacity),
+        match &mut self.table {
+            Some(table) => table.reserve(capacity),
+            None => self
+                .map
+                .reserve(capacity.saturating_sub(self.map.len()), |entry| entry.hash),
         }
         self.views
             .reserve_exact(capacity.saturating_sub(self.views.len()));
@@ -245,10 +249,11 @@ where
     pub fn take_with_capacity(&mut self, capacity: usize) -> ArrayRef {
         let mut outgoing = Self::new(self.output_type);
         mem::swap(self, &mut outgoing);
-        mem::swap(&mut self.lookup, &mut outgoing.lookup);
-        match &mut self.lookup {
-            Lookup::Plain(map) => map.clear(),
-            Lookup::Prefetched(table) => table.clear(),
+        mem::swap(&mut self.map, &mut outgoing.map);
+        self.map.clear();
+        mem::swap(&mut self.table, &mut outgoing.table);
+        if let Some(table) = &mut self.table {
+            table.clear();
         }
         mem::swap(&mut self.hashes_buffer, &mut outgoing.hashes_buffer);
         self.hashes_buffer.clear();
@@ -377,11 +382,24 @@ where
         OP: FnMut(V),
         B: ByteViewType,
     {
+        // A map in hashbrown's table below the gate runs the loop below,
+        // which is the one this map has always run.
+        let moves = self.table.is_some()
+            || staged.unwrap_or_else(|| self.map.allocation_size() > l2_cache_bytes());
+        if moves {
+            return self.insert_prefetched::<MP, OP, B>(
+                values,
+                staged,
+                make_payload_fn,
+                observe_payload_fn,
+            );
+        }
+
         // step 1: compute hashes
-        let mut hashes = mem::take(&mut self.hashes_buffer);
-        hashes.clear();
-        hashes.resize(values.len(), 0);
-        create_hashes([values], &self.random_state, &mut hashes)
+        let batch_hashes = &mut self.hashes_buffer;
+        batch_hashes.clear();
+        batch_hashes.resize(values.len(), 0);
+        create_hashes([values], &self.random_state, batch_hashes)
             // hash is supported for all types and create_hashes only
             // returns errors for unsupported types
             .unwrap();
@@ -389,84 +407,15 @@ where
         // step 2: insert each value into the set, if not already present
         let values = values.as_byte_view::<B>();
 
-        // Ensure lengths are equivalent
-        assert_eq!(values.len(), hashes.len());
-
-        let mut lookup = mem::take(&mut self.lookup);
-        if let Lookup::Plain(map) = &lookup {
-            let moves =
-                staged.unwrap_or_else(|| map.allocation_size() > l2_cache_bytes());
-            if moves {
-                lookup = Lookup::Prefetched(Table::from_hashbrown(map));
-            }
-        }
-        match &mut lookup {
-            Lookup::Plain(map) => self.insert_plain(
-                map,
-                values,
-                &hashes,
-                &mut make_payload_fn,
-                &mut observe_payload_fn,
-            ),
-            Lookup::Prefetched(table) => {
-                let views = values.views();
-                if staged.unwrap_or_else(|| values.len() > 2 * DISTANCE) {
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        if let Some(&ahead) = hashes.get(i + 2 * DISTANCE) {
-                            table.prefetch_home(ahead);
-                        }
-                        if let Some(&ahead) = hashes.get(i + DISTANCE) {
-                            self.prefetch_key(table, ahead, views[i + DISTANCE]);
-                        }
-                        self.insert_row(
-                            table,
-                            values,
-                            i,
-                            views[i],
-                            hash,
-                            &mut make_payload_fn,
-                            &mut observe_payload_fn,
-                        );
-                    }
-                } else {
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        self.insert_row(
-                            table,
-                            values,
-                            i,
-                            views[i],
-                            hash,
-                            &mut make_payload_fn,
-                            &mut observe_payload_fn,
-                        );
-                    }
-                }
-            }
-        }
-        self.lookup = lookup;
-        self.hashes_buffer = hashes;
-    }
-
-    /// The row-at-a-time loop over the hashbrown table, for a map that fits
-    /// in L2.
-    fn insert_plain<MP, OP, B>(
-        &mut self,
-        map: &mut HashTable<Entry<V>>,
-        values: &GenericByteViewArray<B>,
-        hashes: &[u64],
-        make_payload_fn: &mut MP,
-        observe_payload_fn: &mut OP,
-    ) where
-        MP: FnMut(Option<&[u8]>) -> V,
-        OP: FnMut(V),
-        B: ByteViewType,
-    {
         // Get raw views buffer for direct comparison
         let input_views = values.views();
 
+        // Ensure lengths are equivalent
+        assert_eq!(values.len(), self.hashes_buffer.len());
+
         for i in 0..values.len() {
             let view_u128 = input_views[i];
-            let hash = hashes[i];
+            let hash = self.hashes_buffer[i];
 
             // handle null value via validity bitmap check
             if values.is_null(i) {
@@ -492,38 +441,40 @@ where
                 let completed = &self.completed;
                 let in_progress = &self.in_progress;
 
-                map.find(hash, |header| {
-                    if header.hash != hash || header.view as u32 != len {
-                        return false;
-                    }
+                self.map
+                    .find(hash, |header| {
+                        if header.hash != hash || header.view as u32 != len {
+                            return false;
+                        }
 
-                    // Fast path: inline strings can be compared directly
-                    if len <= 12 {
-                        return header.view == view_u128;
-                    }
+                        // Fast path: inline strings can be compared directly
+                        if len <= 12 {
+                            return header.view == view_u128;
+                        }
 
-                    // For larger strings: first compare the 4-byte prefix
-                    let stored_prefix = (header.view >> 32) as u32;
-                    let input_prefix = (view_u128 >> 32) as u32;
-                    if stored_prefix != input_prefix {
-                        return false;
-                    }
+                        // For larger strings: first compare the 4-byte prefix
+                        let stored_prefix = (header.view >> 32) as u32;
+                        let input_prefix = (view_u128 >> 32) as u32;
+                        if stored_prefix != input_prefix {
+                            return false;
+                        }
 
-                    // Prefix matched - compare full bytes
-                    let byte_view = ByteView::from(header.view);
-                    let stored_len = byte_view.length as usize;
-                    let buffer_index = byte_view.buffer_index as usize;
-                    let offset = byte_view.offset as usize;
+                        // Prefix matched - compare full bytes
+                        let byte_view = ByteView::from(header.view);
+                        let stored_len = byte_view.length as usize;
+                        let buffer_index = byte_view.buffer_index as usize;
+                        let offset = byte_view.offset as usize;
 
-                    let stored_value = if buffer_index < completed.len() {
-                        &completed[buffer_index].as_slice()[offset..offset + stored_len]
-                    } else {
-                        &in_progress[offset..offset + stored_len]
-                    };
-                    let input_value: &[u8] = values.value(i).as_ref();
-                    stored_value == input_value
-                })
-                .map(|entry| entry.payload)
+                        let stored_value = if buffer_index < completed.len() {
+                            &completed[buffer_index].as_slice()
+                                [offset..offset + stored_len]
+                        } else {
+                            &in_progress[offset..offset + stored_len]
+                        };
+                        let input_value: &[u8] = values.value(i).as_ref();
+                        stored_value == input_value
+                    })
+                    .map(|entry| entry.payload)
             };
 
             let payload = if let Some(payload) = maybe_payload {
@@ -558,11 +509,77 @@ where
                     payload,
                 };
 
-                map.insert_unique(hash, new_header, |h| h.hash);
+                self.map.insert_unique(hash, new_header, |h| h.hash);
                 payload
             };
             observe_payload_fn(payload);
         }
+    }
+
+    /// [`Self::insert_if_new_inner`] in the prefetched table, moving the map
+    /// to it first if it is not there yet. Kept out of line so the loop over
+    /// hashbrown's table compiles as it did before this table existed.
+    #[inline(never)]
+    fn insert_prefetched<MP, OP, B>(
+        &mut self,
+        values: &ArrayRef,
+        staged: Option<bool>,
+        mut make_payload_fn: MP,
+        mut observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+        B: ByteViewType,
+    {
+        let mut table = match self.table.take() {
+            Some(table) => table,
+            None => Box::new(Table::from_hashbrown(&mem::take(&mut self.map))),
+        };
+
+        let mut hashes = mem::take(&mut self.hashes_buffer);
+        hashes.clear();
+        hashes.resize(values.len(), 0);
+        create_hashes([values], &self.random_state, &mut hashes)
+            // hash is supported for all types and create_hashes only
+            // returns errors for unsupported types
+            .unwrap();
+        let values = values.as_byte_view::<B>();
+        assert_eq!(values.len(), hashes.len());
+        let views = values.views();
+
+        if staged.unwrap_or_else(|| values.len() > 2 * DISTANCE) {
+            for (i, &hash) in hashes.iter().enumerate() {
+                if let Some(&ahead) = hashes.get(i + 2 * DISTANCE) {
+                    table.prefetch_home(ahead);
+                }
+                if let Some(&ahead) = hashes.get(i + DISTANCE) {
+                    self.prefetch_key(&table, ahead, views[i + DISTANCE]);
+                }
+                self.insert_row(
+                    &mut table,
+                    values,
+                    i,
+                    views[i],
+                    hash,
+                    &mut make_payload_fn,
+                    &mut observe_payload_fn,
+                );
+            }
+        } else {
+            for (i, &hash) in hashes.iter().enumerate() {
+                self.insert_row(
+                    &mut table,
+                    values,
+                    i,
+                    views[i],
+                    hash,
+                    &mut make_payload_fn,
+                    &mut observe_payload_fn,
+                );
+            }
+        }
+        self.table = Some(table);
+        self.hashes_buffer = hashes;
     }
 
     /// Looks up row `i` of `values`, whose view is `view`, in the prefetched
@@ -851,6 +868,21 @@ where
         view
     }
 
+    /// Bytes the hash tables hold.
+    ///
+    /// `HashTable::allocation_size` reports the whole hashbrown allocation,
+    /// which is the entry array plus the control bytes plus the trailing
+    /// group, so it is larger than `capacity() * size_of::<Entry<V>>()`. It
+    /// is a constant time layout calculation, not a walk of the table.
+    fn table_size(&self) -> usize {
+        self.map.allocation_size()
+            + self.table.as_ref().map_or(0, |table| {
+                size_of::<Table<V>>()
+                    + table.ctrl.allocated_size()
+                    + table.entries.allocated_size()
+            })
+    }
+
     /// Total number of entries (including null, if present)
     pub fn len(&self) -> usize {
         self.non_null_len() + self.null.map(|_| 1).unwrap_or(0)
@@ -863,9 +895,9 @@ where
 
     /// Number of non null entries
     pub fn non_null_len(&self) -> usize {
-        match &self.lookup {
-            Lookup::Plain(map) => map.len(),
-            Lookup::Prefetched(table) => table.items,
+        match &self.table {
+            Some(table) => table.items,
+            None => self.map.len(),
         }
     }
 
@@ -874,7 +906,7 @@ where
     pub fn size(&self) -> usize {
         // All fields below own their allocations. Count retained capacity rather
         // than used length because this value drives memory accounting.
-        let map_size = self.lookup.size();
+        let map_size = self.table_size();
         let views_size = self.views.allocated_size();
         let in_progress_size = self.in_progress.allocated_size();
         let completed_size = self.completed.allocated_size()
@@ -895,8 +927,8 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowBytesMap")
             .field("map", &"<map>")
-            .field("map_allocation_size", &self.lookup.size())
-            .field("prefetched", &matches!(self.lookup, Lookup::Prefetched(_)))
+            .field("map_allocation_size", &self.table_size())
+            .field("prefetched", &self.table.is_some())
             .field("views_len", &self.views.len())
             .field("completed_buffers", &self.completed.len())
             .field("random_state", &self.random_state)
@@ -925,46 +957,6 @@ where
 
     /// value stored by the entry
     payload: V,
-}
-
-/// The table a map's keys are looked up in. See [`ArrowBytesViewMap`].
-enum Lookup<V>
-where
-    V: Debug + PartialEq + Eq + Clone + Copy + Default,
-{
-    /// hashbrown's table, for a map that fits in L2
-    Plain(HashTable<Entry<V>>),
-    /// The prefetchable table, for a map that outgrew L2
-    Prefetched(Table<V>),
-}
-
-impl<V> Default for Lookup<V>
-where
-    V: Debug + PartialEq + Eq + Clone + Copy + Default,
-{
-    fn default() -> Self {
-        Self::Plain(HashTable::new())
-    }
-}
-
-impl<V> Lookup<V>
-where
-    V: Debug + PartialEq + Eq + Clone + Copy + Default,
-{
-    /// Bytes the table holds.
-    ///
-    /// `HashTable::allocation_size` reports the whole hashbrown allocation,
-    /// which is the entry array plus the control bytes plus the trailing
-    /// group, so it is larger than `capacity() * size_of::<Entry<V>>()`. It
-    /// is a constant time layout calculation, not a walk of the table.
-    fn size(&self) -> usize {
-        match self {
-            Self::Plain(map) => map.allocation_size(),
-            Self::Prefetched(table) => {
-                table.ctrl.allocated_size() + table.entries.allocated_size()
-            }
-        }
-    }
 }
 
 /// A SwissTable-style hash table whose memory a probe can prefetch.
@@ -1415,7 +1407,7 @@ mod tests {
         let map = ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
 
         assert_eq!(capacity(&map), 0);
-        assert_eq!(map.lookup.size(), 0);
+        assert_eq!(map.table_size(), 0);
         assert_eq!(map.size(), 0);
     }
 
@@ -1427,7 +1419,7 @@ mod tests {
         );
 
         assert!(capacity(&map) >= INITIAL_MAP_CAPACITY);
-        assert_eq!(map.size(), map.lookup.size());
+        assert_eq!(map.size(), map.table_size());
 
         // Before this accounting was corrected the map reported exactly
         // `capacity() * size_of::<Entry<V>>()`, which leaves out the control
@@ -1477,7 +1469,7 @@ mod tests {
         ));
         map.insert_if_new(&values, |_| (), |_| ());
 
-        let warm_size = map.lookup.size();
+        let warm_size = map.table_size();
         assert!(warm_size > 0);
 
         // `take` deliberately keeps the map warm, so it does not release the
@@ -1490,7 +1482,7 @@ mod tests {
         );
 
         map.clear_and_release();
-        assert_eq!(map.lookup.size(), 0);
+        assert_eq!(map.table_size(), 0);
         let released_size = map.size();
         assert!(
             released_size < 128,
@@ -1537,7 +1529,7 @@ mod tests {
                 .any(|buffer| buffer.capacity() > buffer.len())
         );
 
-        let expected_size = map.lookup.size()
+        let expected_size = map.table_size()
             + map.views.allocated_size()
             + map.in_progress.allocated_size()
             + map.completed.allocated_size()
@@ -1546,7 +1538,7 @@ mod tests {
         assert_eq!(map.size(), expected_size);
 
         // Verify the retained-capacity delta independently from the production formula.
-        let legacy_size = map.lookup.size()
+        let legacy_size = map.table_size()
             + map.views.len() * size_of::<u128>()
             + map.in_progress.capacity()
             + map.completed.iter().map(Buffer::len).sum::<usize>()
@@ -1693,9 +1685,9 @@ mod tests {
     where
         V: Debug + PartialEq + Eq + Clone + Copy + Default,
     {
-        match &map.lookup {
-            Lookup::Plain(map) => map.capacity(),
-            Lookup::Prefetched(table) => max_items(table.entries.len()),
+        match &map.table {
+            Some(table) => max_items(table.entries.len()),
+            None => map.map.capacity(),
         }
     }
 
@@ -1704,9 +1696,9 @@ mod tests {
     where
         V: Debug + PartialEq + Eq + Clone + Copy + Default,
     {
-        match &map.lookup {
-            Lookup::Plain(_) => panic!("the map is in hashbrown's table"),
-            Lookup::Prefetched(table) => table,
+        match &map.table {
+            Some(table) => table,
+            None => panic!("the map is in hashbrown's table"),
         }
     }
 
@@ -1750,7 +1742,7 @@ mod tests {
                 |payload| seen.push(payload),
             );
         }
-        assert_eq!(matches!(map.lookup, Lookup::Prefetched(_)), staged);
+        assert_eq!(map.table.is_some(), staged);
         (seen, made, map.into_state())
     }
 
@@ -1819,11 +1811,11 @@ mod tests {
 
         // Taking the map, or releasing it, goes back to hashbrown's table.
         map.insert(&values, Some(true), |_| (), |_| ());
-        assert!(matches!(map.take().lookup, Lookup::Prefetched(_)));
-        assert!(matches!(map.lookup, Lookup::Plain(_)));
+        assert!(map.take().table.is_some());
+        assert!(map.table.is_none());
         map.insert(&values, Some(true), |_| (), |_| ());
         map.clear_and_release();
-        assert!(matches!(map.lookup, Lookup::Plain(_)));
+        assert!(map.table.is_none());
     }
 
     /// Quadratic when every hash collides, so skipped under that feature, as
@@ -1876,14 +1868,14 @@ mod tests {
         );
         small.insert_if_new(&values, |_| (), |_| ());
         small.insert_if_new(&values, |_| (), |_| ());
-        assert!(matches!(small.lookup, Lookup::Plain(_)));
+        assert!(small.table.is_none());
 
         let mut big = ArrowBytesViewMap::<()>::with_capacity(
             OutputType::Utf8View,
             l2_cache_bytes() / size_of::<Entry<()>>(),
         );
         big.insert_if_new(&values, |_| (), |_| ());
-        assert!(matches!(big.lookup, Lookup::Prefetched(_)));
+        assert!(big.table.is_some());
         assert!(capacity(&big) >= l2_cache_bytes() / size_of::<Entry<()>>());
         assert_eq!(&big.into_state(), &small.into_state());
     }
