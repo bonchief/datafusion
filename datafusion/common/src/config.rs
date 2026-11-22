@@ -1158,12 +1158,27 @@ config_namespace! {
         /// less memory. Only aggregations whose group keys and aggregate state
         /// are all fixed-width are affected: a string or other variable-length
         /// value costs about as much to move into its bucket as the smaller
-        /// table saves. Spilling must be enabled, because buckets that cannot be
+        /// table saves, see `hash_aggregate_bucket_threshold_bytes` for those.
+        /// Spilling must be enabled, because buckets that cannot be
         /// spilled hold more memory than one table. Moving rows has a cost of
         /// its own, so aggregations that end at up to twice this number of
         /// groups gain little, and input that repeats its groups can use more
         /// memory. Set to 0 to disable.
         pub hash_aggregate_bucket_threshold: usize, default = 0
+
+        /// (experimental) Bytes of one final hash aggregation partition's
+        /// hash table (group keys, hash table and aggregate state) above
+        /// which an aggregation with variable-width group keys or state
+        /// (strings, binary, their views) moves into hash buckets the way
+        /// `hash_aggregate_bucket_threshold` does for fixed-width ones. A
+        /// group count is the wrong measure for such a table: a million short
+        /// keys can fit in cache where a million URLs do not. Moving a string
+        /// into its bucket costs several times what moving a fixed-width row
+        /// does, so this pays only for tables well past the caches, and the
+        /// threshold should be set at a size the CPU caches cannot hold.
+        /// Nested state (lists, structs) is never bucketed. Spilling must be
+        /// enabled. Set to 0 to disable.
+        pub hash_aggregate_bucket_threshold_bytes: usize, default = 0
 
         /// (experimental) Allocated-byte threshold for flushing unordered partial
         /// hash aggregation tables. Checked after each input batch; the table can
