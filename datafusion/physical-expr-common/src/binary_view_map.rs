@@ -122,12 +122,17 @@ impl ArrowBytesViewSet {
 /// # Lookup tables
 ///
 /// A map starts in hashbrown's table, probed one row at a time. A map whose
-/// table and key bytes outgrow the core's L2 cache ([`l2_cache_bytes`]) moves,
+/// table outgrows the core's L2 cache ([`l2_cache_bytes`]) moves,
 /// once, at the start of the next batch, to [`Table`]: a SwissTable-style
 /// table of our own whose probe can prefetch the memory a later row's probe
 /// reads, which hashbrown cannot since it exposes no addresses. It stays there
 /// until [`Self::take`] or [`Self::clear_and_release`];
 /// [`Self::take_with_capacity`] keeps whichever table the map is in.
+///
+/// Key bytes do not count towards the gate: a probe reads one line of them
+/// only for an entry whose hash already matched, and counting them would move
+/// a partial aggregate's 8,192 long keys, whose table stays cache-hot between
+/// flushes, to the table that only pays beyond the cache.
 ///
 /// # Staged probe
 ///
@@ -389,7 +394,8 @@ where
 
         let mut lookup = mem::take(&mut self.lookup);
         if let Lookup::Plain(map) = &lookup {
-            let moves = staged.unwrap_or_else(|| self.outgrows_l2(map.allocation_size()));
+            let moves =
+                staged.unwrap_or_else(|| map.allocation_size() > l2_cache_bytes());
             if moves {
                 lookup = Lookup::Prefetched(Table::from_hashbrown(map));
             }
@@ -666,14 +672,6 @@ where
         } else {
             &self.in_progress[offset..offset + len]
         }
-    }
-
-    /// Whether a table of `table` bytes and this map's key bytes together are
-    /// larger than the core's L2 cache: the gate of the prefetched table.
-    fn outgrows_l2(&self, table: usize) -> bool {
-        let keys = self.in_progress.len()
-            + self.completed.iter().map(Buffer::len).sum::<usize>();
-        table + keys > l2_cache_bytes()
     }
 
     /// Staged probe, second stage: prefetch the entry `hash`'s tag selects in
@@ -1563,10 +1561,6 @@ mod tests {
                 .sum::<usize>();
         assert_eq!(map.size() - legacy_size, retained_capacity_delta);
 
-        // Its 3 MiB of keys outgrow L2, so the next batch moves the map to the
-        // prefetched table; after that, known keys change no size.
-        map.insert_if_new(&values, |_| (), |_| {});
-        assert!(matches!(map.lookup, Lookup::Prefetched(_)));
         let size_after_insert = map.size();
         map.insert_if_new(&values, |_| (), |_| {});
         assert_eq!(map.size(), size_after_insert);
