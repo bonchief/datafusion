@@ -25,13 +25,14 @@
 //! - `PROBE_ROWS`: rows timed per case and table, at least, default 4 Mi
 
 use arrow::array::{ArrayRef, StringViewArray};
+use datafusion_common::instant::Instant;
 use datafusion_physical_expr_common::binary_map::OutputType;
 use datafusion_physical_expr_common::binary_view_map::{
     ArrowBytesViewMap, INITIAL_MAP_CAPACITY,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const BATCH: usize = 8192;
 const KIB: usize = 1024;
@@ -218,7 +219,7 @@ fn flush_case(len: usize, seed: u64) -> (Duration, usize, usize) {
 
 /// Runs `run` on `tables` threads at once and prints the mean ns per row.
 fn report(
-    label: String,
+    label: &str,
     tables: usize,
     run: impl Fn(u64) -> (Duration, usize, usize) + Sync,
 ) {
@@ -266,7 +267,7 @@ fn main() {
     for len in [80, 8] {
         for &tables in &threads {
             report(
-                format!("{len},{FLUSH_GROUPS},Flush,{FLUSH_GROUPS}"),
+                &format!("{len},{FLUSH_GROUPS},Flush,{FLUSH_GROUPS}"),
                 tables,
                 |seed| flush_case(len, seed),
             );
@@ -286,7 +287,7 @@ fn main() {
                         println!("{label},{tables},skipped,skipped");
                         continue;
                     }
-                    report(label, tables, |seed| case(groups, len, workload, seed));
+                    report(&label, tables, |seed| case(groups, len, workload, seed));
                 }
             }
         }

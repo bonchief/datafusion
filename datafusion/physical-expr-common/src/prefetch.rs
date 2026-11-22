@@ -142,6 +142,6 @@ mod tests {
         prefetch(std::ptr::null::<u8>());
         prefetch(std::ptr::without_provenance::<u64>(usize::MAX));
         let value = 7u64;
-        prefetch(&value);
+        prefetch(std::ptr::from_ref(&value));
     }
 }
