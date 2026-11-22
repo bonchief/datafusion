@@ -3,16 +3,17 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 //! Regex expressions
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 
 use crate::utils::transform_leaf_type_preserving_encoding;
 use arrow::array::ArrayDataBuilder;
 use arrow::array::BufferBuilder;
 use arrow::array::GenericStringArray;
-use arrow::array::StringViewBuilder;
+use arrow::array::make_view;
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait};
 use arrow::array::{ArrayAccessor, StringViewArray};
 use arrow::array::{ArrayIter, AsArray, new_null_array};
+use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use datafusion_common::ScalarValue;
@@ -31,8 +32,10 @@ use datafusion_expr::{
 };
 use datafusion_macros::user_doc;
 use regex::{CaptureLocations, Regex};
+use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind, Look};
 
 use super::compile_regex;
+use crate::strings::{MAX_INLINE_LEN, sub_view};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -262,96 +265,406 @@ fn regex_replace_posix_groups(replacement: &str) -> String {
         .into_owned()
 }
 
-struct ShortRegex {
-    /// Shortened anchored regex used to extract capture group 1 directly.
-    /// See [`try_build_short_extract_regex`] for details.
-    short_re: Regex,
-    /// Reusable capture locations for `short_re` to avoid per-row allocation.
-    locs: CaptureLocations,
-}
-
-/// Holds the normal compiled regex together with the optional fast path used
-/// for `regexp_replace(str, '^...(capture)...*$', '\1')`.
-struct OptimizedRegex {
-    /// Full regex used for the normal replacement path and as a correctness fallback.
+/// A replacement that is one capture group alone (`${N}`, `$N` or a group's
+/// name) of a pattern every match of which starts at the start of the value
+/// and ends at its end (`^...$` without the multi-line flag).
+///
+/// Such a pattern matches a value whole or not at all, and matches it at most
+/// once, so with or without the global flag `regexp_replace` returns the
+/// group's span of a matching value (empty when the group does not take part
+/// in the match) and an unmatched value unchanged. The result is a substring
+/// of the input, which a `Utf8View` result points at instead of copying.
+struct Extract {
     re: Regex,
-    /// Precomputed state for the direct-extraction fast path, when applicable.
-    short_re: Option<ShortRegex>,
+    locs: CaptureLocations,
+    group: usize,
+    short: Option<Short>,
+    prefix: Option<Prefix>,
 }
 
-impl OptimizedRegex {
-    /// Builds any reusable state needed by the extraction fast path.
-    ///
-    /// The fast path is only enabled for single replacements where the pattern
-    /// and replacement satisfy [`try_build_short_extract_regex`].
-    fn new(re: Regex, limit: usize, pattern: &str, replacement: &str) -> Self {
-        let short_re = if limit == 1 {
-            try_build_short_extract_regex(pattern, replacement)
-        } else {
+/// A pattern `^<prefix>([^X]+)X<tail>$` whose prefix is one of a few
+/// literals, as `^https?://(?:www\.)?([^/]+)/.*$`, matched without a regex:
+/// try each literal in the order the regex prefers them, and the first that
+/// starts the value, is followed by at least one byte before the next `X`,
+/// and leaves a rest [`Tail`] admits, decides the match.
+///
+/// The group cannot hold `X` and must be followed by it, so it ends at the
+/// first `X` after the literal; were the rest refused there, no shorter
+/// group could end at an `X` either, so the regex moves on to its next
+/// literal, as this does. No literal leading to a match means no match.
+///
+/// Ported from rust-lang/regex#1350 (`LiteralPrefixCapture`, open), which
+/// makes the `regex` crate's own engine do this, with the group and the
+/// tail taken from the pattern instead of fixed to group 1 and `.*`.
+struct Prefix {
+    /// Distinct literals in the regex's order of preference.
+    literals: Vec<Vec<u8>>,
+    stop: u8,
+    tail: Tail,
+}
+
+/// Each `(?:...)?` doubles the literals and each alternation adds to them,
+/// so a pattern with more takes the regex.
+const MAX_LITERALS: usize = 32;
+
+/// The pattern without a trailing repetition of a class before its end
+/// anchor, as `^https?://([^/]+)/` for `^https?://([^/]+)/.*$`.
+///
+/// The pattern matches where the shorter one matches and the class matches
+/// the rest of the value, and with the same groups: the repetition captures
+/// nothing and must reach the end, so the leftmost-first choice of the
+/// shorter pattern decides the match. It spares searching the rest of the
+/// value when [`Tail`] checks it with `memchr` instead. Group 0, the whole
+/// match, differs between the two, so a replacement by it never uses this.
+struct Short {
+    re: Regex,
+    locs: CaptureLocations,
+    tail: Tail,
+}
+
+/// The bytes the stripped repetition's class leaves out: none, or some of
+/// `\n` and `\r`, as `.` does with and without the `s` and `R` flags.
+enum Tail {
+    Any,
+    One(u8),
+    Two(u8, u8),
+}
+
+impl Extract {
+    /// Decides whether `pattern`, as `re` was compiled from it, and
+    /// `replacement`, in the `regex` crate's syntax, qualify; see [`Extract`].
+    fn new(re: &Regex, pattern: &str, replacement: &str) -> Option<Self> {
+        let group = group(re, replacement)?;
+        // `Regex::new` parses with the parser's default options.
+        let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+        let props = hir.properties();
+        if !props.look_set_prefix().contains(Look::Start)
+            || !props.look_set_suffix().contains(Look::End)
+        {
+            return None;
+        }
+        let prefix = Prefix::new(&hir, group);
+        let short = if group == 0 || prefix.is_some() {
             None
+        } else {
+            Short::new(&hir, re.captures_len())
         };
-
-        let short_re = short_re.map(|short_re| {
-            let locs = short_re.capture_locations();
-            ShortRegex { short_re, locs }
-        });
-
-        Self { re, short_re }
+        Some(Self {
+            re: re.clone(),
+            locs: re.capture_locations(),
+            group,
+            short,
+            prefix,
+        })
     }
 
-    /// Applies the direct-extraction fast path when it preserves the result of
-    /// `Regex::replacen`; otherwise falls back to the full regex replacement.
-    fn replacen<'a>(
-        &mut self,
-        val: &'a str,
-        limit: usize,
-        replacement: &str,
-    ) -> Cow<'a, str> {
-        // If this pattern is not eligible for direct extraction, use the full regex.
-        let Some(ShortRegex { short_re, locs }) = self.short_re.as_mut() else {
-            return self.re.replacen(val, limit, replacement);
+    /// The group's span in `val`, empty when the pattern matches without the
+    /// group, or `None` when it does not match.
+    fn find(&mut self, val: &str) -> Option<(usize, usize)> {
+        if let Some(prefix) = &self.prefix {
+            return prefix.find(val.as_bytes());
+        }
+        if let Some(short) = self.short.as_mut() {
+            // The pattern cannot match where the shorter one does not.
+            let end = short.re.captures_read(&mut short.locs, val)?.end();
+            if short.tail.admits(&val.as_bytes()[end..]) {
+                return Some(short.locs.get(self.group).unwrap_or_default());
+            }
+        }
+        self.re.captures_read(&mut self.locs, val)?;
+        Some(self.locs.get(self.group).unwrap_or_default())
+    }
+}
+
+impl Short {
+    fn new(hir: &Hir, groups: usize) -> Option<Self> {
+        let HirKind::Concat(items) = hir.kind() else {
+            return None;
         };
-
-        // If the shortened regex does not match, the original anchored regex would
-        // also leave the input unchanged.
-        if short_re.captures_read(locs, val).is_none() {
-            return Cow::Borrowed(val);
+        let [head @ .., rest, end] = items.as_slice() else {
+            return None;
+        };
+        if !matches!(end.kind(), HirKind::Look(Look::End)) {
+            return None;
         }
-
-        // `captures_read` succeeded, so the overall shortened match is present.
-        let match_end = locs.get(0).unwrap().1;
-        if memchr(b'\n', &val.as_bytes()[match_end..]).is_some() {
-            // If there is a newline after the match, we can't use the short
-            // regex since it won't match across lines. Fall back to the full
-            // regex replacement.
-            return self.re.replacen(val, limit, replacement);
+        let HirKind::Repetition(rep) = rest.kind() else {
+            return None;
+        };
+        if rep.min != 0 || rep.max.is_some() {
+            return None;
         }
-        // The fast path only applies to `${1}` replacements, so the result is
-        // either capture group 1 or the empty string if that group did not match.
-        if let Some((start, end)) = locs.get(1) {
-            Cow::Borrowed(&val[start..end])
-        } else {
-            Cow::Borrowed("")
+        let HirKind::Class(Class::Unicode(class)) = rep.sub.kind() else {
+            return None;
+        };
+        let tail = Tail::new(class)?;
+        let re = Regex::new(&Hir::concat(head.to_vec()).to_string()).ok()?;
+        (re.captures_len() == groups).then(|| Self {
+            locs: re.capture_locations(),
+            re,
+            tail,
+        })
+    }
+}
+
+impl Prefix {
+    fn new(hir: &Hir, group: usize) -> Option<Self> {
+        let HirKind::Concat(items) = hir.kind() else {
+            return None;
+        };
+        let (first, items) = items.split_first()?;
+        if !matches!(first.kind(), HirKind::Look(Look::Start)) {
+            return None;
+        }
+        let at = items
+            .iter()
+            .position(|item| matches!(item.kind(), HirKind::Capture(_)))?;
+        let mut literals = vec![Vec::new()];
+        for item in &items[..at] {
+            literals = concat(&literals, &variants(item)?)?;
+        }
+        let HirKind::Capture(capture) = items[at].kind() else {
+            return None;
+        };
+        if capture.index as usize != group {
+            return None;
+        }
+        let stop = stop(&capture.sub)?;
+        let [next, rest, end] = &items[at + 1..] else {
+            return None;
+        };
+        if !matches!(next.kind(), HirKind::Literal(lit) if lit.0.as_ref() == [stop])
+            || !matches!(end.kind(), HirKind::Look(Look::End))
+        {
+            return None;
+        }
+        let HirKind::Repetition(rep) = rest.kind() else {
+            return None;
+        };
+        let HirKind::Class(Class::Unicode(class)) = rep.sub.kind() else {
+            return None;
+        };
+        if rep.min != 0 || rep.max.is_some() {
+            return None;
+        }
+        let tail = Tail::new(class)?;
+        let mut distinct: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
+        for literal in literals {
+            if !distinct.contains(&literal) {
+                distinct.push(literal);
+            }
+        }
+        Some(Self {
+            literals: distinct,
+            stop,
+            tail,
+        })
+    }
+
+    /// The group's span, or `None` when the pattern does not match.
+    fn find(&self, val: &[u8]) -> Option<(usize, usize)> {
+        self.literals.iter().find_map(|literal| {
+            let start = literal.len();
+            let rest = val.strip_prefix(literal.as_slice())?;
+            let end = start + memchr(self.stop, rest).filter(|&len| len > 0)?;
+            self.tail.admits(&val[end + 1..]).then_some((start, end))
+        })
+    }
+}
+
+/// The literals `hir` matches, in the regex's order of preference, when it
+/// is built of literals, the empty pattern, concatenations, alternations and
+/// `?` alone.
+fn variants(hir: &Hir) -> Option<Vec<Vec<u8>>> {
+    match hir.kind() {
+        HirKind::Empty => Some(vec![Vec::new()]),
+        HirKind::Literal(lit) => Some(vec![lit.0.to_vec()]),
+        HirKind::Concat(items) => items
+            .iter()
+            .try_fold(vec![Vec::new()], |acc, item| concat(&acc, &variants(item)?)),
+        HirKind::Repetition(rep) if rep.min == 0 && rep.max == Some(1) => {
+            let mut out = variants(&rep.sub)?;
+            if out.len() >= MAX_LITERALS {
+                return None;
+            }
+            if rep.greedy {
+                out.push(Vec::new());
+            } else {
+                out.insert(0, Vec::new());
+            }
+            Some(out)
+        }
+        HirKind::Alternation(branches) => {
+            let mut out = Vec::new();
+            for branch in branches {
+                out.extend(variants(branch)?);
+                if out.len() > MAX_LITERALS {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Every literal of `heads` followed by every literal of `tails`: a regex
+/// exhausts the later part's choices before it backtracks into the earlier.
+fn concat(heads: &[Vec<u8>], tails: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    if heads.len().checked_mul(tails.len())? > MAX_LITERALS {
+        return None;
+    }
+    Some(
+        heads
+            .iter()
+            .flat_map(|head| tails.iter().map(move |tail| [&head[..], tail].concat()))
+            .collect(),
+    )
+}
+
+/// The byte `X` of a greedy `[^X]+`, a class of every char but one ASCII.
+fn stop(hir: &Hir) -> Option<u8> {
+    let HirKind::Repetition(rep) = hir.kind() else {
+        return None;
+    };
+    if rep.min != 1 || rep.max.is_some() || !rep.greedy {
+        return None;
+    }
+    let HirKind::Class(Class::Unicode(class)) = rep.sub.kind() else {
+        return None;
+    };
+    let mut left = class.clone();
+    left.negate();
+    match left.ranges() {
+        [range] if range.start() == range.end() && range.start().is_ascii() => {
+            Some(range.start() as u8)
+        }
+        _ => None,
+    }
+}
+
+impl Tail {
+    fn new(class: &ClassUnicode) -> Option<Self> {
+        let mut left = class.clone();
+        left.negate();
+        let mut bytes = Vec::with_capacity(2);
+        for range in left.iter() {
+            if u32::from(range.end()) - u32::from(range.start()) > 3 {
+                return None;
+            }
+            for c in range.start()..=range.end() {
+                if c != '\n' && c != '\r' {
+                    return None;
+                }
+                bytes.push(c as u8);
+            }
+        }
+        match bytes.as_slice() {
+            [] => Some(Self::Any),
+            [a] => Some(Self::One(*a)),
+            [a, b] => Some(Self::Two(*a, *b)),
+            _ => None,
+        }
+    }
+
+    fn admits(&self, rest: &[u8]) -> bool {
+        match self {
+            Self::Any => true,
+            Self::One(a) => memchr(*a, rest).is_none(),
+            Self::Two(a, b) => memchr2(*a, *b, rest).is_none(),
         }
     }
 }
 
-/// For anchored patterns like `^...(capture)....*$` where the replacement
-/// is `\1`, build a shorter regex (stripping trailing `.*$`) and use
-/// `captures_read` with `CaptureLocations` for direct extraction — no
-/// `expand()`, no `String` allocation.
-/// This pattern appears in ClickBench Q28: which uses a regexp like
-/// `^https?://(?:www\.)?([^/]+)/.*$`
-fn try_build_short_extract_regex(pattern: &str, replacement: &str) -> Option<Regex> {
-    if replacement != "${1}" || !pattern.starts_with('^') || !pattern.ends_with(".*$") {
+/// The capture group `replacement` consists of alone, read as
+/// `Regex::replacen` reads it: `$name` takes the longest run of
+/// `[0-9A-Za-z_]`, `${name}` anything up to `}`, and a name that parses as a
+/// number is that group. A group the pattern lacks does not qualify.
+fn group(re: &Regex, replacement: &str) -> Option<usize> {
+    let name = replacement.strip_prefix('$')?;
+    let name = match name.strip_prefix('{') {
+        Some(name) => name.strip_suffix('}').filter(|n| !n.contains('}'))?,
+        None => Some(name)
+            .filter(|n| n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()))?,
+    };
+    if name.is_empty() {
         return None;
     }
-    let short = &pattern[..pattern.len() - 3];
-    let re = Regex::new(short).ok()?;
-    if re.captures_len() != 2 {
-        return None;
+    let index = name
+        .parse::<usize>()
+        .ok()
+        .or_else(|| re.capture_names().position(|n| n == Some(name)))?;
+    (index < re.captures_len()).then_some(index)
+}
+
+/// The views of a `Utf8View` result. A value that is an input value or a
+/// substring of one points into the input's own buffers; any other value of
+/// more than 12 bytes is copied into new buffers after them.
+struct Views<'a> {
+    input: &'a StringViewArray,
+    views: Vec<u128>,
+    /// New buffers, filled before `data`.
+    blocks: Vec<Buffer>,
+    data: Vec<u8>,
+}
+
+impl<'a> Views<'a> {
+    fn new(input: &'a StringViewArray) -> Self {
+        Self {
+            input,
+            views: Vec::with_capacity(input.len()),
+            blocks: Vec::new(),
+            data: Vec::new(),
+        }
     }
-    Some(re)
+
+    fn view(&mut self, view: u128) {
+        self.views.push(view);
+    }
+
+    fn push(&mut self, value: &[u8]) -> Result<()> {
+        if value.len() <= MAX_INLINE_LEN {
+            self.views.push(make_view(value, 0, 0));
+            return Ok(());
+        }
+        if self.data.len() + value.len() > u32::MAX as usize {
+            self.blocks
+                .push(Buffer::from_vec(std::mem::take(&mut self.data)));
+        }
+        let index = self.input.data_buffers().len() + self.blocks.len();
+        let Ok(block) = u32::try_from(index) else {
+            return exec_err!("regexp_replace result has too many buffers");
+        };
+        // At most `u32::MAX` after the check above.
+        let offset = self.data.len() as u32;
+        self.views.push(make_view(value, block, offset));
+        self.data.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn finish(mut self) -> ArrayRef {
+        if !self.data.is_empty() {
+            self.blocks.push(Buffer::from_vec(self.data));
+        }
+        let shared = self.input.data_buffers();
+        let buffers = if self.blocks.is_empty() {
+            Arc::clone(shared)
+        } else {
+            shared.iter().cloned().chain(self.blocks).collect()
+        };
+        // SAFETY: every view is inline, an input view, a view `sub_view` made
+        // of a span of an input value in the same buffer, or `make_view` of
+        // bytes appended at its offset in the buffer it names. Every value is
+        // a whole `&str` or a span a regex matched, which starts and ends on
+        // char boundaries, so each view addresses valid UTF-8 in bounds.
+        let array = unsafe {
+            StringViewArray::new_unchecked(
+                ScalarBuffer::from(self.views),
+                buffers,
+                self.input.nulls().cloned(),
+            )
+        };
+        Arc::new(array)
+    }
 }
 
 /// Replaces substring(s) matching a PCRE-like regular expression.
@@ -614,7 +927,7 @@ fn regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
     // with rust ones.
     let replacement = regex_replace_posix_groups(replacement);
 
-    let mut opt_re = OptimizedRegex::new(re, limit, &pattern, &replacement);
+    let mut extract = Extract::new(&re, &pattern, &replacement);
 
     let string_array_type = args[0].data_type();
     match string_array_type {
@@ -628,13 +941,26 @@ fn regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
             let mut new_offsets = BufferBuilder::<T>::new(string_array.len() + 1);
             new_offsets.append(T::zero());
 
-            string_array.iter().for_each(|val| {
+            for val in string_array.iter() {
                 if let Some(val) = val {
-                    let result = opt_re.replacen(val, limit, replacement.as_str());
-                    vals.append_slice(result.as_bytes());
+                    match extract.as_mut() {
+                        Some(extract) => match extract.find(val) {
+                            Some((start, end)) => {
+                                vals.append_slice(&val.as_bytes()[start..end])
+                            }
+                            None => vals.append_slice(val.as_bytes()),
+                        },
+                        None => {
+                            let result = re.replacen(val, limit, replacement.as_str());
+                            vals.append_slice(result.as_bytes());
+                        }
+                    }
                 }
-                new_offsets.append(T::from_usize(vals.len()).unwrap());
-            });
+                let Some(offset) = T::from_usize(vals.len()) else {
+                    return exec_err!("regexp_replace result is too large");
+                };
+                new_offsets.append(offset);
+            }
 
             let data = ArrayDataBuilder::new(GenericStringArray::<T>::DATA_TYPE)
                 .len(string_array.len())
@@ -645,21 +971,31 @@ fn regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
             Ok(Arc::new(result_array) as ArrayRef)
         }
         DataType::Utf8View => {
-            let string_view_array = as_string_view_array(&args[0])?;
-
-            let mut builder = StringViewBuilder::with_capacity(string_view_array.len());
-
-            for val in string_view_array.iter() {
-                if let Some(val) = val {
-                    let result = opt_re.replacen(val, limit, replacement.as_str());
-                    builder.append_value(result.as_ref());
-                } else {
-                    builder.append_null();
+            let array = as_string_view_array(&args[0])?;
+            let mut out = Views::new(array);
+            for (i, &view) in array.views().iter().enumerate() {
+                if array.is_null(i) {
+                    out.view(0);
+                    continue;
+                }
+                let val = array.value(i);
+                match extract.as_mut() {
+                    Some(extract) => match extract.find(val) {
+                        Some((start, end)) => {
+                            out.view(sub_view(view, val.as_bytes(), start..end))
+                        }
+                        None => out.view(view),
+                    },
+                    None => match re.replacen(val, limit, replacement.as_str()) {
+                        // `replacen` borrows the value only when nothing matched.
+                        Cow::Borrowed(result) if std::ptr::eq(result, val) => {
+                            out.view(view)
+                        }
+                        result => out.push(result.as_bytes())?,
+                    },
                 }
             }
-
-            let result = builder.finish();
-            Ok(Arc::new(result) as ArrayRef)
+            Ok(out.finish())
         }
         _ => unreachable!(
             "Invalid data type for regexp_replace: {}",
@@ -1107,5 +1443,198 @@ mod tests {
         .unwrap();
         assert_eq!(re.as_ref(), &expected);
         assert_eq!(re.null_count(), 3);
+    }
+
+    fn static_replace(
+        values: ArrayRef,
+        pattern: &str,
+        rep: &str,
+        flags: Option<&str>,
+    ) -> ArrayRef {
+        let large = values.data_type() == &DataType::LargeUtf8;
+        let scalar = |s: &str| -> ArrayRef {
+            if large {
+                Arc::new(LargeStringArray::from(vec![s]))
+            } else {
+                Arc::new(StringArray::from(vec![s]))
+            }
+        };
+        let mut args = vec![values, scalar(pattern), scalar(rep)];
+        args.extend(flags.map(scalar));
+        if large {
+            regexp_replace_static_pattern_replace::<i64>(&args).unwrap()
+        } else {
+            regexp_replace_static_pattern_replace::<i32>(&args).unwrap()
+        }
+    }
+
+    fn strings(array: &ArrayRef) -> Vec<Option<String>> {
+        let own = |v: Option<&str>| v.map(String::from);
+        match array.data_type() {
+            DataType::Utf8View => array.as_string_view().iter().map(own).collect(),
+            DataType::LargeUtf8 => array.as_string::<i64>().iter().map(own).collect(),
+            _ => array.as_string::<i32>().iter().map(own).collect(),
+        }
+    }
+
+    /// What `regex` itself returns for `regexp_replace(values, pattern, rep, flags)`.
+    fn oracle(
+        values: &[Option<String>],
+        pattern: &str,
+        rep: &str,
+        flags: Option<&str>,
+    ) -> Vec<Option<String>> {
+        let inner = flags.map_or(String::new(), |f| f.replace('g', ""));
+        let full = if inner.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("(?{inner}){pattern}")
+        };
+        let re = Regex::new(&full).unwrap();
+        let rep = regex_replace_posix_groups(rep);
+        let all = flags.is_some_and(|f| f.contains('g'));
+        values
+            .iter()
+            .map(|v| {
+                v.as_deref().map(|v| {
+                    if all {
+                        re.replace_all(v, rep.as_str()).into_owned()
+                    } else {
+                        re.replace(v, rep.as_str()).into_owned()
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The same values as `Utf8View` inline and in one buffer, in buffers of
+    /// 16 bytes, sliced, as `Utf8` and as `LargeUtf8`.
+    fn layouts(values: &[Option<String>]) -> Vec<(&'static str, ArrayRef)> {
+        let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+        let mut blocks = StringViewBuilder::new().with_fixed_block_size(16);
+        for v in &refs {
+            blocks.append_option(*v);
+        }
+        let mut out: Vec<(&'static str, ArrayRef)> = vec![
+            ("view", Arc::new(StringViewArray::from(refs.clone()))),
+            ("view-blocks", Arc::new(blocks.finish())),
+            ("utf8", Arc::new(StringArray::from(refs.clone()))),
+            ("large", Arc::new(LargeStringArray::from(refs.clone()))),
+        ];
+        if refs.len() > 2 {
+            let view = StringViewArray::from(refs.clone());
+            out.push(("view-sliced", Arc::new(view.slice(1, refs.len() - 2))));
+        }
+        out
+    }
+
+    fn check(values: &[Option<String>], pattern: &str, rep: &str, flags: Option<&str>) {
+        for (layout, input) in layouts(values) {
+            let want = oracle(&strings(&input), pattern, rep, flags);
+            let result = static_replace(Arc::clone(&input), pattern, rep, flags);
+            result.to_data().validate_full().unwrap();
+            assert_eq!(result.data_type(), input.data_type());
+            let got = strings(&result);
+            for (row, (got, want)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    got,
+                    want,
+                    "pattern {pattern:?} replacement {rep:?} flags {flags:?} \
+                     layout {layout} row {row} value {:?}",
+                    strings(&input)[row]
+                );
+            }
+        }
+    }
+
+    /// Every path the pattern and replacement select (a group of a pattern
+    /// anchored at both ends, with a literal prefix or a stripped tail or
+    /// neither, and the general replacement) returns what the regex crate's
+    /// own replacement does, on each string type.
+    #[test]
+    fn test_static_pattern_regexp_replace_matches_regex_crate() {
+        let values: Vec<Option<String>> = [
+            None,
+            Some(""),
+            Some("http://a.b/"),
+            Some("https://www.example.com/path?q=1"),
+            Some("https://www.x.com/path\nmore"),
+            Some("http://www./x"),
+            Some("http://example.com"),
+            Some("https://www.longer-than-twelve-bytes.example/a/b/c"),
+            Some("http://a.b/c\rd"),
+            Some("aaa"),
+            Some("xbz"),
+            Some("abc/x"),
+            Some("a/x"),
+            Some("abx/y"),
+            Some("ab/b\ncd/e"),
+            Some("a\nb/x"),
+        ]
+        .into_iter()
+        .map(|v| v.map(String::from))
+        .collect();
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", None),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", Some("g")),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", Some("i")),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", Some("m")),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", Some("s")),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", Some("R")),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\0", None),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"x\1", None),
+            (r"^https?://([^/?]+)[^?]*(?:\?.*)?$", r"\1", None),
+            (r"^(?P<h>[a-z]+)://.*$", r"${h}", None),
+            (r"^(x)?(.*)$", r"\1", None),
+            // `.*$` stripped from the pattern's text would cut the
+            // alternation's second branch short.
+            (r"^(a)|b.*$", r"\1", None),
+            (r"^(a*)$", r"\1", Some("g")),
+            (r"^(?:a|ab)([^/]+)/.*$", r"\1", None),
+            (r"^a??([^/]+)/.*$", r"\1", None),
+            (r"^a?([^/]+)/.*$", r"\1", None),
+            (r"^a?(?:ab)?([^/]+)/.*$", r"\1", None),
+            ("^(?:a|ab/b\nc)([^/]+)/.*$", r"\1", None),
+            (r"^a([^/]+)/.*$", r"\1", None),
+            (r"://([^/]+)", r"\1", None),
+            (r"^https?://([^/]+)/([^?]*)", r"\2-\1", None),
+            (r"[a-z]+", "N", Some("g")),
+        ];
+        for (pattern, rep, flags) in cases {
+            check(&values, pattern, rep, *flags);
+        }
+    }
+
+    /// A `Utf8View` result of a group of a pattern anchored at both ends, or
+    /// of a replacement that leaves values unchanged, holds no bytes of its
+    /// own: its views point into the input's buffers.
+    #[test]
+    fn test_static_pattern_regexp_replace_view_shares_input() {
+        let values = StringViewArray::from(vec![
+            Some("https://www.longer-than-twelve-bytes.example/a"),
+            None,
+            Some("https://short.ex/"),
+            Some("not a url at all, but long"),
+        ]);
+        let input: ArrayRef = Arc::new(values.clone());
+        for (pattern, rep) in [
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1"),
+            (r"^(?i)https?://(?:www\.)?([^/]+)/.*$", r"\1"),
+            (r"xyzzy(\d)", r"\1"),
+        ] {
+            let result = static_replace(Arc::clone(&input), pattern, rep, None);
+            let result = result.as_string_view();
+            assert!(Arc::ptr_eq(result.data_buffers(), values.data_buffers()));
+            assert_eq!(result.null_count(), 1);
+        }
+        let result =
+            static_replace(input, r"^https?://(?:www\.)?([^/]+)/.*$", r"\1", None);
+        let expected = StringViewArray::from(vec![
+            Some("longer-than-twelve-bytes.example"),
+            None,
+            Some("short.ex"),
+            Some("not a url at all, but long"),
+        ]);
+        assert_eq!(result.as_string_view(), &expected);
     }
 }
