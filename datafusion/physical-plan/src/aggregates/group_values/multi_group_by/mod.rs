@@ -1084,31 +1084,16 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         Ok(output)
     }
 
+    /// Reserves the map and the group columns. The hash and vectorized
+    /// operation buffers hold one input batch, not the groups, so they keep
+    /// the size of the largest batch seen instead of growing to `capacity`.
     fn reserve_groups(&mut self, capacity: usize) {
         self.map
             .reserve(capacity.saturating_sub(self.map.len()), |entry| entry.0);
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
-        self.hashes_buffer
-            .reserve_exact(capacity.saturating_sub(self.hashes_buffer.len()));
         for column in &mut self.group_values {
             column.reserve_groups(capacity);
         }
-        let buffers = &mut self.vectorized_operation_buffers;
-        buffers
-            .append_row_indices
-            .reserve_exact(capacity.saturating_sub(buffers.append_row_indices.len()));
-        buffers
-            .equal_to_row_indices
-            .reserve_exact(capacity.saturating_sub(buffers.equal_to_row_indices.len()));
-        buffers
-            .equal_to_group_indices
-            .reserve_exact(capacity.saturating_sub(buffers.equal_to_group_indices.len()));
-        buffers
-            .remaining_row_indices
-            .reserve_exact(capacity.saturating_sub(buffers.remaining_row_indices.len()));
-        buffers
-            .equal_to_results
-            .reserve(capacity.saturating_sub(buffers.equal_to_results.len()));
     }
 
     fn size(&self) -> usize {
@@ -1327,8 +1312,7 @@ mod tests {
 
     use arrow::array::{
         Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
-        Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
     use arrow::datatypes::{

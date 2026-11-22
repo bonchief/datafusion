@@ -34,6 +34,7 @@ use crate::metrics::{
 };
 use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use crate::{SendableRecordBatchStream, metrics};
+use datafusion_common::instant::Instant;
 
 /// Hash aggregation is implemented in two stages: partial and final. This
 /// stream implements the partial stage.
@@ -194,6 +195,10 @@ pub(crate) struct FinalHashAggregateStream {
     spill_context: Option<Box<AggregateSpill>>,
     /// `None` unless `hash_aggregate_bucket_threshold` is set and applies.
     bucketing: Option<Arc<BucketedAggregation>>,
+    /// Time from the end of the input to the end of the output: the work
+    /// that waits for all input, plus the time the consumer takes to ask for
+    /// each output batch.
+    tail_time: metrics::Time,
 }
 
 #[derive(PartialEq)]
@@ -728,6 +733,9 @@ impl FinalHashAggregateStream {
             ))
         });
 
+        let tail_time =
+            MetricBuilder::new(&agg.metrics).subset_time("tail_time", partition);
+
         Ok(Self {
             schema,
             input,
@@ -737,6 +745,7 @@ impl FinalHashAggregateStream {
             hash_table: Some(hash_table),
             spill_context,
             bucketing,
+            tail_time,
         })
     }
 
@@ -763,39 +772,54 @@ impl FinalHashAggregateStream {
                 .await?;
             self.close_input();
 
-            if let (Some(buckets), Some(bucketing)) = (buckets, self.bucketing.clone()) {
-                // The table handed its groups over to the buckets, whose
-                // memory this stream's reservation already covers.
-                drop(hash_table);
-                let empty = self.reservation.new_empty();
-                let bucket_reservation = std::mem::replace(&mut self.reservation, empty);
-                let mut emitter = emitter;
-                let mut output = bucketing.output_stream(
-                    buckets,
-                    bucket_reservation,
-                    self.baseline_metrics.clone(),
-                );
-                while let Some(batch) = output.next().await.transpose()? {
-                    emitter.emit(batch).await;
-                }
-                return Ok(());
-            }
-
-            match spill_context {
-                // - If spilled before, perform merging spill runs
-                Some(spill_context) if spill_context.has_spills() => {
-                    self.produce_output_from_spills(hash_table, spill_context, emitter)
-                        .await?
-                }
-                // Either all the input fit in memory or hit soft group limit with no spilling
-                spill_context => {
-                    self.produce_output_from_memory(hash_table, spill_context, emitter)
-                        .await?
-                }
-            }
-
+            let ended = Instant::now();
+            let tail_time = self.tail_time.clone();
+            self.produce_output(hash_table, spill_context, buckets, emitter)
+                .await?;
+            tail_time.add_elapsed(ended);
             Ok(())
         })
+    }
+
+    async fn produce_output(
+        &mut self,
+        hash_table: AggregateHashTable<FinalMarker>,
+        spill_context: Option<Box<AggregateSpill>>,
+        buckets: Option<FinalBuckets>,
+        emitter: TryEmitter<RecordBatch, DataFusionError>,
+    ) -> Result<()> {
+        if let (Some(buckets), Some(bucketing)) = (buckets, self.bucketing.clone()) {
+            // The table handed its groups over to the buckets, whose
+            // memory this stream's reservation already covers.
+            drop(hash_table);
+            let empty = self.reservation.new_empty();
+            let bucket_reservation = std::mem::replace(&mut self.reservation, empty);
+            let mut emitter = emitter;
+            let mut output = bucketing.output_stream(
+                buckets,
+                bucket_reservation,
+                self.baseline_metrics.clone(),
+            );
+            while let Some(batch) = output.next().await.transpose()? {
+                emitter.emit(batch).await;
+            }
+            return Ok(());
+        }
+
+        match spill_context {
+            // - If spilled before, perform merging spill runs
+            Some(spill_context) if spill_context.has_spills() => {
+                self.produce_output_from_spills(hash_table, spill_context, emitter)
+                    .await?
+            }
+            // Either all the input fit in memory or hit soft group limit with no spilling
+            spill_context => {
+                self.produce_output_from_memory(hash_table, spill_context, emitter)
+                    .await?
+            }
+        }
+
+        Ok(())
     }
 
     fn close_input(&mut self) {
@@ -855,7 +879,12 @@ impl FinalHashAggregateStream {
                 (buckets.as_mut(), self.bucketing.as_ref())
             {
                 buckets.route(&batch)?;
-                bucketing.compact(buckets, &mut compaction_table)?;
+                bucketing.compact(
+                    buckets,
+                    &mut compaction_table,
+                    &self.reservation,
+                    0,
+                )?;
                 bucketing.reserve(&self.reservation, 0, buckets)?;
                 continue;
             }
@@ -1548,20 +1577,23 @@ mod tests {
             .sum_by_name("bucket_splits")
             .map(|value| value.as_usize())
             .unwrap_or(0);
-        BUCKET_COMPACTIONS.with(|compactions| {
-            compactions.set(
-                metrics
-                    .sum_by_name("bucket_compactions")
-                    .map(|value| value.as_usize())
-                    .unwrap_or(0),
-            )
-        });
+        let count = |name| {
+            metrics
+                .sum_by_name(name)
+                .map(|value| value.as_usize())
+                .unwrap_or(0)
+        };
+        BUCKET_COMPACTIONS
+            .with(|compactions| compactions.set(count("bucket_compactions")));
+        BUCKET_CHUNKS.with(|chunks| chunks.set(count("bucket_chunks")));
         Ok((rows, bucket_splits, metrics.spill_count().unwrap_or(0)))
     }
 
     thread_local! {
         /// `bucket_compactions` metric of the last [`run_final_hash_aggregate`]
         static BUCKET_COMPACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// `bucket_chunks` metric of the last [`run_final_hash_aggregate`]
+        static BUCKET_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     #[tokio::test]
@@ -1574,6 +1606,17 @@ mod tests {
         assert!(rows.iter().all(|&(_, count)| count == 40));
         assert!(splits >= 1);
         assert_eq!(spills, 0);
+        // Eager buckets aggregate their rows as they arrive instead
+        let chunks = BUCKET_CHUNKS.with(|chunks| chunks.get());
+        assert!(chunks > 0, "buckets were aggregated as input arrived");
+        assert_eq!(BUCKET_COMPACTIONS.with(|compactions| compactions.get()), 0);
+
+        // Buckets that reached the threshold and were split again are
+        // compacted while input arrives
+        let (rows, splits, _) = run_final_hash_aggregate(20_000, 40, 100, None).await?;
+        assert_eq!(rows.len(), 20_000);
+        assert!(rows.iter().all(|&(_, count)| count == 40));
+        assert!(splits > 1);
         let compactions = BUCKET_COMPACTIONS.with(|compactions| compactions.get());
         assert!(compactions > 0, "buckets were compacted");
         Ok(())

@@ -26,6 +26,11 @@ use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
 
+/// Upper bound of the hash map's bytes per group of a presized table: the
+/// map keeps between 8/7 and 16/7 slots per entry, a slot is a 16 byte entry
+/// plus a control byte, and the table keeps a group index per row.
+const MAP_BYTES_PER_GROUP: usize = 48;
+
 /// What a hash aggregation stream needs to split the groups of a hash table
 /// that has reached `hash_aggregate_bucket_threshold` into [`FinalBuckets`],
 /// and to aggregate those buckets one after another.
@@ -33,6 +38,28 @@ use crate::stream::RecordBatchStreamAdapter;
 /// The buckets hold partial state rows, whatever the input of the stream is:
 /// a final aggregation routes its input as is, a single stage aggregation
 /// routes the state of the table that aggregates its raw input.
+///
+/// # When a bucket is aggregated
+///
+/// An eager bucket (see [`FinalBuckets`]) aggregates a chunk of its rows
+/// into its own table whenever [`Self::compact`] finds it due, right after
+/// the input batch that made it due was routed, in the stream's own task:
+/// no other task or thread is started. After input ends each bucket, in
+/// bucket order, aggregates its remaining rows into its table and emits it.
+/// A bucket that is no longer eager is aggregated as a whole after input
+/// ends, as it was before eager buckets existed.
+///
+/// # Memory
+///
+/// The stream's reservation covers, at every point where it is resized, the
+/// memory held besides the buckets plus every bucket's buffered rows and
+/// table ([`FinalBuckets::memory_size`]). Before a table is presized for a
+/// chunk, the reservation is grown to cover the presized table
+/// ([`Self::presize`]); after each routed batch it is set to what is held
+/// ([`Self::reserve`]), spilling the largest bucket, rows and table, for as
+/// long as the pool refuses it. While output is produced, the buckets that
+/// wait for their turn stay charged until they are aggregated, and each
+/// table is released once it has been emitted.
 pub(super) struct BucketedAggregation {
     /// Number of groups in one hash table that triggers bucketing
     threshold: usize,
@@ -53,6 +80,9 @@ pub(super) struct BucketedAggregation {
     bucket_splits: metrics::Count,
     /// Number of times the rows of a bucket were replaced by their aggregated state
     bucket_compactions: metrics::Count,
+    /// Number of times the buffered rows of an eager bucket were aggregated
+    /// into its table while input was still arriving
+    bucket_chunks: metrics::Count,
 }
 
 /// What [`BucketedAggregation::output_stream`] works with while it runs.
@@ -79,6 +109,8 @@ impl BucketedAggregation {
             MetricBuilder::new(&agg.metrics).counter("bucket_splits", partition);
         let bucket_compactions =
             MetricBuilder::new(&agg.metrics).counter("bucket_compactions", partition);
+        let bucket_chunks =
+            MetricBuilder::new(&agg.metrics).counter("bucket_chunks", partition);
         Self {
             threshold,
             agg,
@@ -89,6 +121,7 @@ impl BucketedAggregation {
             spill_manager,
             bucket_splits,
             bucket_compactions,
+            bucket_chunks,
         }
     }
 
@@ -144,13 +177,54 @@ impl BucketedAggregation {
         Ok(buckets)
     }
 
-    /// Replaces the rows of every bucket that is due for it by their aggregated
-    /// state. See the compaction section of [`FinalBuckets`].
+    /// Aggregates the buffered rows of every eager bucket that is due for it
+    /// into the bucket's table, then replaces the rows of every other bucket
+    /// that is due for it by their aggregated state. See the sections on
+    /// aggregating as input arrives and on compaction of [`FinalBuckets`].
+    ///
+    /// `table` is the table that compacts buckets, and the template of the
+    /// buckets' tables. `other_bytes` is the memory held besides `buckets`,
+    /// for the reservation that presizes a bucket's table.
     pub(super) fn compact(
         &self,
         buckets: &mut FinalBuckets,
         table: &mut Option<AggregateHashTable<FinalMarker>>,
+        reservation: &MemoryReservation,
+        other_bytes: usize,
     ) -> Result<()> {
+        let can_split = buckets.level() + 1 < MAX_BUCKET_LEVELS;
+        while let Some(index) = buckets.bucket_to_aggregate() {
+            let template = match table {
+                Some(table) => table,
+                None => table.insert(self.new_table()?),
+            };
+            let mut bucket_table = match buckets.take_table(index) {
+                Some(bucket_table) => bucket_table,
+                None => template.empty_like()?,
+            };
+            let batches = buckets.take_bucket(index)?;
+            let rows = batches.iter().map(RecordBatch::num_rows).sum();
+            let bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+            let held = other_bytes + buckets.memory_size() + bytes;
+            // A table that cannot be split any more grows past the threshold
+            let limit = if can_split {
+                self.threshold
+            } else {
+                usize::MAX
+            };
+            self.presize(&mut bucket_table, rows, bytes, limit, reservation, held)?;
+            for batch in &batches {
+                bucket_table.aggregate_batch(batch)?;
+            }
+            drop(batches);
+            if can_split && bucket_table.building_group_count() >= self.threshold {
+                buckets.stop_eager(index, bucket_table.take_state_batch()?, rows);
+            } else {
+                buckets.put_table(index, bucket_table, rows);
+            }
+            self.bucket_chunks.add(1);
+        }
+
         while let Some(index) = buckets.bucket_to_compact() {
             let table = match table {
                 Some(table) => table,
@@ -169,6 +243,46 @@ impl BucketedAggregation {
             self.bucket_compactions.add(1);
         }
         Ok(())
+    }
+
+    /// Makes room in `table` for the groups of `rows` more state rows of
+    /// `bytes` bytes, at most `limit` groups in all, so that aggregating them
+    /// neither grows nor rehashes the table: the rows are an upper bound on
+    /// the groups they add.
+    ///
+    /// The memory is reserved before it is allocated: `held` plus the table
+    /// plus an upper bound of its growth (the state row of each new group,
+    /// which mirrors the table's group and accumulator columns for the fixed
+    /// width state that is bucketed, and [`MAP_BYTES_PER_GROUP`]). If the
+    /// pool refuses it, the table is left to grow as it aggregates, and the
+    /// caller's reservation after the aggregation decides what to spill.
+    fn presize(
+        &self,
+        table: &mut AggregateHashTable<FinalMarker>,
+        rows: usize,
+        bytes: usize,
+        limit: usize,
+        reservation: &MemoryReservation,
+        held: usize,
+    ) -> Result<()> {
+        let groups = table.building_group_count();
+        let target = groups.saturating_add(rows).min(limit.max(groups));
+        if target <= groups {
+            return Ok(());
+        }
+        let row_bytes = bytes / rows.max(1);
+        let growth = (target - groups).saturating_mul(row_bytes + MAP_BYTES_PER_GROUP);
+        let size = held
+            .saturating_add(table.memory_size())
+            .saturating_add(growth);
+        match reservation.try_resize(size) {
+            Ok(()) => {
+                table.reserve_groups(target);
+                Ok(())
+            }
+            Err(DataFusionError::ResourcesExhausted(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Reserves `other_bytes` plus the memory of `buckets`, spilling buckets
@@ -206,6 +320,10 @@ impl BucketedAggregation {
 
     /// Aggregates the buckets one after another, each with a table of its
     /// own size, and emits the groups of a bucket before reading the next one.
+    /// An eager bucket finishes in the table that aggregated its rows while
+    /// input arrived; the others share one table, which keeps its capacity
+    /// from one bucket to the next. Every table is presized for the rows that
+    /// are left in the bucket, if they are in memory.
     ///
     /// A bucket whose table reaches the bucketing threshold again, or does
     /// not fit in memory, is split into buckets of the next level.
@@ -257,19 +375,42 @@ impl BucketedAggregation {
             let mut waiting_bytes: usize =
                 sources.iter().map(|source| source.memory_size()).sum();
 
-            // One table aggregates all the buckets, one after another
+            let can_split = next_level < MAX_BUCKET_LEVELS;
+            let limit = if can_split {
+                self.threshold
+            } else {
+                usize::MAX
+            };
+
+            // An eager bucket finishes in its own table. One table aggregates
+            // all the other buckets, one after another.
             let mut reusable_table = None;
-            for source in sources {
+            for mut source in sources {
+                waiting_bytes -= source.memory_size();
+                let eager = source.take_table();
                 let mut source_bytes = source.memory_size();
-                waiting_bytes -= source_bytes;
+                let rows = source.rows();
                 let mut input = source.into_stream(&self.state_schema);
 
                 let mut timer = elapsed_compute.timer();
-                let mut hash_table = match reusable_table.take() {
-                    Some(hash_table) => hash_table,
-                    None => self.new_table()?.with_restart(),
+                let is_eager = eager.is_some();
+                let (mut hash_table, mut table_rows) = match eager {
+                    Some(eager) => (eager.table, eager.rows),
+                    None => match reusable_table.take() {
+                        Some(hash_table) => (hash_table, 0),
+                        None => (self.new_table()?.with_restart(), 0),
+                    },
                 };
-                let mut table_rows = 0usize;
+                if let Some(rows) = rows {
+                    self.presize(
+                        &mut hash_table,
+                        rows,
+                        source_bytes,
+                        limit,
+                        &output.reservation,
+                        waiting_bytes + source_bytes,
+                    )?;
+                }
                 let mut sub_buckets: Option<FinalBuckets> = None;
                 let mut compaction_table = None;
 
@@ -281,7 +422,12 @@ impl BucketedAggregation {
 
                     if let Some(sub_buckets) = sub_buckets.as_mut() {
                         sub_buckets.route(&batch)?;
-                        self.compact(sub_buckets, &mut compaction_table)?;
+                        self.compact(
+                            sub_buckets,
+                            &mut compaction_table,
+                            &output.reservation,
+                            held_bytes,
+                        )?;
                         self.reserve(&output.reservation, held_bytes, sub_buckets)?;
                         continue;
                     }
@@ -289,7 +435,6 @@ impl BucketedAggregation {
                     hash_table.aggregate_batch(&batch)?;
                     table_rows += batch.num_rows();
 
-                    let can_split = next_level < MAX_BUCKET_LEVELS;
                     let split = match output
                         .reservation
                         .try_resize(held_bytes + hash_table.memory_size())
@@ -318,7 +463,9 @@ impl BucketedAggregation {
 
                 if let Some(sub_buckets) = sub_buckets {
                     // The table handed its groups over and is empty again
-                    reusable_table = Some(hash_table);
+                    if !is_eager {
+                        reusable_table = Some(hash_table);
+                    }
                     timer.done();
                     self.produce_output(sub_buckets, output, emitter).await?;
                     continue;

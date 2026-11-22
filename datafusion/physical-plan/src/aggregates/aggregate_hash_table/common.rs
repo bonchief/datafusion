@@ -418,6 +418,41 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         self.take_state_batch_inner(true, 0)
     }
 
+    /// An empty table for the same aggregation and input, which reports to
+    /// the same metrics as this one instead of registering a set of its own.
+    /// This table must be building.
+    pub(in crate::aggregates) fn empty_like(&self) -> Result<Self> {
+        let state = self.state.building();
+        let group_schema = state.group_by.group_schema(&self.input_schema)?;
+        let group_values = new_group_values(group_schema, &GroupClustering::None)?;
+        let accumulators = state
+            .accumulators
+            .iter()
+            .map(HashAggregateAccumulator::empty_like)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            group_by_metrics: self.group_by_metrics.clone(),
+            aggregate_argument_metrics: self.aggregate_argument_metrics.clone(),
+            aggregate_accumulator_metrics: Arc::clone(
+                &self.aggregate_accumulator_metrics,
+            ),
+            aggregate_submetrics: self.aggregate_submetrics.clone(),
+            input_schema: Arc::clone(&self.input_schema),
+            output_schema: Arc::clone(&self.output_schema),
+            state_schema: Arc::clone(&self.state_schema),
+            batch_size: self.batch_size,
+            state: AggregateHashTableState::Building(AggregateHashTableBuffer {
+                group_by: Arc::clone(&state.group_by),
+                group_values,
+                batch_group_indices: Default::default(),
+                accumulators,
+            }),
+            recycle_buffer: false,
+            recycled_buffer: None,
+            _mode: PhantomData,
+        })
+    }
+
     /// Reserves fixed row capacity without changing the number of groups.
     pub(in crate::aggregates) fn reserve_groups(&mut self, capacity: usize) {
         let state = self.state.building_mut();

@@ -18,6 +18,7 @@ use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_execution::async_try_stream;
 use futures::StreamExt;
 
+use super::aggregate_hash_table::{AggregateHashTable, FinalMarker};
 use crate::SendableRecordBatchStream;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
@@ -64,7 +65,8 @@ const MAX_COMPACTION_FACTOR: f64 = 2.0;
 const POOR_COMPACTION_FACTOR: f64 = 4.0;
 
 /// One hash bucket: its completed batches, held in memory or appended to a
-/// spill file, plus the rows not yet forming a full batch.
+/// spill file, plus the rows not yet forming a full batch, and the table its
+/// rows are aggregated into as they arrive.
 struct Bucket {
     coalescer: BatchCoalescer,
     batches: VecDeque<RecordBatch>,
@@ -76,6 +78,27 @@ struct Bucket {
     rows: usize,
     /// The bucket is due for compaction once it holds this many rows
     compact_at: usize,
+    /// True while the bucket aggregates its rows into `table` as they
+    /// arrive. False once that table reached the bucketing threshold or the
+    /// bucket spilled: from then on its rows are buffered and compacted, and
+    /// aggregated when input has ended.
+    eager: bool,
+    /// The groups of every row aggregated so far, in the order the rows
+    /// arrived. `None` until the first chunk, and once `eager` is false.
+    table: Option<AggregateHashTable<FinalMarker>>,
+    /// `table`'s memory after its last chunk
+    table_bytes: usize,
+    /// Rows aggregated by `table`
+    table_rows: usize,
+}
+
+/// A bucket's eager table, handed to the output with the bucket's rows
+pub(super) struct EagerTable {
+    pub(super) table: AggregateHashTable<FinalMarker>,
+    /// Rows the table aggregated
+    pub(super) rows: usize,
+    /// The table's memory
+    pub(super) bytes: usize,
 }
 
 /// Rows of partial aggregate state, split by a hash of their group keys.
@@ -99,6 +122,41 @@ struct Bucket {
 /// so the buffered rows stay within a small multiple of the groups they hold,
 /// and waits much longer after a compaction that found nothing to merge, so
 /// input that does not reduce is not aggregated over and over.
+///
+/// Compaction applies only to buckets that are no longer eager (below).
+///
+/// # Aggregating as input arrives
+///
+/// A bucket starts *eager*: it owns a table that persists while input
+/// arrives, and once its buffered rows reach [`Self::bucket_to_aggregate`]'s
+/// chunk size they are aggregated into that table and released. So the
+/// aggregation is done while the input is produced instead of after it ends,
+/// and each chunk works in one bucket's table, not the 64 at once.
+///
+/// - **Chunk size.** A chunk is due once the bucket buffers at least one
+///   batch of rows and at least as many rows as its table holds groups. A
+///   chunk then touches each cache line of the table at most once per row it
+///   aggregates, so bringing the table back into cache costs no more lines
+///   than reading the chunk, and with every key new the table at most
+///   doubles per chunk. A bucket's buffered rows are therefore bounded by
+///   `max(batch_size, groups of its table)` plus the rows of one input batch.
+/// - **Re-splits.** A table that reaches the bucketing threshold, at a level
+///   that can still be split, stops being eager: its state is put back in
+///   place of the rows it aggregated, and the bucket is buffered, compacted
+///   and split into the next level after input ends, as before.
+/// - **Spills.** Spilling an eager bucket writes its table's state, then its
+///   buffered rows, to the spill file; the bucket is not eager after that.
+/// - **Results.** Every group's state rows are merged in the order they
+///   arrived, whether through an eager table, a compaction or the table
+///   that aggregates the bucket after input ends, so every aggregate value is
+///   the one a single table computes. The buckets are emitted in bucket
+///   order and each bucket's groups in the order they first arrived, as
+///   before: a table emits its groups in insertion order, and putting a
+///   table's state back in place of its rows keeps that order. A bucket is
+///   split again exactly when its groups reach the threshold (or a
+///   reservation is refused, as before), and the moment of the split does
+///   not change the order, since the state that is routed precedes the rows
+///   that follow it.
 pub(super) struct FinalBuckets {
     /// Bucketing level, selects which bits of the routing hash are used
     level: u32,
@@ -133,6 +191,10 @@ impl FinalBuckets {
                 spill_file: None,
                 rows: 0,
                 compact_at: min_compaction_rows,
+                eager: true,
+                table: None,
+                table_bytes: 0,
+                table_rows: 0,
             })
             .collect();
         Self {
@@ -234,10 +296,71 @@ impl FinalBuckets {
         Ok(())
     }
 
+    /// Returns an eager bucket whose buffered rows are due to be aggregated
+    /// into its table, if any: it holds at least one batch of rows and at
+    /// least as many rows as its table holds groups. See the section on
+    /// aggregating as input arrives.
+    pub(super) fn bucket_to_aggregate(&self) -> Option<usize> {
+        self.buckets.iter().position(|bucket| {
+            let groups = bucket
+                .table
+                .as_ref()
+                .map_or(0, |table| table.building_group_count());
+            bucket.eager
+                && bucket.spill_file.is_none()
+                && bucket.rows >= self.min_compaction_rows.max(groups)
+        })
+    }
+
+    /// Removes and returns the table of an eager bucket, to be followed by
+    /// [`Self::put_table`] or [`Self::stop_eager`].
+    pub(super) fn take_table(
+        &mut self,
+        index: usize,
+    ) -> Option<AggregateHashTable<FinalMarker>> {
+        let bucket = &mut self.buckets[index];
+        debug_assert!(bucket.eager);
+        bucket.table_bytes = 0;
+        bucket.table.take()
+    }
+
+    /// Puts back the table of an eager bucket after it aggregated the
+    /// `input_rows` rows that [`Self::take_bucket`] returned.
+    pub(super) fn put_table(
+        &mut self,
+        index: usize,
+        table: AggregateHashTable<FinalMarker>,
+        input_rows: usize,
+    ) {
+        let bucket = &mut self.buckets[index];
+        bucket.rows = 0;
+        bucket.table_rows += input_rows;
+        bucket.table_bytes = table.memory_size();
+        bucket.table = Some(table);
+    }
+
+    /// Ends the eager aggregation of a bucket whose table took the last
+    /// `input_rows` rows that [`Self::take_bucket`] returned and reached the
+    /// bucketing threshold: its `state` takes the place of the rows it
+    /// aggregated, and the bucket is compacted from now on.
+    pub(super) fn stop_eager(
+        &mut self,
+        index: usize,
+        state: Option<RecordBatch>,
+        input_rows: usize,
+    ) {
+        let bucket = &mut self.buckets[index];
+        bucket.eager = false;
+        let table_rows = std::mem::take(&mut bucket.table_rows) + input_rows;
+        self.put_compacted(index, state, table_rows);
+    }
+
     /// Returns a bucket that is due for compaction, if any.
     pub(super) fn bucket_to_compact(&self) -> Option<usize> {
         self.buckets.iter().position(|bucket| {
-            bucket.spill_file.is_none() && bucket.rows >= bucket.compact_at
+            !bucket.eager
+                && bucket.spill_file.is_none()
+                && bucket.rows >= bucket.compact_at
         })
     }
 
@@ -282,18 +405,15 @@ impl FinalBuckets {
         bucket.compact_at = state_rows + new_rows;
     }
 
-    /// Memory held by the buckets
+    /// Memory held by the buckets: their rows and their eager tables
     pub(super) fn memory_size(&self) -> usize {
-        self.buckets
-            .iter()
-            .map(|bucket| bucket.batches_bytes + bucket.coalescer.size())
-            .sum::<usize>()
+        self.buckets.iter().map(Bucket::memory_size).sum::<usize>()
             + self.hashes.capacity() * size_of::<u64>()
     }
 
-    /// Spills the in-memory batches of the largest bucket, which from then on
-    /// appends its batches to the spill file. Returns false if nothing can be
-    /// spilled.
+    /// Spills the largest bucket, which from then on appends its batches to
+    /// the spill file: first the state of its eager table, if it has one,
+    /// then its in-memory batches. Returns false if nothing can be spilled.
     pub(super) fn spill_largest(&mut self) -> Result<bool> {
         let Some(spill_manager) = &self.spill_manager else {
             return Ok(false);
@@ -301,13 +421,27 @@ impl FinalBuckets {
         let Some(bucket) = self
             .buckets
             .iter_mut()
-            .filter(|bucket| bucket.spill_file.is_none() && bucket.rows > 0)
-            .max_by_key(|bucket| bucket.batches_bytes + bucket.coalescer.size())
+            .filter(|bucket| bucket.spill_file.is_none() && bucket.holds_memory())
+            .max_by_key(|bucket| bucket.memory_size())
         else {
             return Ok(false);
         };
-        bucket.spill_file =
-            Some(spill_manager.create_in_progress_file("FinalHashAggregateBucket")?);
+        let mut spill_file =
+            spill_manager.create_in_progress_file("FinalHashAggregateBucket")?;
+        // The table aggregated rows that arrived before the buffered ones
+        bucket.eager = false;
+        bucket.table_bytes = 0;
+        bucket.table_rows = 0;
+        if let Some(state) = bucket
+            .table
+            .take()
+            .map(|mut table| table.take_state_batch())
+            .transpose()?
+            .flatten()
+        {
+            spill_file.append_batch(&state)?;
+        }
+        bucket.spill_file = Some(spill_file);
         // Rows that do not form a full batch yet are spilled as well, and the
         // coalescer is replaced to give up the buffers it allocated.
         bucket.coalescer.finish_buffered_batch()?;
@@ -316,9 +450,9 @@ impl FinalBuckets {
         Ok(true)
     }
 
-    /// True if no bucket holds rows in memory.
+    /// True if no bucket holds rows or a table in memory.
     pub(super) fn is_fully_spilled(&self) -> bool {
-        self.buckets.iter().all(|bucket| bucket.rows == 0)
+        self.buckets.iter().all(|bucket| !bucket.holds_memory())
     }
 
     /// Finishes the buckets and returns the non-empty ones.
@@ -340,11 +474,22 @@ impl FinalBuckets {
                         });
                     }
                 }
-                None if bucket.batches.is_empty() => {}
-                None => sources.push(BucketSource::Memory {
-                    batches: bucket.batches,
-                    bytes: bucket.batches_bytes,
-                }),
+                None if bucket.batches.is_empty() && bucket.table.is_none() => {}
+                None => {
+                    let table = bucket.table.map(|table| {
+                        Box::new(EagerTable {
+                            table,
+                            rows: bucket.table_rows,
+                            bytes: bucket.table_bytes,
+                        })
+                    });
+                    sources.push(BucketSource::Memory {
+                        rows: bucket.batches.iter().map(RecordBatch::num_rows).sum(),
+                        batches: bucket.batches,
+                        bytes: bucket.batches_bytes,
+                        table,
+                    })
+                }
             }
         }
         Ok(sources)
@@ -352,6 +497,14 @@ impl FinalBuckets {
 }
 
 impl Bucket {
+    fn memory_size(&self) -> usize {
+        self.batches_bytes + self.coalescer.size() + self.table_bytes
+    }
+
+    fn holds_memory(&self) -> bool {
+        self.rows > 0 || self.table.is_some()
+    }
+
     /// Moves the batches the coalescer has completed to where the bucket
     /// lives: the spill file if it has been spilled, memory otherwise.
     fn collect_completed(&mut self) -> Result<()> {
@@ -372,9 +525,12 @@ impl Bucket {
 
 /// The rows of one finished bucket
 pub(super) enum BucketSource {
+    /// Rows still in memory, which follow the rows that `table` aggregated
     Memory {
         batches: VecDeque<RecordBatch>,
         bytes: usize,
+        rows: usize,
+        table: Option<Box<EagerTable>>,
     },
     /// Rows were appended to the file in pieces much smaller than a batch
     Spilled {
@@ -384,11 +540,30 @@ pub(super) enum BucketSource {
 }
 
 impl BucketSource {
-    /// Memory held by the bucket's rows
+    /// Memory held by the bucket's rows and table
     pub(super) fn memory_size(&self) -> usize {
         match self {
-            Self::Memory { bytes, .. } => *bytes,
+            Self::Memory { bytes, table, .. } => {
+                bytes + table.as_ref().map_or(0, |table| table.bytes)
+            }
             Self::Spilled { .. } => 0,
+        }
+    }
+
+    /// Number of rows left to aggregate, if known
+    pub(super) fn rows(&self) -> Option<usize> {
+        match self {
+            Self::Memory { rows, .. } => Some(*rows),
+            Self::Spilled { .. } => None,
+        }
+    }
+
+    /// Removes the bucket's eager table, which aggregated the rows that
+    /// arrived before the rows of this source.
+    pub(super) fn take_table(&mut self) -> Option<Box<EagerTable>> {
+        match self {
+            Self::Memory { table, .. } => table.take(),
+            Self::Spilled { .. } => None,
         }
     }
 
