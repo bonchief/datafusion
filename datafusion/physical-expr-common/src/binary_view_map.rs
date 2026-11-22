@@ -969,7 +969,7 @@ where
 
 /// A SwissTable-style hash table whose memory a probe can prefetch.
 ///
-/// It has a power of two of buckets, or none. `entries` holds one [`Entry`]
+/// It has a power of two of buckets, at least [`GROUP`]. `entries` holds one [`Entry`]
 /// per bucket, and `ctrl` one control byte per bucket followed by a copy of
 /// the first [`GROUP`] bytes, so a group of control bytes can be read at any
 /// bucket without wrapping. A control byte is [`EMPTY`], or the top 7 bits of
@@ -991,6 +991,8 @@ where
     ctrl: Vec<u8>,
     /// One entry per bucket, initialised where `ctrl` is full
     entries: Box<[MaybeUninit<Entry<V>>]>,
+    /// Buckets less one
+    mask: usize,
     /// Full buckets: the distinct non-null keys
     items: usize,
 }
@@ -999,14 +1001,21 @@ impl<V> Table<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
 {
+    /// An empty table of `buckets` buckets, a power of two of at least
+    /// [`GROUP`].
+    fn with_buckets(buckets: usize) -> Self {
+        Self {
+            ctrl: vec![EMPTY; buckets + GROUP],
+            entries: Box::new_uninit_slice(buckets),
+            mask: buckets - 1,
+            items: 0,
+        }
+    }
+
     /// The entries of `map` in a table with at least its capacity.
     fn from_hashbrown(map: &HashTable<Entry<V>>) -> Self {
-        let mut table = Self {
-            ctrl: Vec::new(),
-            entries: Box::new_uninit_slice(0),
-            items: 0,
-        };
-        table.resize(buckets_for(map.capacity().max(map.len())));
+        let mut table =
+            Self::with_buckets(buckets_for(map.capacity().max(map.len()).max(1)));
         for entry in map {
             let bucket = table.vacant(entry.hash);
             table.put(bucket, *entry);
@@ -1017,9 +1026,28 @@ where
     /// The control bytes of the group of buckets starting at `bucket`.
     #[inline(always)]
     fn group(&self, bucket: usize) -> u64 {
-        let mut bytes = [0; GROUP];
-        bytes.copy_from_slice(&self.ctrl[bucket..bucket + GROUP]);
-        u64::from_le_bytes(bytes)
+        debug_assert!(bucket <= self.mask);
+        // SAFETY: `bucket` is at most `mask` and `ctrl` holds `mask + 1 +
+        // GROUP` bytes, so the eight bytes from `bucket` are inside it; the
+        // read is unaligned.
+        let bytes = unsafe {
+            self.ctrl
+                .as_ptr()
+                .add(bucket)
+                .cast::<u64>()
+                .read_unaligned()
+        };
+        u64::from_le(bytes)
+    }
+
+    /// The entry of the full `bucket`.
+    #[inline(always)]
+    fn entry(&self, bucket: usize) -> &Entry<V> {
+        debug_assert!(bucket <= self.mask && self.ctrl[bucket] & EMPTY == 0);
+        // SAFETY: `bucket` is at most `mask`, below the length of `entries`,
+        // and callers pass only a bucket whose control byte is full, whose
+        // entry `put` or `resize` wrote.
+        unsafe { self.entries.get_unchecked(bucket).assume_init_ref() }
     }
 
     /// Sets the control byte of `bucket`, and its copy after the last bucket.
@@ -1027,30 +1055,22 @@ where
     fn set_ctrl(&mut self, bucket: usize, byte: u8) {
         self.ctrl[bucket] = byte;
         if bucket < GROUP {
-            let buckets = self.entries.len();
-            self.ctrl[buckets + bucket] = byte;
+            self.ctrl[self.mask + 1 + bucket] = byte;
         }
     }
 
     /// The payload of the entry with `hash` that `eq` accepts; or, if there
-    /// is none, the first empty bucket of its probe. With no buckets the
-    /// bucket is meaningless, and [`Self::room`] grows the table.
+    /// is none, the first empty bucket of its probe.
     #[inline(always)]
     fn find(&self, hash: u64, mut eq: impl FnMut(&Entry<V>) -> bool) -> Result<V, usize> {
-        if self.entries.is_empty() {
-            return Err(0);
-        }
-        let mask = self.entries.len() - 1;
         let tag = tag(hash);
-        let mut pos = hash as usize & mask;
+        let mut pos = hash as usize & self.mask;
         loop {
             let group = self.group(pos);
             let mut hits = match_tag(group, tag);
             while hits != 0 {
-                let bucket = (pos + (hits.trailing_zeros() / 8) as usize) & mask;
-                // SAFETY: the bucket's control byte equals a tag, which is
-                // below EMPTY, so the bucket is full and its entry written.
-                let entry = unsafe { self.entries[bucket].assume_init_ref() };
+                let bucket = (pos + (hits.trailing_zeros() / 8) as usize) & self.mask;
+                let entry = self.entry(bucket);
                 if eq(entry) {
                     return Ok(entry.payload);
                 }
@@ -1058,9 +1078,9 @@ where
             }
             let empty = group & HIGH_BITS;
             if empty != 0 {
-                return Err((pos + (empty.trailing_zeros() / 8) as usize) & mask);
+                return Err((pos + (empty.trailing_zeros() / 8) as usize) & self.mask);
             }
-            pos = (pos + GROUP) & mask;
+            pos = (pos + GROUP) & self.mask;
         }
     }
 
@@ -1068,7 +1088,7 @@ where
     /// [`Self::find`]: that bucket, unless the table is full and grows first.
     #[inline(always)]
     fn room(&mut self, hash: u64, vacant: usize) -> usize {
-        if self.items < max_items(self.entries.len()) {
+        if self.items < max_items(self.mask + 1) {
             return vacant;
         }
         self.resize(buckets_for(self.items + 1));
@@ -1085,43 +1105,36 @@ where
 
     /// The first empty bucket of `hash`'s probe. The table has room.
     fn vacant(&self, hash: u64) -> usize {
-        let mask = self.entries.len() - 1;
-        let mut pos = hash as usize & mask;
+        let mut pos = hash as usize & self.mask;
         loop {
             let empty = self.group(pos) & HIGH_BITS;
             if empty != 0 {
-                return (pos + (empty.trailing_zeros() / 8) as usize) & mask;
+                return (pos + (empty.trailing_zeros() / 8) as usize) & self.mask;
             }
-            pos = (pos + GROUP) & mask;
+            pos = (pos + GROUP) & self.mask;
         }
     }
 
-    /// Replaces the table with `buckets` buckets, zero or a power of two of at
-    /// least [`GROUP`] that holds every key, and places each entry again from
-    /// the hash it holds.
+    /// Replaces the table with `buckets` buckets, a power of two of at least
+    /// [`GROUP`] that holds every key, and places each entry again from the
+    /// hash it holds.
     fn resize(&mut self, buckets: usize) {
-        let ctrl = mem::take(&mut self.ctrl);
-        let entries = mem::take(&mut self.entries);
-        if buckets == 0 {
-            return;
-        }
-        self.ctrl = vec![EMPTY; buckets + GROUP];
-        self.entries = Box::new_uninit_slice(buckets);
-        for (byte, entry) in ctrl.iter().zip(&entries) {
+        let old = mem::replace(self, Self::with_buckets(buckets));
+        for (bucket, byte) in old.ctrl[..=old.mask].iter().enumerate() {
             if byte & EMPTY == 0 {
-                // SAFETY: the control byte is full, so the entry was written.
-                let entry = unsafe { entry.assume_init_read() };
+                let entry = *old.entry(bucket);
                 let bucket = self.vacant(entry.hash);
                 self.entries[bucket].write(entry);
                 self.set_ctrl(bucket, *byte);
             }
         }
+        self.items = old.items;
     }
 
     /// Grows the table to hold `capacity` keys without growing again.
     fn reserve(&mut self, capacity: usize) {
         let buckets = buckets_for(capacity);
-        if buckets > self.entries.len() {
+        if buckets > self.mask + 1 {
             self.resize(buckets);
         }
     }
@@ -1136,31 +1149,23 @@ where
     /// of `hash`'s home bucket.
     #[inline(always)]
     fn prefetch_home(&self, hash: u64) {
-        if !self.entries.is_empty() {
-            let home = hash as usize & (self.entries.len() - 1);
-            prefetch(self.ctrl.as_ptr().wrapping_add(home));
-            prefetch(self.entries.as_ptr().wrapping_add(home));
-        }
+        let home = hash as usize & self.mask;
+        prefetch(self.ctrl.as_ptr().wrapping_add(home));
+        prefetch(self.entries.as_ptr().wrapping_add(home));
     }
 
     /// Staged probe, second stage: the entry of the first bucket in the home
-    /// group of `hash` whose control byte matches, after prefetching it.
+    /// group of `hash` whose control byte may match, after prefetching it.
     #[inline(always)]
     fn candidate(&self, hash: u64) -> Option<&Entry<V>> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let mask = self.entries.len() - 1;
-        let home = hash as usize & mask;
+        let home = hash as usize & self.mask;
         let hits = match_tag(self.group(home), tag(hash));
         if hits == 0 {
             return None;
         }
-        let bucket = (home + (hits.trailing_zeros() / 8) as usize) & mask;
+        let bucket = (home + (hits.trailing_zeros() / 8) as usize) & self.mask;
         prefetch(self.entries.as_ptr().wrapping_add(bucket));
-        // SAFETY: the bucket's control byte equals a tag, which is below
-        // EMPTY, so the bucket is full and its entry written.
-        Some(unsafe { self.entries[bucket].assume_init_ref() })
+        Some(self.entry(bucket))
     }
 }
 
@@ -1185,16 +1190,21 @@ fn tag(hash: u64) -> u8 {
     (hash >> 57) as u8
 }
 
-/// The high bit of exactly the bytes of `group` that equal `tag`.
+/// The high bit of the bytes of `group` that may equal `tag`: every byte
+/// that does, and possibly full bytes above one that does, which the
+/// caller's comparison of the entry rejects. Never an empty byte, and the
+/// lowest hit is always a true one.
 ///
-/// A byte of `diff` is zero where the group's byte equals the tag. Adding
-/// 0x7F to its low seven bits carries into the high bit unless they are all
-/// zero, and or-ing in the byte itself covers its own high bit, so the high
-/// bit ends up clear exactly for a zero byte. No carry crosses a byte.
+/// This is hashbrown's portable match. A byte of `diff` is zero where the
+/// group's byte equals the tag, and subtracting one from it borrows into its
+/// high bit; a borrow starts only at a zero byte, so a false hit sits above a
+/// true one. `!diff` keeps only bytes whose
+/// `diff` is below 0x80, which for a tag below 0x80 means a byte below 0x80:
+/// a full bucket.
 #[inline(always)]
 fn match_tag(group: u64, tag: u8) -> u64 {
     let diff = group ^ (LOW_BITS * u64::from(tag));
-    !(((diff & !HIGH_BITS) + !HIGH_BITS) | diff) & HIGH_BITS
+    diff.wrapping_sub(LOW_BITS) & !diff & HIGH_BITS
 }
 
 /// The most keys `buckets` buckets hold: seven eighths, so every probe meets
@@ -1909,27 +1919,41 @@ mod tests {
     }
 
     #[test]
-    fn match_tag_marks_exactly_the_equal_bytes() {
-        let group = u64::from_le_bytes([3, EMPTY, 7, 3, 0, 127, 3, 4]);
-        let marked = |tag: u8| {
-            let mut hits = match_tag(group, tag);
-            let mut bytes = vec![];
-            while hits != 0 {
-                bytes.push(hits.trailing_zeros() / 8);
-                hits &= hits - 1;
+    fn match_tag_marks_every_equal_byte_and_no_empty_one() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Bytes from a few tags and EMPTY, so equal neighbours are common.
+            let bytes: [u8; GROUP] =
+                std::array::from_fn(|at| match (state >> (8 * at)) as u8 % 5 {
+                    0 => EMPTY,
+                    pick => pick - 1,
+                });
+            let group = u64::from_le_bytes(bytes);
+            for tag in 0..5u8 {
+                let hits = match_tag(group, tag);
+                let marked = |at: usize| hits & (0x80 << (8 * at)) != 0;
+                for (at, byte) in bytes.iter().enumerate() {
+                    if *byte == tag {
+                        assert!(marked(at), "{bytes:?} tag {tag} byte {at}");
+                    }
+                    if marked(at) {
+                        assert_ne!(*byte, EMPTY, "{bytes:?} tag {tag} byte {at}");
+                        // A false hit sits above a true one, so the lowest
+                        // hit is always true.
+                        assert!(
+                            *byte == tag || bytes[..at].contains(&tag),
+                            "{bytes:?} tag {tag} byte {at}"
+                        );
+                    }
+                }
             }
-            bytes
-        };
-        for tag in 0..128u8 {
-            let equal = group
-                .to_le_bytes()
-                .iter()
-                .enumerate()
-                .filter(|(_, byte)| **byte == tag)
-                .map(|(at, _)| at as u32)
-                .collect::<Vec<_>>();
-            assert_eq!(marked(tag), equal, "tag {tag}");
+            // The high bits mark exactly the empty bytes.
+            for (at, byte) in bytes.iter().enumerate() {
+                assert_eq!(group & (0x80 << (8 * at)) != 0, *byte == EMPTY);
+            }
         }
-        assert_eq!(group & HIGH_BITS, 0x80 << 8);
     }
 }
