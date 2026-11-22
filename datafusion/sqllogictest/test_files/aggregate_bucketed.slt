@@ -112,8 +112,9 @@ select count(*), round(sum(a), 3) from (select v % 10007 as k, avg(v) a from t g
 ----
 10007 1000705003.5
 
-# The next three queries have a string key, so they keep a single table: only
-# fixed-width state is bucketed. Their results must not change.
+# The next three queries have a string key, so they keep a single table: with
+# hash_aggregate_bucket_threshold_bytes at 0, only fixed-width state is
+# bucketed. Their results must not change.
 
 # string key
 query II
@@ -170,6 +171,52 @@ select k, c, s from (select v as k, count(*) c, sum(v) s from t group by v) orde
 200000 1 200000
 199999 1 199999
 199998 1 199998
+
+# --- hash_aggregate_bucket_threshold_bytes = 65536: variable-width keys and
+# state are bucketed by the bytes of their table, fixed-width ones still by
+# hash_aggregate_bucket_threshold.
+
+statement ok
+set datafusion.execution.hash_aggregate_bucket_threshold_bytes = 65536;
+
+# Each of the four final partitions moved its string groups into buckets once
+query TT
+explain analyze select count(*) from (select arrow_cast(concat('a-long-enough-string-view-key-', cast(v % 9973 as varchar)), 'Utf8View') as k, count(*) c from t group by k);
+----
+<slt:ignore>bucket_splits=4,<slt:ignore>
+
+# string key
+query II
+select count(*), sum(c) from (select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k);
+----
+9973 200000
+
+# string view key
+query II
+select count(*), sum(c) from (select arrow_cast(concat('a-long-enough-string-view-key-', cast(v % 9973 as varchar)), 'Utf8View') as k, count(*) c from t group by k);
+----
+9973 200000
+
+# string view state
+query IT
+select count(*), min(m) from (select v % 9973 as k, min(arrow_cast(concat('a-long-enough-string-view-value-', cast(v as varchar)), 'Utf8View')) m from t group by k);
+----
+9973 a-long-enough-string-view-value-1
+
+# several key columns of mixed types
+query III
+select count(*), sum(c), sum(s) from (select v % 101 as k1, concat('k', cast(v % 103 as varchar)) as k2, v % 7 = 0 as k3, count(*) c, sum(v) s from t group by k1, k2, k3);
+----
+20806 200000 20000100000
+
+# list state keeps its single table
+query II
+select count(*), sum(d) from (select concat('key-', cast(v % 5003 as varchar)) as k, count(distinct v % 17) d from t group by k);
+----
+5003 85051
+
+statement ok
+reset datafusion.execution.hash_aggregate_bucket_threshold_bytes;
 
 statement ok
 reset datafusion.execution.hash_aggregate_bucket_threshold;

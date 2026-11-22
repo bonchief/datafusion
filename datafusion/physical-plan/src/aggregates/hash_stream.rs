@@ -192,7 +192,9 @@ pub(crate) struct FinalHashAggregateStream {
     hash_table: Option<AggregateHashTable<FinalMarker>>,
     /// `None` if spilling is not supported by the configured `DiskManager`.
     spill_context: Option<Box<AggregateSpill>>,
-    /// `None` unless `hash_aggregate_bucket_threshold` is set and applies.
+    /// `None` unless `hash_aggregate_bucket_threshold` (fixed-width state) or
+    /// `hash_aggregate_bucket_threshold_bytes` (variable-width state) is set
+    /// and applies.
     bucketing: Option<Arc<BucketedAggregation>>,
 }
 
@@ -701,22 +703,20 @@ impl FinalHashAggregateStream {
 
         let group_values_soft_limit = agg.limit_options().map(|config| config.limit());
 
-        let bucket_threshold = context
-            .session_config()
-            .options()
-            .execution
-            .hash_aggregate_bucket_threshold;
+        let execution = &context.session_config().options().execution;
         // A soft limit stops reading input early, which bucketing cannot do.
         // Buckets that cannot be spilled hold more memory than one table, the
         // rows waiting for their next compaction, and release none of it under
         // memory pressure, so bucketing also needs spilling.
-        let bucketing = (bucket_threshold > 0
-            && group_values_soft_limit.is_none()
-            && spill_context.is_some()
-            && BucketedAggregation::supports_state(&input_schema))
-        .then(|| {
+        let trigger = BucketedAggregation::trigger(
+            &input_schema,
+            execution.hash_aggregate_bucket_threshold,
+            execution.hash_aggregate_bucket_threshold_bytes,
+        )
+        .filter(|_| group_values_soft_limit.is_none() && spill_context.is_some());
+        let bucketing = trigger.map(|trigger| {
             Arc::new(BucketedAggregation::new(
-                bucket_threshold,
+                trigger,
                 agg.clone(),
                 partition,
                 batch_size,
@@ -834,7 +834,8 @@ impl FinalHashAggregateStream {
     /// Spilling: The table cannot reserve enough memory.
     ///           Move all current states into one fully group-key-sorted spill run.
     ///
-    /// Bucketing: The table has reached `hash_aggregate_bucket_threshold` groups.
+    /// Bucketing: The table has reached its bucketing threshold, see
+    ///            [`BucketedAggregation::trigger`].
     ///            Move all current states and the rest of the input into hash
     ///            buckets, which are returned for [`BucketedAggregation::output_stream`].
     async fn consume_input(
@@ -877,7 +878,7 @@ impl FinalHashAggregateStream {
             // bucketing only starts from a table that has never spilled.
             if let Some(bucketing) = &self.bucketing
                 && !spilled
-                && hash_table.building_group_count() >= bucketing.threshold()
+                && bucketing.due(hash_table)
             {
                 let kept =
                     hash_table.building_group_count() as f64 / table_rows.max(1) as f64;
@@ -1630,6 +1631,186 @@ mod tests {
 
         let (rows, splits, spills) =
             run_final_hash_aggregate(200_000, 3, 10_000, Some(3 * 1024 * 1024)).await?;
+        assert_eq!(rows, expected);
+        assert!(splits >= 1);
+        assert!(spills > 0, "buckets were spilled");
+        Ok(())
+    }
+
+    /// Like [`run_final_hash_aggregate`], for `SELECT key, COUNT(value),
+    /// MIN(label) .. GROUP BY key` where `key` and `label` are `Utf8View`
+    /// values past the inline length, so the keys and one state column are
+    /// variable-width and bucketing is decided by the table's bytes.
+    ///
+    /// Returns the `(key, count, min)` rows sorted by key, and the final
+    /// aggregation's `bucket_splits` and `spill_count` metrics.
+    async fn run_final_text_aggregate(
+        num_groups: usize,
+        num_partitions: usize,
+        bucket_bytes: usize,
+        memory_limit: Option<usize>,
+    ) -> Result<(Vec<(String, i64, String)>, usize, usize)> {
+        use datafusion_common::ScalarValue;
+
+        let batch_size = 1024;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8View, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("label", DataType::Utf8View, false),
+        ]));
+
+        let mut runtime = RuntimeEnvBuilder::default();
+        if let Some(memory_limit) = memory_limit {
+            runtime = runtime.with_memory_limit(memory_limit, 1.0);
+        }
+        let task_ctx = TaskContext::default().with_runtime(runtime.build_arc()?);
+        let session_config = task_ctx
+            .session_config()
+            .clone()
+            .set(
+                "datafusion.execution.batch_size",
+                &ScalarValue::UInt64(Some(batch_size as u64)),
+            )
+            // The group count threshold applies to fixed-width state only
+            .set(
+                "datafusion.execution.hash_aggregate_bucket_threshold",
+                &ScalarValue::UInt64(Some(1)),
+            )
+            .set(
+                "datafusion.execution.hash_aggregate_bucket_threshold_bytes",
+                &ScalarValue::UInt64(Some(bucket_bytes as u64)),
+            );
+        let task_ctx = Arc::new(task_ctx.with_session_config(session_config));
+
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("key", &schema)?, "key".to_string())]);
+        let aggr_expr = vec![
+            Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("count_value")
+                    .build()?,
+            ),
+            Arc::new(
+                AggregateExprBuilder::new(min_udaf(), vec![col("label", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("min_label")
+                    .build()?,
+            ),
+        ];
+
+        let empty = TestMemoryExec::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
+        let state_schema = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by.clone(),
+            aggr_expr.clone(),
+            vec![None, None],
+            empty,
+            Arc::clone(&schema),
+        )?
+        .schema();
+        let key = |group: usize| format!("a group key well past twelve bytes {group:08}");
+        let label = |group: usize, partition: usize| {
+            format!("label of group {group:08} from partition {partition}")
+        };
+        let mut state_batches = vec![];
+        for partition in 0..num_partitions {
+            for start in (0..num_groups).step_by(batch_size) {
+                let end = (start + batch_size).min(num_groups);
+                let keys: StringViewArray = (start..end).map(|g| Some(key(g))).collect();
+                let labels: StringViewArray =
+                    (start..end).map(|g| Some(label(g, partition))).collect();
+                state_batches.push(RecordBatch::try_new(
+                    Arc::clone(&state_schema),
+                    vec![
+                        Arc::new(keys),
+                        Arc::new(Int64Array::from(vec![1i64; end - start])),
+                        Arc::new(labels),
+                    ],
+                )?);
+            }
+        }
+        let state_input = TestMemoryExec::try_new_exec(
+            &[state_batches],
+            Arc::clone(&state_schema),
+            None,
+        )?;
+        let final_agg = Arc::new(AggregateExec::try_new(
+            AggregateMode::Final,
+            group_by.as_final(),
+            aggr_expr,
+            vec![None, None],
+            state_input,
+            Arc::clone(&schema),
+        )?);
+
+        let batches =
+            crate::collect(Arc::clone(&final_agg) as Arc<dyn ExecutionPlan>, task_ctx)
+                .await?;
+        let mut rows = vec![];
+        for batch in &batches {
+            let keys = batch.column(0).as_string_view();
+            let counts = batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let mins = batch.column(2).as_string_view();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    keys.value(row).to_string(),
+                    counts.value(row),
+                    mins.value(row).to_string(),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        // Every group is there once, with the state of every partition merged
+        assert_eq!(rows.len(), num_groups);
+        for (group, (k, count, min)) in rows.iter().enumerate() {
+            assert_eq!(*k, key(group));
+            assert_eq!(*count, num_partitions as i64);
+            assert_eq!(*min, label(group, 0));
+        }
+
+        let metrics = final_agg.metrics().expect("final aggregate has metrics");
+        let bucket_splits = metrics
+            .sum_by_name("bucket_splits")
+            .map(|value| value.as_usize())
+            .unwrap_or(0);
+        Ok((rows, bucket_splits, metrics.spill_count().unwrap_or(0)))
+    }
+
+    #[tokio::test]
+    async fn final_text_aggregate_buckets_by_table_bytes() -> Result<()> {
+        // Off, and a threshold the table never reaches: one table
+        let (expected, splits, _) = run_final_text_aggregate(30_000, 3, 0, None).await?;
+        assert_eq!(splits, 0);
+        let (rows, splits, _) =
+            run_final_text_aggregate(30_000, 3, 1 << 30, None).await?;
+        assert_eq!(rows, expected);
+        assert_eq!(splits, 0);
+
+        // A table of 30,000 such groups takes several MB: it is split once,
+        // and its buckets stay below the threshold
+        let (rows, splits, spills) =
+            run_final_text_aggregate(30_000, 3, 1 << 20, None).await?;
+        assert_eq!(rows, expected);
+        assert_eq!(splits, 1);
+        assert_eq!(spills, 0);
+
+        // Buckets that still exceed the threshold are split again
+        let (rows, splits, _) =
+            run_final_text_aggregate(30_000, 3, 16 << 10, None).await?;
+        assert_eq!(rows, expected);
+        assert!(splits > 1, "buckets were split again, got {splits} splits");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_text_aggregate_spills_buckets_under_memory_limit() -> Result<()> {
+        let (expected, _, _) = run_final_text_aggregate(100_000, 3, 0, None).await?;
+
+        let (rows, splits, spills) =
+            run_final_text_aggregate(100_000, 3, 1 << 20, Some(8 * 1024 * 1024)).await?;
         assert_eq!(rows, expected);
         assert!(splits >= 1);
         assert!(spills > 0, "buckets were spilled");
