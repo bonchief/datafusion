@@ -12,8 +12,8 @@
 //! ahead will read, lets the misses of different rows overlap.
 //!
 //! Prefetching a table that fits in L2 only adds instructions, so callers take
-//! the staged path only when their table is larger than [`l2_cache_bytes`], as
-//! ClickHouse does (`getMinBytesForPrefetch`).
+//! the staged path only when their table is larger than one core's share of
+//! L2, [`l2_cache_bytes`], as ClickHouse does with L2 (`getMinBytesForPrefetch`).
 
 use std::sync::OnceLock;
 
@@ -66,17 +66,27 @@ pub fn prefetch<T>(ptr: *const T) {
     let _ = ptr;
 }
 
-/// The L2 data cache of one core, in bytes.
+/// One core's share of its L2 cache, in bytes: the L2 size divided by the
+/// cores that share it.
 ///
-/// Read once from Linux sysfs (`/sys/devices/system/cpu/cpu0/cache`); on other
-/// platforms, or when sysfs does not say, 1 MiB.
+/// A table that fits in this share stays in L2 while every core probes a
+/// table of its own, as a final aggregate does with one partition per core;
+/// one larger than it misses. Graviton's L2 is per core (1 MiB on Graviton 3,
+/// 2 MiB on Graviton 4), so the share is the whole cache. Apple's is shared by
+/// a cluster (16 MiB by 5 performance cores on an M5 Pro), so the share is
+/// 3.2 MiB, not 16.
+///
+/// Read once: on Linux from sysfs (`/sys/devices/system/cpu/cpu0/cache`, the
+/// level 2 data or unified cache's `size` and `shared_cpu_list`), on macOS
+/// from `sysctl` (`hw.perflevel0.l2cachesize` and `hw.perflevel0.cpusperl2`,
+/// the performance cores). Where neither says, 1 MiB.
 pub fn l2_cache_bytes() -> usize {
     static L2: OnceLock<usize> = OnceLock::new();
-    *L2.get_or_init(|| sysfs_l2().unwrap_or(DEFAULT_L2))
+    *L2.get_or_init(|| platform_l2().unwrap_or(DEFAULT_L2))
 }
 
 #[cfg(target_os = "linux")]
-fn sysfs_l2() -> Option<usize> {
+fn platform_l2() -> Option<usize> {
     let root = std::path::Path::new("/sys/devices/system/cpu/cpu0/cache");
     std::fs::read_dir(root).ok()?.find_map(|entry| {
         let dir = entry.ok()?.path();
@@ -87,13 +97,59 @@ fn sysfs_l2() -> Option<usize> {
         if level.trim() != "2" || !(kind == "Unified" || kind == "Data") {
             return None;
         }
-        parse_size(&read("size")?)
+        let cores = read("shared_cpu_list")
+            .and_then(|list| count_cpus(&list))
+            .unwrap_or(1);
+        share(parse_size(&read("size")?)?, cores)
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn sysfs_l2() -> Option<usize> {
+/// Reads two `sysctl` values through the `sysctl` tool, which needs no
+/// `unsafe` call into libc; it runs once per process.
+#[cfg(target_os = "macos")]
+fn platform_l2() -> Option<usize> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.perflevel0.l2cachesize", "hw.perflevel0.cpusperl2"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut values = text.lines().map(|line| line.trim().parse::<usize>().ok());
+    let size = values.next()??;
+    let cores = values.next().flatten().unwrap_or(1);
+    share(size, cores)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_l2() -> Option<usize> {
     None
+}
+
+/// One of `cores`' share of a cache of `size` bytes. Zero is no answer.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    expect(dead_code)
+)]
+fn share(size: usize, cores: usize) -> Option<usize> {
+    Some(size / cores.max(1)).filter(|share| *share > 0)
+}
+
+/// The number of CPUs in a sysfs CPU list such as `0-3,8`.
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))]
+fn count_cpus(list: &str) -> Option<usize> {
+    list.trim()
+        .split(',')
+        .map(|range| match range.split_once('-') {
+            Some((first, last)) => {
+                let first = first.parse::<usize>().ok()?;
+                last.parse::<usize>()
+                    .ok()?
+                    .checked_sub(first)
+                    .map(|n| n + 1)
+            }
+            None => range.parse::<usize>().ok().map(|_| 1),
+        })
+        .sum::<Option<usize>>()
+        .filter(|count| *count > 0)
 }
 
 /// Parses a sysfs cache size such as `2048K` or `1M`. Zero is no answer.
@@ -130,6 +186,18 @@ mod tests {
         assert_eq!(parse_size("0K"), None);
         assert_eq!(parse_size("12Q"), None);
         assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn counts_sysfs_cpu_lists() {
+        assert_eq!(count_cpus("0\n"), Some(1));
+        assert_eq!(count_cpus("0-3,8"), Some(5));
+        assert_eq!(count_cpus("4-5,10-11"), Some(4));
+        assert_eq!(count_cpus("3-1"), None);
+        assert_eq!(count_cpus(""), None);
+        assert_eq!(share(16 << 20, 5), Some((16 << 20) / 5));
+        assert_eq!(share(1 << 20, 0), Some(1 << 20));
+        assert_eq!(share(0, 1), None);
     }
 
     #[test]
