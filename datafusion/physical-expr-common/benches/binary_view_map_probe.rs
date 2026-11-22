@@ -23,6 +23,8 @@
 //! - `PROBE_MAX_TOTAL`: skip a case whose tables and inputs together would
 //!   exceed this many bytes, default 24 GiB
 //! - `PROBE_ROWS`: rows timed per case and table, at least, default 4 Mi
+//! - `PROBE_ONLY`: comma separated workloads to run (`Flush`, `New`, `Half`,
+//!   `Skewed`), default all
 
 use arrow::array::{ArrayRef, StringViewArray};
 use datafusion_common::instant::Instant;
@@ -262,10 +264,16 @@ fn main() {
         .chain(std::iter::once(max_bytes))
         .collect::<Vec<_>>();
     sizes.dedup();
+    // Only the workloads named here (Flush, New, Half, Skewed), if set.
+    let only = std::env::var("PROBE_ONLY").ok();
+    let wanted = |name: &str| {
+        only.as_ref()
+            .is_none_or(|only| only.split(',').any(|item| item.trim() == name))
+    };
 
     println!("key_bytes,table_target,workload,groups,tables,table_bytes,ns_per_row");
     for len in [80, 8] {
-        for &tables in &threads {
+        for &tables in threads.iter().filter(|_| wanted("Flush")) {
             report(
                 &format!("{len},{FLUSH_GROUPS},Flush,{FLUSH_GROUPS}"),
                 tables,
@@ -277,7 +285,10 @@ fn main() {
         let per_group = 48 + if len > 12 { len } else { 0 };
         for &size in &sizes {
             let groups = (size / per_group).max(64);
-            for workload in [Workload::New, Workload::Half, Workload::Skewed] {
+            for workload in [Workload::New, Workload::Half, Workload::Skewed]
+                .into_iter()
+                .filter(|workload| wanted(&format!("{workload:?}")))
+            {
                 for &tables in &threads {
                     let label = format!("{len},{size},{workload:?},{groups}");
                     // Table, input keys and their views, at about twice the
