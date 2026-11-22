@@ -1605,6 +1605,299 @@ mod tests {
         }
     }
 
+    /// Patterns in and just outside the shapes `Prefix` and `Short` accept,
+    /// on values built to reach their edges, return byte for byte what the
+    /// regex crate's own replacement does. `REGEXP_REPLACE_DIFF_SEED` and
+    /// `REGEXP_REPLACE_DIFF_PATTERNS` replay or widen a run.
+    #[test]
+    fn test_static_pattern_regexp_replace_differential() {
+        use rand::rngs::StdRng;
+        use rand::seq::IndexedRandom;
+        use rand::{Rng, SeedableRng};
+
+        const LITERALS: &[&str] = &[
+            "", "a", "ab", "abc", "b", "h", "http", "https", "s", "://", "www.", "é",
+            "日", "x", "a.b",
+        ];
+        const STOPS: &[char] = &['/', ',', '.', ':', 'a', '\n', 'é'];
+        const TOKENS: &[&str] = &[
+            "a", "ab", "b", "h", "http", "https", "://", "www.", "/", ",", ".", ":",
+            "\n", "\r", "\r\n", "é", "日本", "x", "y", "1", "A", "W", "s",
+        ];
+
+        fn literal(rng: &mut StdRng) -> String {
+            regex_syntax::escape(LITERALS.choose(rng).unwrap())
+        }
+        fn alternation(rng: &mut StdRng) -> String {
+            let n = rng.random_range(2..=3);
+            let branches: Vec<String> = (0..n).map(|_| literal(rng)).collect();
+            format!("(?:{})", branches.join("|"))
+        }
+        /// A literal, an alternation of literals, or either made optional.
+        fn piece(rng: &mut StdRng) -> String {
+            match rng.random_range(0..6) {
+                0 | 1 => literal(rng),
+                2 => alternation(rng),
+                3 => format!("(?:{})?", literal(rng)),
+                4 => format!("(?:{})??", literal(rng)),
+                _ => format!("{}?", alternation(rng)),
+            }
+        }
+        /// One of `inside` (a choice the fast paths accept) four times in
+        /// five, else one of `outside` (a near miss).
+        fn pick(
+            rng: &mut StdRng,
+            inside: &[&'static str],
+            outside: &[&'static str],
+        ) -> &'static str {
+            if rng.random_bool(0.8) {
+                inside.choose(rng).unwrap()
+            } else {
+                outside.choose(rng).unwrap()
+            }
+        }
+        fn tail(rng: &mut StdRng) -> &'static str {
+            pick(
+                rng,
+                &[
+                    ".*",
+                    r"[^\r]*",
+                    r"[^\r\n]*",
+                    r"[^\n]*",
+                    "(?s:.*)",
+                    r"[\s\S]*",
+                    ".*?",
+                ],
+                &[".+", r"\S*", "[^a]*", "", ".*.*", r"[^\r\n\t]*"],
+            )
+        }
+        fn start(rng: &mut StdRng) -> &'static str {
+            pick(
+                rng,
+                &["^", "^", "^", r"\A"],
+                &["", "(?:^|x)", "(?m:^)", "x?^"],
+            )
+        }
+        fn end(rng: &mut StdRng) -> &'static str {
+            pick(
+                rng,
+                &["$", "$", "$", r"\z"],
+                &["", r"\n?$", "(?m:$)", "$x?"],
+            )
+        }
+        fn open(rng: &mut StdRng) -> &'static str {
+            if rng.random_bool(0.2) { "(?P<g>" } else { "(" }
+        }
+        /// `^<pieces>([^X]+)X<tail>$` and its near misses.
+        fn prefix_shape(rng: &mut StdRng) -> String {
+            let stop = *STOPS.choose(rng).unwrap();
+            let x = regex_syntax::escape(&stop.to_string());
+            let body = if rng.random_bool(0.8) {
+                format!("[^{x}]+")
+            } else {
+                [
+                    format!("[^{x}]*"),
+                    format!("[^{x}]+?"),
+                    format!("[^{x}y]+"),
+                    r"\w+".to_string(),
+                    format!("[^{x}]{{1,3}}"),
+                ]
+                .choose(rng)
+                .unwrap()
+                .clone()
+            };
+            let after = if rng.random_bool(0.85) {
+                x.clone()
+            } else {
+                [format!("{x}{x}"), String::new(), "y".to_string()]
+                    .choose(rng)
+                    .unwrap()
+                    .clone()
+            };
+            let pieces: String =
+                (0..rng.random_range(0..=3)).map(|_| piece(rng)).collect();
+            format!(
+                "{}{pieces}{}{body}){after}{}{}",
+                start(rng),
+                open(rng),
+                tail(rng),
+                end(rng)
+            )
+        }
+        /// `^<head><class>*$` with groups in the head, and near misses.
+        fn short_shape(rng: &mut StdRng) -> String {
+            const HEADS: &[&str] = &[
+                "(a|ab)",
+                r"(\w*)",
+                r"(?:www\.)?",
+                "([^/]+)/",
+                "(é|e)?",
+                r"(\d*)",
+                "([a-z]+)",
+                "(.)",
+                "(?:x(y))?",
+                "(a*)",
+                "(?:(a)|(b))",
+                "()",
+                "(a)|(b)",
+                "(.*)",
+                "(a+?)",
+            ];
+            let head: String = (0..rng.random_range(1..=3))
+                .map(|_| {
+                    let h = HEADS.choose(rng).unwrap();
+                    if rng.random_bool(0.15) {
+                        h.replacen('(', "(?P<g>", 1).replace("(?P<g>?:", "(?:")
+                    } else {
+                        h.to_string()
+                    }
+                })
+                .collect();
+            format!("{}{head}{}{}", start(rng), tail(rng), end(rng))
+        }
+        fn unanchored(rng: &mut StdRng) -> String {
+            [
+                r"([a-z]+)",
+                r"(\d)",
+                "(a)(b)?",
+                r"://([^/]+)",
+                "(é)",
+                "",
+                "(x*)",
+            ]
+            .choose(rng)
+            .unwrap()
+            .to_string()
+        }
+        /// A reference to `group` in each spelling four times in five, else a
+        /// replacement that is not one group alone.
+        fn reference(rng: &mut StdRng, group: usize, named: bool) -> String {
+            if rng.random_bool(0.8) {
+                match rng.random_range(0..6) {
+                    0 => format!(r"\{group}"),
+                    1 => format!(r"\\{group}"),
+                    2 => format!("${{{group}}}"),
+                    3 => format!("${group}"),
+                    4 if named => "${g}".to_string(),
+                    5 if named => "$g".to_string(),
+                    _ => format!(r"\{group}"),
+                }
+            } else {
+                match rng.random_range(0..6) {
+                    0 => format!(r"x\{group}"),
+                    1 => format!(r"\{group}\{group}"),
+                    2 => format!("${group}x"),
+                    3 => "$$1".to_string(),
+                    4 => "${9}".to_string(),
+                    _ => "${}".to_string(),
+                }
+            }
+        }
+        fn value(rng: &mut StdRng) -> String {
+            let mut s: String = (0..rng.random_range(0..8))
+                .map(|_| *TOKENS.choose(rng).unwrap())
+                .collect();
+            match rng.random_range(0..10) {
+                // 12 bytes is the most a view holds inline, 13 the least
+                // it keeps in a buffer.
+                0 => pad(&mut s, 12),
+                1 => pad(&mut s, 13),
+                2 => pad(&mut s, 4096),
+                _ => {}
+            }
+            s
+        }
+        fn pad(s: &mut String, len: usize) {
+            while s.len() < len {
+                s.push(if s.len().is_multiple_of(7) { '/' } else { 'b' });
+            }
+            while s.len() > len {
+                s.pop();
+            }
+        }
+
+        let seed: u64 = std::env::var("REGEXP_REPLACE_DIFF_SEED")
+            .map_or(0x5EED_2026, |s| s.parse().unwrap());
+        let patterns: u64 = std::env::var("REGEXP_REPLACE_DIFF_PATTERNS")
+            .map_or(400, |s| s.parse().unwrap());
+        let flags = [
+            None,
+            Some(""),
+            Some("i"),
+            Some("g"),
+            Some("m"),
+            Some("s"),
+            Some("gi"),
+            Some("gm"),
+            Some("gs"),
+            Some("ims"),
+            Some("gims"),
+            Some("R"),
+            Some("U"),
+        ];
+        let mut paths = [0usize; 4];
+        let mut cases = 0usize;
+        for i in 0..patterns {
+            let rng = &mut StdRng::seed_from_u64(seed ^ i.wrapping_mul(0x9E37_79B9));
+            let pattern = match rng.random_range(0..20) {
+                0..=10 => prefix_shape(rng),
+                11..=17 => short_shape(rng),
+                _ => unanchored(rng),
+            };
+            // Flags that leave the fast paths open, three times in five.
+            let flag = if rng.random_bool(0.6) {
+                *[None, Some(""), Some("g"), Some("s"), Some("gs"), Some("R")]
+                    .choose(rng)
+                    .unwrap()
+            } else {
+                *flags.choose(rng).unwrap()
+            };
+            let inner = flag.map_or(String::new(), |f| f.replace('g', ""));
+            let full = if inner.is_empty() {
+                pattern.clone()
+            } else {
+                format!("(?{inner}){pattern}")
+            };
+            let Ok(re) = Regex::new(&full) else {
+                continue;
+            };
+            let named = re.capture_names().any(|n| n == Some("g"));
+            // A group of the pattern four times in five, else the whole
+            // match or one it lacks.
+            let groups = re.captures_len();
+            let group = if groups > 1 && rng.random_bool(0.8) {
+                rng.random_range(1..groups)
+            } else {
+                rng.random_range(0..=groups)
+            };
+            let rep = reference(rng, group, named);
+            paths[match Extract::new(&re, &full, &regex_replace_posix_groups(&rep)) {
+                None => 0,
+                Some(e) if e.prefix.is_some() => 1,
+                Some(e) if e.short.is_some() => 2,
+                Some(_) => 3,
+            }] += 1;
+            let mut values: Vec<Option<String>> =
+                (0..16).map(|_| Some(value(rng))).collect();
+            values.push(None);
+            values.push(Some(String::new()));
+            let at = rng.random_range(0..values.len());
+            values.insert(at, None);
+            cases += values.len() * 5;
+            let run = std::panic::catch_unwind(|| check(&values, &pattern, &rep, flag));
+            assert!(
+                run.is_ok(),
+                "mismatch: REGEXP_REPLACE_DIFF_SEED={seed} pattern number {i}: \
+                 {pattern:?} {rep:?} {flag:?}"
+            );
+        }
+        println!(
+            "seed {seed}: {cases} cases; patterns by path: fallback {}, prefix {}, \
+             short {}, whole regex {}",
+            paths[0], paths[1], paths[2], paths[3]
+        );
+    }
+
     /// A `Utf8View` result of a group of a pattern anchored at both ends, or
     /// of a replacement that leaves values unchanged, holds no bytes of its
     /// own: its views point into the input's buffers.
