@@ -33,9 +33,13 @@ use crate::{
     PlanProperties, ReplaceChildrenOptions, Statistics, validate_child_count,
 };
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{
+    AsArray, PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array,
+};
 use arrow::compute::take_arrays;
-use arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
+use arrow::datatypes::{
+    BinaryViewType, ByteViewType, DataType, Schema, SchemaRef, StringViewType, UInt32Type,
+};
 use arrow_schema::SortOptions;
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
@@ -390,6 +394,36 @@ impl OutputChannel {
     }
 }
 
+/// `batch` with each view column that holds more than twice the bytes its
+/// views reference rewritten into buffers of exactly those bytes
+/// ([`arrow::array::GenericByteViewArray::gc`]); its other columns, and a view column
+/// within that bound, are shared as they are.
+fn compact(batch: &RecordBatch) -> Result<RecordBatch> {
+    fn view<T: ByteViewType>(
+        array: &arrow::array::ArrayRef,
+    ) -> Option<arrow::array::ArrayRef> {
+        let array = array.as_byte_view_opt::<T>()?;
+        let held: usize = array.data_buffers().iter().map(|b| b.capacity()).sum();
+        (held > array.total_buffer_bytes_used().saturating_mul(2))
+            .then(|| Arc::new(array.gc()) as arrow::array::ArrayRef)
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            view::<StringViewType>(column)
+                .or_else(|| view::<BinaryViewType>(column))
+                .unwrap_or_else(|| Arc::clone(column))
+        })
+        .collect();
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
+}
+
 /// A producer-side coalescer shared across all input tasks targeting a
 /// single output partition.
 ///
@@ -398,18 +432,20 @@ impl OutputChannel {
 /// into it. The last task to call [`Self::finalize`] is the one that
 /// finalizes the coalescer and ships the residual batch.
 ///
-/// Cheap to [`Clone`]: both fields are [`Arc`]s.
+/// Cheap to [`Clone`]: its fields are [`Arc`]s and a number.
 #[derive(Clone)]
 struct SharedCoalescer {
     inner: Arc<Mutex<LimitedBatchCoalescer>>,
     active_senders: Arc<AtomicUsize>,
     demand: Option<Arc<Notify>>,
     requested: Arc<AtomicBool>,
+    target_batch_size: usize,
 }
 
 impl SharedCoalescer {
     fn new(schema: SchemaRef, target_batch_size: usize, num_senders: usize) -> Self {
         Self {
+            target_batch_size,
             inner: Arc::new(Mutex::new(LimitedBatchCoalescer::new(
                 schema,
                 target_batch_size,
@@ -448,13 +484,30 @@ impl SharedCoalescer {
         }
     }
 
+    /// The batch buffered for this output, flushed because its consumer
+    /// asked ([`FlushOnDemand`]).
+    ///
+    /// **A partial batch flushed on demand keeps at most twice the bytes its
+    /// views reference.** The coalescer finishes its in-progress string block
+    /// as it is, at the capacity it grew to (up to 1 MiB per view column),
+    /// however few bytes the batch holds, so many small flushes would queue
+    /// far more memory than their rows need. A view column above that bound
+    /// is compacted ([`compact`]) before the batch is queued. A full batch and
+    /// a column that is not a view are handed on as they are. The rows and
+    /// their order are unchanged, and the batch is charged for what it then
+    /// holds ([`OutputChannel::send`]).
     fn flush_requested(&self) -> Result<Vec<RecordBatch>> {
         let mut c = self.inner.lock();
         if c.is_empty() || !self.requested.swap(false, AtomicOrdering::AcqRel) {
             return Ok(vec![]);
         }
         c.flush()?;
-        Ok(std::iter::from_fn(|| c.next_completed_batch()).collect())
+        std::iter::from_fn(|| c.next_completed_batch())
+            .map(|batch| match batch.num_rows() < self.target_batch_size {
+                true => compact(&batch),
+                false => Ok(batch),
+            })
+            .collect()
     }
 
     /// Decrement the active-senders counter. If this caller was the last
@@ -2928,7 +2981,7 @@ mod tests {
     };
 
     use arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int64Array, StringArray,
+        Array, ArrayRef, Decimal128Array, Int64Array, StringArray, StringViewArray,
         TimestampNanosecondArray, UInt32Array,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -4165,6 +4218,57 @@ mod tests {
                 .expect("demand flush deadlocked")
                 .expect("missing batch")?;
         assert_eq!(result, batch);
+        drop(stream);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn demand_flush_compacts_a_partial_string_batch() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, false),
+            Field::new("n", DataType::UInt32, false),
+        ]));
+        // A few long strings sliced out of many, so the coalescer copies them
+        // into its own block rather than sharing the input's buffer.
+        let strings = StringViewArray::from_iter_values(
+            (0..10_000).map(|i| format!("a string longer than twelve bytes {i}")),
+        );
+        let numbers = UInt32Array::from_iter_values(0..10_000);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(strings), Arc::new(numbers)],
+        )?
+        .slice(0, 10);
+        let source = Arc::new(StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UnboundedTestPartition {
+                schema: Arc::clone(&schema),
+                batch: batch.clone(),
+            })],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(1))?;
+        let config = SessionConfig::new()
+            .with_batch_size(8192)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut stream = exec.execute(0, task)?;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("demand flush deadlocked")
+                .expect("missing batch")?;
+        assert_eq!(result, batch);
+        let flushed = result.column(0).as_string_view();
+        let held: usize = flushed.data_buffers().iter().map(|b| b.capacity()).sum();
+        assert!(
+            held <= 2 * flushed.total_buffer_bytes_used(),
+            "a partial batch of {} string bytes holds {held} bytes of buffer",
+            flushed.total_buffer_bytes_used()
+        );
         drop(stream);
         Ok(())
     }
