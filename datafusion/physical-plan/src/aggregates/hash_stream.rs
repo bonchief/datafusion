@@ -17,6 +17,7 @@ use datafusion_common::{
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
+use futures::FutureExt;
 use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
@@ -872,7 +873,32 @@ impl FinalHashAggregateStream {
         // Rows aggregated by `hash_table`
         let mut table_rows = 0usize;
 
-        while let Some(batch) = self.input.next().await.transpose()? {
+        loop {
+            let next = match self.input.next().now_or_never() {
+                Some(next) => next,
+                None => {
+                    // The input has nothing ready: aggregate a bucket's
+                    // buffered rows meanwhile, see `BucketedAggregation`
+                    if let (Some(buckets), Some(bucketing)) =
+                        (buckets.as_mut(), self.bucketing.as_ref())
+                    {
+                        let _timer = elapsed_compute.timer();
+                        if bucketing.aggregate_idle(
+                            buckets,
+                            &mut compaction_table,
+                            &self.reservation,
+                            0,
+                        )? {
+                            bucketing.reserve(&self.reservation, 0, buckets)?;
+                            continue;
+                        }
+                    }
+                    self.input.next().await
+                }
+            };
+            let Some(batch) = next.transpose()? else {
+                break;
+            };
             let _timer = elapsed_compute.timer();
 
             if let (Some(buckets), Some(bucketing)) =
@@ -1464,6 +1490,27 @@ mod tests {
         .await
     }
 
+    /// Like [`run_final_hash_aggregate`], with input that has no batch ready
+    /// at every other poll, as a final aggregation's input often has.
+    async fn run_final_hash_aggregate_waiting(
+        num_groups: usize,
+        num_partitions: usize,
+        bucket_threshold: usize,
+        memory_limit: Option<usize>,
+    ) -> Result<(Vec<(i32, i64)>, usize, usize)> {
+        WAITING.with(|waiting| waiting.set(true));
+        let result = run_final_hash_aggregate_with_disk(
+            num_groups,
+            num_partitions,
+            bucket_threshold,
+            memory_limit,
+            true,
+        )
+        .await;
+        WAITING.with(|waiting| waiting.set(false));
+        result
+    }
+
     async fn run_final_hash_aggregate_with_disk(
         num_groups: usize,
         num_partitions: usize,
@@ -1553,9 +1600,24 @@ mod tests {
             Arc::clone(&schema),
         )?);
 
-        let batches =
+        let batches = if WAITING.with(|waiting| waiting.get()) {
+            let input = final_agg.input().execute(0, Arc::clone(&task_ctx))?;
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                input.schema(),
+                Waiting {
+                    input,
+                    ready: false,
+                },
+            ));
+            let stream = FinalHashAggregateStream::new_with_input(
+                &final_agg, &task_ctx, 0, input,
+            )?
+            .into_stream();
+            collect(stream).await?
+        } else {
             crate::collect(Arc::clone(&final_agg) as Arc<dyn ExecutionPlan>, task_ctx)
-                .await?;
+                .await?
+        };
         let mut rows = vec![];
         for batch in &batches {
             let groups = batch.column(0).as_primitive::<Int32Type>();
@@ -1589,11 +1651,36 @@ mod tests {
         Ok((rows, bucket_splits, metrics.spill_count().unwrap_or(0)))
     }
 
+    /// Has no batch ready at every other poll, and wakes its task at once.
+    struct Waiting {
+        input: SendableRecordBatchStream,
+        ready: bool,
+    }
+
+    impl Stream for Waiting {
+        type Item = Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.ready {
+                self.ready = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.ready = false;
+            self.input.poll_next_unpin(cx)
+        }
+    }
+
     thread_local! {
         /// `bucket_compactions` metric of the last [`run_final_hash_aggregate`]
         static BUCKET_COMPACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// `bucket_chunks` metric of the last [`run_final_hash_aggregate`]
         static BUCKET_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Set by [`run_final_hash_aggregate_waiting`]
+        static WAITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     #[tokio::test]
@@ -1606,19 +1693,41 @@ mod tests {
         assert!(rows.iter().all(|&(_, count)| count == 40));
         assert!(splits >= 1);
         assert_eq!(spills, 0);
-        // Eager buckets aggregate their rows as they arrive instead
-        let chunks = BUCKET_CHUNKS.with(|chunks| chunks.get());
-        assert!(chunks > 0, "buckets were aggregated as input arrived");
-        assert_eq!(BUCKET_COMPACTIONS.with(|compactions| compactions.get()), 0);
-
-        // Buckets that reached the threshold and were split again are
-        // compacted while input arrives
-        let (rows, splits, _) = run_final_hash_aggregate(20_000, 40, 100, None).await?;
-        assert_eq!(rows.len(), 20_000);
-        assert!(rows.iter().all(|&(_, count)| count == 40));
-        assert!(splits > 1);
+        // Input that is always ready leaves no time to aggregate buckets early
+        assert_eq!(BUCKET_CHUNKS.with(|chunks| chunks.get()), 0);
         let compactions = BUCKET_COMPACTIONS.with(|compactions| compactions.get());
         assert!(compactions > 0, "buckets were compacted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_hash_aggregate_buckets_aggregate_while_input_waits() -> Result<()> {
+        // Every group arrives 40 times; eager tables keep the rows bounded
+        let (rows, splits, spills) =
+            run_final_hash_aggregate_waiting(20_000, 40, 1_000, None).await?;
+        assert_eq!(rows.len(), 20_000);
+        assert!(rows.iter().all(|&(_, count)| count == 40));
+        assert!(splits >= 1);
+        assert_eq!(spills, 0);
+        let chunks = BUCKET_CHUNKS.with(|chunks| chunks.get());
+        assert!(chunks > 0, "buckets were aggregated while input waited");
+        assert_eq!(BUCKET_COMPACTIONS.with(|compactions| compactions.get()), 0);
+
+        let (expected, _, _) = run_final_hash_aggregate(50_000, 3, 0, None).await?;
+        // Eager tables that reach the threshold are split again
+        let (rows, splits, _) =
+            run_final_hash_aggregate_waiting(50_000, 3, 100, None).await?;
+        assert_eq!(rows, expected);
+        assert!(splits > 1, "buckets were split again, got {splits} splits");
+
+        // Eager tables spill under a memory limit
+        let (expected, _, _) = run_final_hash_aggregate(200_000, 3, 0, None).await?;
+        let (rows, splits, spills) =
+            run_final_hash_aggregate_waiting(200_000, 3, 10_000, Some(3 * 1024 * 1024))
+                .await?;
+        assert_eq!(rows, expected);
+        assert!(splits >= 1);
+        assert!(spills > 0, "buckets were spilled");
         Ok(())
     }
 

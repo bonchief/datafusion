@@ -127,19 +127,25 @@ pub(super) struct EagerTable {
 ///
 /// # Aggregating as input arrives
 ///
-/// A bucket starts *eager*: it owns a table that persists while input
-/// arrives, and once its buffered rows reach [`Self::bucket_to_aggregate`]'s
-/// chunk size they are aggregated into that table and released. So the
-/// aggregation is done while the input is produced instead of after it ends,
-/// and each chunk works in one bucket's table, not the 64 at once.
+/// A bucket starts *eager*: while the stream's input has no batch ready, the
+/// stream aggregates the buffered rows of the eager bucket that holds the
+/// most, at least a batch of them, into a table that the bucket owns from
+/// then on ([`Self::bucket_to_aggregate_idle`]). So the time the final
+/// aggregation spends waiting for its input does the work that would
+/// otherwise wait for the end of the input, and each such chunk works in one
+/// bucket's table, not the 64 at once. A stream whose input is always ready
+/// never starts a table and works exactly as without eager buckets: it
+/// buffers and compacts rows and aggregates the buckets after input ends.
 ///
-/// - **Chunk size.** A chunk is due once the bucket buffers at least one
-///   batch of rows and at least as many rows as its table holds groups. A
-///   chunk then touches each cache line of the table at most once per row it
+/// - **Chunk size.** Once a bucket has a table, its rows are also due
+///   whenever it buffers at least one batch of rows and at least as many
+///   rows as its table holds groups ([`Self::bucket_to_aggregate`]), which
+///   bounds what it buffers by `max(batch_size, groups of its table)` plus
+///   the rows of one input batch, in place of compaction. Such a chunk
+///   touches each cache line of the table at most once per row it
 ///   aggregates, so bringing the table back into cache costs no more lines
 ///   than reading the chunk, and with every key new the table at most
-///   doubles per chunk. A bucket's buffered rows are therefore bounded by
-///   `max(batch_size, groups of its table)` plus the rows of one input batch.
+///   doubles per chunk.
 /// - **Re-splits.** A table that reaches the bucketing threshold, at a level
 ///   that can still be split, stops being eager: its state is put back in
 ///   place of the rows it aggregated, and the bucket is buffered, compacted
@@ -296,20 +302,32 @@ impl FinalBuckets {
         Ok(())
     }
 
-    /// Returns an eager bucket whose buffered rows are due to be aggregated
-    /// into its table, if any: it holds at least one batch of rows and at
+    /// Returns a bucket with a table whose buffered rows are due to be
+    /// aggregated into it, if any: it holds at least one batch of rows and at
     /// least as many rows as its table holds groups. See the section on
     /// aggregating as input arrives.
     pub(super) fn bucket_to_aggregate(&self) -> Option<usize> {
         self.buckets.iter().position(|bucket| {
-            let groups = bucket
-                .table
-                .as_ref()
-                .map_or(0, |table| table.building_group_count());
-            bucket.eager
-                && bucket.spill_file.is_none()
-                && bucket.rows >= self.min_compaction_rows.max(groups)
+            bucket.table.as_ref().is_some_and(|table| {
+                bucket.rows >= self.min_compaction_rows.max(table.building_group_count())
+            })
         })
+    }
+
+    /// Returns the eager bucket that buffers the most rows, if it buffers at
+    /// least one batch of them, for the stream to aggregate while its input
+    /// has nothing ready.
+    pub(super) fn bucket_to_aggregate_idle(&self) -> Option<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| {
+                bucket.eager
+                    && bucket.spill_file.is_none()
+                    && bucket.rows >= self.min_compaction_rows
+            })
+            .max_by_key(|(index, bucket)| (bucket.rows, std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
     }
 
     /// Removes and returns the table of an eager bucket, to be followed by
@@ -358,7 +376,7 @@ impl FinalBuckets {
     /// Returns a bucket that is due for compaction, if any.
     pub(super) fn bucket_to_compact(&self) -> Option<usize> {
         self.buckets.iter().position(|bucket| {
-            !bucket.eager
+            bucket.table.is_none()
                 && bucket.spill_file.is_none()
                 && bucket.rows >= bucket.compact_at
         })

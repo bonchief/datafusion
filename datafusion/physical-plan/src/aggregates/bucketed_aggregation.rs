@@ -41,13 +41,15 @@ const MAP_BYTES_PER_GROUP: usize = 48;
 ///
 /// # When a bucket is aggregated
 ///
-/// An eager bucket (see [`FinalBuckets`]) aggregates a chunk of its rows
-/// into its own table whenever [`Self::compact`] finds it due, right after
-/// the input batch that made it due was routed, in the stream's own task:
-/// no other task or thread is started. After input ends each bucket, in
-/// bucket order, aggregates its remaining rows into its table and emits it.
-/// A bucket that is no longer eager is aggregated as a whole after input
-/// ends, as it was before eager buckets existed.
+/// While input arrives, an eager bucket (see [`FinalBuckets`]) aggregates a
+/// chunk of its rows into its own table when the stream finds its input
+/// with no batch ready ([`Self::aggregate_idle`]), and once it has a table,
+/// also whenever [`Self::compact`] finds it due after a routed batch. Both
+/// run in the stream's own task, within the turns it is given: no other task
+/// or thread is started. After input ends each bucket, in bucket order,
+/// aggregates its remaining rows into its table, if it has one, and emits
+/// it. A bucket without a table is aggregated as a whole after input ends,
+/// as it was before eager buckets existed.
 ///
 /// # Memory
 ///
@@ -177,10 +179,10 @@ impl BucketedAggregation {
         Ok(buckets)
     }
 
-    /// Aggregates the buffered rows of every eager bucket that is due for it
-    /// into the bucket's table, then replaces the rows of every other bucket
-    /// that is due for it by their aggregated state. See the sections on
-    /// aggregating as input arrives and on compaction of [`FinalBuckets`].
+    /// Aggregates the buffered rows of every bucket with a table that is due
+    /// for it into that table, then replaces the rows of every bucket without
+    /// a table that is due for it by their aggregated state. See the sections
+    /// on aggregating as input arrives and on compaction of [`FinalBuckets`].
     ///
     /// `table` is the table that compacts buckets, and the template of the
     /// buckets' tables. `other_bytes` is the memory held besides `buckets`,
@@ -192,39 +194,8 @@ impl BucketedAggregation {
         reservation: &MemoryReservation,
         other_bytes: usize,
     ) -> Result<()> {
-        let can_split = buckets.level() + 1 < MAX_BUCKET_LEVELS;
         while let Some(index) = buckets.bucket_to_aggregate() {
-            let template = match table {
-                Some(table) => table,
-                None => table.insert(self.new_table()?),
-            };
-            let mut bucket_table = match buckets.take_table(index) {
-                Some(bucket_table) => bucket_table,
-                None => template.empty_like()?,
-            };
-            let batches = buckets.take_bucket(index)?;
-            let rows = batches.iter().map(RecordBatch::num_rows).sum();
-            let bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-            let held = other_bytes + buckets.memory_size() + bytes;
-            // A table that cannot be split any more grows past the threshold
-            let limit = if can_split {
-                self.threshold
-            } else {
-                usize::MAX
-            };
-            self.presize(&mut bucket_table, rows, bytes, limit, reservation, held)?;
-            for batch in &batches {
-                bucket_table.aggregate_batch(batch)?;
-            }
-            drop(batches);
-            // The table waits for its next chunk without the scratch of this one
-            bucket_table.release_scratch();
-            if can_split && bucket_table.building_group_count() >= self.threshold {
-                buckets.stop_eager(index, bucket_table.take_state_batch()?, rows);
-            } else {
-                buckets.put_table(index, bucket_table, rows);
-            }
-            self.bucket_chunks.add(1);
+            self.aggregate_chunk(buckets, index, table, reservation, other_bytes)?;
         }
 
         while let Some(index) = buckets.bucket_to_compact() {
@@ -244,6 +215,68 @@ impl BucketedAggregation {
             );
             self.bucket_compactions.add(1);
         }
+        Ok(())
+    }
+
+    /// Aggregates one chunk of an eager bucket while the stream's input has
+    /// no batch ready. Returns false if no bucket buffers a batch of rows.
+    /// See [`Self::compact`] for the arguments.
+    pub(super) fn aggregate_idle(
+        &self,
+        buckets: &mut FinalBuckets,
+        table: &mut Option<AggregateHashTable<FinalMarker>>,
+        reservation: &MemoryReservation,
+        other_bytes: usize,
+    ) -> Result<bool> {
+        let Some(index) = buckets.bucket_to_aggregate_idle() else {
+            return Ok(false);
+        };
+        self.aggregate_chunk(buckets, index, table, reservation, other_bytes)?;
+        Ok(true)
+    }
+
+    /// Aggregates the buffered rows of the eager bucket `index` into its
+    /// table, which is started from `template` if it has none yet.
+    fn aggregate_chunk(
+        &self,
+        buckets: &mut FinalBuckets,
+        index: usize,
+        template: &mut Option<AggregateHashTable<FinalMarker>>,
+        reservation: &MemoryReservation,
+        other_bytes: usize,
+    ) -> Result<()> {
+        let can_split = buckets.level() + 1 < MAX_BUCKET_LEVELS;
+        let template = match template {
+            Some(table) => table,
+            None => template.insert(self.new_table()?),
+        };
+        let mut bucket_table = match buckets.take_table(index) {
+            Some(bucket_table) => bucket_table,
+            None => template.empty_like()?,
+        };
+        let batches = buckets.take_bucket(index)?;
+        let rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        let held = other_bytes + buckets.memory_size() + bytes;
+        // A table that cannot be split any more grows past the threshold
+        let limit = if can_split {
+            self.threshold
+        } else {
+            usize::MAX
+        };
+        self.presize(&mut bucket_table, rows, bytes, limit, reservation, held)?;
+        for batch in &batches {
+            bucket_table.aggregate_batch(batch)?;
+        }
+        drop(batches);
+        // The table waits for its next chunk without the scratch of this one
+        bucket_table.release_scratch();
+        if can_split && bucket_table.building_group_count() >= self.threshold {
+            buckets.stop_eager(index, bucket_table.take_state_batch()?, rows);
+        } else {
+            buckets.put_table(index, bucket_table, rows);
+        }
+        self.bucket_chunks.add(1);
         Ok(())
     }
 
