@@ -1940,7 +1940,7 @@ mod tests {
             let keys = batch.column(0).as_string_view();
             let counts = batch
                 .column(1)
-                .as_primitive::<arrow::datatypes::Int64Type>();
+                .as_primitive::<Int64Type>();
             let mins = batch.column(2).as_string_view();
             for row in 0..batch.num_rows() {
                 rows.push((
@@ -1960,7 +1960,11 @@ mod tests {
         }
 
         let metrics = final_agg.metrics().expect("final aggregate has metrics");
-        let metric = |name| metrics.sum_by_name(name).map_or(0, |value| value.as_usize());
+        let metric = |name| {
+            metrics
+                .sum_by_name(name)
+                .map_or(0, |value| value.as_usize())
+        };
         let bucket_splits = metric("bucket_splits");
         // The stream reports its peak reservation, and the buckets the rows
         // routed into them: every group at least once

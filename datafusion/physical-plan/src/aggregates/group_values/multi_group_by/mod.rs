@@ -19,13 +19,13 @@ use std::mem::{self, size_of};
 use std::sync::Arc;
 
 use crate::aggregates::group_values::carried::table_hashes;
-use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
     bytes_view::ByteViewGroupValueBuilder,
     fixed_size_binary::FixedSizeBinaryGroupValueBuilder,
     primitive::PrimitiveGroupValueBuilder, row_backed::RowsGroupColumn,
 };
+use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 use arrow::array::{
     Array, ArrayRef, BooleanBufferBuilder, downcast_primitive, new_empty_array,
 };
@@ -1370,8 +1370,7 @@ mod tests {
 
     use arrow::array::{
         Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
-        Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
     use arrow::datatypes::{

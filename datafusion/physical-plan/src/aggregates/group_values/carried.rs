@@ -26,10 +26,16 @@ use datafusion_physical_expr_common::group_hash::GroupHash;
 ///   [`GroupHash::STATE`] ([`Self::hash_rows`]), which is how the carried
 ///   hashes were computed, so they probe the same table.
 ///
+/// It is one pointer wide until hashes are first admitted, so group values
+/// that never carry hashes stay the size they were.
+///
 /// [`GroupValues`]: super::GroupValues
 /// [`GroupValues::intern_hashed`]: super::GroupValues::intern_hashed
 #[derive(Debug, Default)]
-pub(crate) struct CarriedHashes {
+pub(crate) struct CarriedHashes(Option<Box<Kept>>);
+
+#[derive(Debug, Default)]
+struct Kept {
     /// `None` until hashes are first admitted, then the hash of every group
     groups: Option<Vec<u64>>,
     /// The hashes of the groups the last emit removed, until they are taken
@@ -39,32 +45,40 @@ pub(crate) struct CarriedHashes {
 }
 
 impl CarriedHashes {
+    fn groups(&mut self) -> Option<&mut Vec<u64>> {
+        self.0.as_mut().and_then(|kept| kept.groups.as_mut())
+    }
+
     /// True once hashes are carried.
     pub(crate) fn is_carried(&self) -> bool {
-        self.groups.is_some()
+        self.0.as_ref().is_some_and(|kept| kept.groups.is_some())
     }
 
     /// Admits carried hashes into an implementation holding `num_groups`
     /// groups. Refuses them if those groups were interned with hashes of the
     /// implementation's own.
     pub(crate) fn admit(&mut self, num_groups: usize) -> Result<()> {
-        match self.groups {
-            Some(_) => Ok(()),
-            None if num_groups == 0 => {
-                self.groups = Some(Vec::new());
-                Ok(())
-            }
-            None => internal_err!(
-                "Group values holding {num_groups} groups interned with their own hashes cannot intern carried hashes"
-            ),
+        if self.is_carried() {
+            return Ok(());
         }
+        if num_groups > 0 {
+            return internal_err!(
+                "Group values holding {num_groups} groups interned with their own hashes cannot intern carried hashes"
+            );
+        }
+        self.0.get_or_insert_with(Box::default).groups = Some(Vec::new());
+        Ok(())
     }
 
     /// The carried hash of every row of `cols`, for rows that come without
     /// one once hashes are carried. Hand the vector back with
     /// [`Self::reuse`].
     pub(crate) fn hash_rows(&mut self, cols: &[ArrayRef]) -> Result<Vec<u64>> {
-        let mut hashes = std::mem::take(&mut self.buffer);
+        let mut hashes = self
+            .0
+            .as_mut()
+            .map(|kept| std::mem::take(&mut kept.buffer))
+            .unwrap_or_default();
         hashes.clear();
         hashes.resize(cols.first().map_or(0, |col| col.len()), 0);
         create_hashes(cols, &GroupHash::STATE, &mut hashes)?;
@@ -73,7 +87,9 @@ impl CarriedHashes {
 
     /// Takes back the vector [`Self::hash_rows`] returned.
     pub(crate) fn reuse(&mut self, hashes: Vec<u64>) {
-        self.buffer = hashes;
+        if let Some(kept) = &mut self.0 {
+            kept.buffer = hashes;
+        }
     }
 
     /// Records the hashes of the groups one intern created: the groups from
@@ -87,7 +103,7 @@ impl CarriedHashes {
         groups: &[usize],
         hashes: &[u64],
     ) {
-        let Some(kept) = &mut self.groups else {
+        let Some(kept) = self.groups() else {
             return;
         };
         debug_assert_eq!(kept.len(), first_new);
@@ -105,37 +121,44 @@ impl CarriedHashes {
     /// Removes the hashes of the groups `emit_to` removes, to be taken with
     /// [`Self::take_emitted`].
     pub(crate) fn emit(&mut self, emit_to: EmitTo) {
-        if let Some(kept) = &mut self.groups {
-            self.emitted = Some(emit_to.take_needed(kept));
+        if let Some(kept) = &mut self.0
+            && let Some(groups) = &mut kept.groups
+        {
+            kept.emitted = Some(emit_to.take_needed(groups));
         }
     }
 
     /// Forgets the hashes of the groups that are left, which the caller is
     /// about to intern again.
     pub(crate) fn restart(&mut self) {
-        if let Some(kept) = &mut self.groups {
+        if let Some(kept) = self.groups() {
             kept.clear();
         }
     }
 
     /// The hashes the last emit removed, once.
     pub(crate) fn take_emitted(&mut self) -> Option<Vec<u64>> {
-        self.emitted.take()
+        self.0.as_mut().and_then(|kept| kept.emitted.take())
     }
 
     /// Forgets every group's hash and whether hashes are carried, for an
     /// implementation that dropped its groups. Hashes already emitted stay
     /// until they are taken.
     pub(crate) fn clear(&mut self) {
-        self.groups = None;
-        self.buffer = Vec::new();
+        if let Some(kept) = &mut self.0 {
+            kept.groups = None;
+            kept.buffer = Vec::new();
+        }
     }
 
     /// Memory held, in bytes
     pub(crate) fn size(&self) -> usize {
-        self.groups.as_ref().map_or(0, |kept| kept.allocated_size())
-            + self.emitted.as_ref().map_or(0, |kept| kept.allocated_size())
-            + self.buffer.allocated_size()
+        self.0.as_ref().map_or(0, |kept| {
+            size_of::<Kept>()
+                + kept.groups.as_ref().map_or(0, |v| v.allocated_size())
+                + kept.emitted.as_ref().map_or(0, |v| v.allocated_size())
+                + kept.buffer.allocated_size()
+        })
     }
 }
 
@@ -221,7 +244,8 @@ mod tests {
 
         fn keys(rows: usize) -> impl Iterator<Item = Option<String>> {
             (0..rows).map(|row| {
-                (row % 9 != 4).then(|| format!("a group key past the inline length {}", row % 13))
+                (row % 9 != 4)
+                    .then(|| format!("a group key past the inline length {}", row % 13))
             })
         }
 

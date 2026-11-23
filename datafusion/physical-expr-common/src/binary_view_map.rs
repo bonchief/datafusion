@@ -458,12 +458,7 @@ where
         }
 
         // step 1: compute hashes, or take the carried ones
-        table_hashes(
-            values,
-            carried,
-            &self.random_state,
-            &mut self.hashes_buffer,
-        );
+        table_hashes(values, carried, &self.random_state, &mut self.hashes_buffer);
 
         // step 2: insert each value into the set, if not already present
         let values = values.as_byte_view::<B>();

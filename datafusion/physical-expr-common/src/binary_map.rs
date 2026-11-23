@@ -5,6 +5,7 @@
 //! [`ArrowBytesMap`] and [`ArrowBytesSet`] for storing maps/sets of values from
 //! StringArray / LargeStringArray / BinaryArray / LargeBinaryArray.
 
+use crate::group_hash::table_hashes;
 use arrow::array::{
     Array, ArrayRef, BufferBuilder, GenericBinaryArray, GenericStringArray,
     NullBufferBuilder, OffsetSizeTrait,
@@ -13,7 +14,6 @@ use arrow::array::{
 };
 use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
-use crate::group_hash::table_hashes;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::{Result, exec_err};
@@ -1515,7 +1515,8 @@ mod tests {
         use crate::group_hash::GroupHash;
 
         let values: ArrayRef = Arc::new(StringArray::from_iter((0..5_000).map(|row| {
-            (row % 7 != 3).then(|| format!("a value past any inline length {}", row % 1_700))
+            (row % 7 != 3)
+                .then(|| format!("a value past any inline length {}", row % 1_700))
         })));
         let mut carried = vec![0; values.len()];
         create_hashes([&values], &GroupHash::STATE, &mut carried).unwrap();
@@ -1528,7 +1529,9 @@ mod tests {
             };
             let observe = |payload| payloads.push(payload);
             match carried {
-                Some(carried) => map.insert_if_new_hashed(&values, carried, make, observe),
+                Some(carried) => {
+                    map.insert_if_new_hashed(&values, carried, make, observe)
+                }
                 None => map.insert_if_new(&values, make, observe),
             }
             payloads

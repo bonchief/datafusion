@@ -477,7 +477,8 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("v", DataType::Int64, false),
         ]));
-        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
+        let mut buckets =
+            FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
         // the same keys arrive in two different batches
         buckets.route(&test_batch(&schema, 0..20_000))?;
         buckets.route(&test_batch(&schema, 10_000..30_000))?;
@@ -521,13 +522,15 @@ mod tests {
             Field::new("v", DataType::Int64, false),
         ]));
         // Rows of one level-0 bucket must spread again at level 1
-        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
+        let mut level0 =
+            FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
         level0.route(&test_batch(&schema, 0..50_000))?;
         let source = level0.into_sources()?.swap_remove(0);
         let BucketSource::Memory { batches, .. } = source else {
             unreachable!()
         };
-        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
+        let mut level1 =
+            FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
         for batch in &batches {
             level1.route(batch)?;
         }
