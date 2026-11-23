@@ -10,7 +10,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, GenericByteViewArray, UInt32Array};
-use arrow::compute::{BatchCoalescer, concat_batches, take_arrays};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow::compute::{BatchCoalescer, concat_batches, take};
 use arrow::datatypes::{ByteViewType, DataType, SchemaRef, UInt64Type};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::hash_utils::create_hashes;
@@ -90,10 +91,12 @@ struct Bucket {
 /// which the row carries in its last column when the partial aggregation
 /// computed it (see `AggregateExec::with_group_hash`), and which is
 /// computed here otherwise. While a routed batch is still in cache, its row
-/// indices are sorted by bucket and one `take` gathers them, copying the
-/// 16-byte view of a string and not its bytes; each bucket keeps its slice of
-/// the result. A bucket's slices are concatenated, in order, when the bucket
-/// is aggregated.
+/// indices are sorted by bucket and its rows are copied in that order, the
+/// bytes of a string or binary view longer than its inline 12 included (see
+/// [`scatter_views`]); each bucket keeps its slice of the result. A bucket's
+/// rows thus own their bytes, which lie together, and its aggregate does not
+/// reach back into the batches the exchange sent. A bucket's slices are
+/// concatenated, in order, when the bucket is aggregated.
 ///
 /// # Memory pressure
 ///
@@ -214,7 +217,15 @@ impl FinalBuckets {
 
         let _timer = self.metrics.move_time.timer();
         let indices = UInt32Array::from(sorted);
-        let columns = take_arrays(batch.columns(), &indices, None)?;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| match column.data_type() {
+                DataType::Utf8View => scatter_views(column.as_string_view(), &indices),
+                DataType::BinaryView => scatter_views(column.as_binary_view(), &indices),
+                _ => Ok(take(column, &indices, None)?),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
         let sorted =
             RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
@@ -421,6 +432,76 @@ fn concat_pieces(
     })
 }
 
+/// The rows `rows` of `array`, in that order, with the bytes of every view
+/// longer than the 12 a view holds inline copied into one buffer of their
+/// own. Unlike `take`, which keeps referencing the source's buffers, the
+/// result references nothing of `array`.
+fn scatter_views<T: ByteViewType + ?Sized>(
+    array: &GenericByteViewArray<T>,
+    rows: &UInt32Array,
+) -> Result<ArrayRef> {
+    const INLINE: u32 = 12;
+    let views = array.views();
+    let sources = array.data_buffers();
+    let nulls = array.nulls().filter(|nulls| nulls.null_count() > 0);
+    let valid = |row: usize| nulls.is_none_or(|nulls| nulls.is_valid(row));
+    let length = |view: u128| view as u32;
+
+    let bytes: usize = rows
+        .values()
+        .iter()
+        .map(|&row| views[row as usize])
+        .filter(|&view| length(view) > INLINE)
+        .map(|view| length(view) as usize)
+        .sum();
+    if u32::try_from(bytes).is_err() {
+        return internal_err!(
+            "A batch routed into hash buckets holds over 4 GiB of strings"
+        );
+    }
+    let mut data = Vec::with_capacity(bytes);
+    let mut out = Vec::with_capacity(rows.len());
+    for &row in rows.values() {
+        let row = row as usize;
+        let view = views[row];
+        let len = length(view);
+        if len <= INLINE {
+            out.push(view);
+        } else if !valid(row) {
+            out.push(0);
+        } else {
+            // Long view: length and prefix in the low 64 bits, then the
+            // buffer index and the offset into that buffer
+            let source = (view >> 64) as u32 as usize;
+            let start = (view >> 96) as u32 as usize;
+            let offset = data.len() as u128;
+            data.extend_from_slice(&sources[source][start..start + len as usize]);
+            out.push((view & u128::from(u64::MAX)) | (offset << 96));
+        }
+    }
+    let nulls = nulls.map(|nulls| {
+        let values = rows.values();
+        NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |i| {
+            nulls.is_valid(values[i] as usize)
+        }))
+    });
+    let buffers = match data.is_empty() {
+        true => vec![],
+        false => vec![Buffer::from_vec(data)],
+    };
+    // SAFETY: every view is a valid view of `array` (or zero, for a null),
+    // and every long view now points at an identical copy of its bytes in
+    // buffer 0, so the views are as valid as `array`'s.
+    let array = unsafe {
+        GenericByteViewArray::<T>::new_unchecked(
+            ScalarBuffer::from(out),
+            buffers.into(),
+            nulls,
+        )
+    };
+    Ok(Arc::new(array))
+}
+
 /// Bytes the rows of `batch` take, counting only the bytes of a string or
 /// binary view that its row references: a routed batch shares the data
 /// buffers of the batch it was taken from with the other partitions' rows.
@@ -532,7 +613,7 @@ fn coalesce_stream(
 mod tests {
     use super::*;
 
-    use arrow::array::{Int64Array, StringArray, UInt64Array};
+    use arrow::array::{Int64Array, StringArray, StringViewArray, UInt64Array};
     use arrow::datatypes::{Field, Int64Type, Schema};
     use datafusion_physical_expr_common::group_hash::group_hash_field;
     use std::collections::HashMap;
@@ -617,6 +698,57 @@ mod tests {
             assert_eq!(seen, bucket, "key {key} in two buckets");
         }
         assert_eq!(bucket_of_key.len(), 30_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn routed_strings_own_their_bytes() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8View, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        // Short (inline), long and null names
+        let name = |k: i64| match k % 3 {
+            0 => Some(format!("k{k}")),
+            1 => Some(format!("a string longer than twelve bytes {k}")),
+            _ => None,
+        };
+        let names: StringViewArray = (0..5_000).map(name).collect();
+        let source: Vec<_> = names
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_ptr_range())
+            .collect();
+        let values: Int64Array = (0..5_000).collect::<Vec<_>>().into();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(names), Arc::new(values)],
+        )?;
+        let mut buckets =
+            FinalBuckets::new(&schema, 1, 1024, 0, 6, None, RouteMetrics::default());
+        buckets.route(&batch)?;
+        drop(batch);
+
+        let mut seen = 0;
+        for source_rows in buckets.into_sources()?.0 {
+            let mut stream = source_rows.into_stream(&schema);
+            while let Some(batch) = stream.next().await.transpose()? {
+                let names = batch.column(0).as_string_view();
+                for buffer in names.data_buffers().iter() {
+                    let start = buffer.as_ptr();
+                    assert!(
+                        !source.iter().any(|range| range.contains(&start)),
+                        "a routed string references the batch it came from"
+                    );
+                }
+                let values = batch.column(1).as_primitive::<Int64Type>();
+                for (got, k) in names.iter().zip(values.values()) {
+                    assert_eq!(got.map(str::to_owned), name(*k));
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 5_000);
         Ok(())
     }
 
