@@ -23,6 +23,19 @@ use std::mem::{size_of, swap};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// The hash state of the byte maps, and of the aggregation's other group
+/// tables, which reuse it.
+///
+/// It is not `RandomState::default()`: that equals `RandomState::with_seed(0)`,
+/// the state `RepartitionExec` routes rows with. After a hash repartition on
+/// the same columns, every key of a partition would share the residue of its
+/// table hash modulo the partition count, and a table of a power-of-two size
+/// would use only one home bucket in that count. With this seed the table
+/// hash is independent of the routing hash.
+pub const AGGREGATION_HASH_SEED: RandomState =
+    // This seed is chosen to be a large 64-bit number
+    RandomState::with_seed(15395726432021054657);
+
 /// Should the output be a String or Binary?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputType {
@@ -305,7 +318,7 @@ where
             initial_buffer_capacity: buffer_capacity,
             buffer: Vec::with_capacity(buffer_capacity),
             offsets: vec![O::default()], // first offset is always 0
-            random_state: RandomState::default(),
+            random_state: AGGREGATION_HASH_SEED,
             hashes_buffer: vec![],
             null: None,
         }
@@ -1404,5 +1417,57 @@ mod tests {
             assert_eq!(&arr, &expected);
             arr
         }
+    }
+
+    /// The byte maps hash with [`AGGREGATION_HASH_SEED`], not with the
+    /// repartition's state: keys that one partition of a hash repartition
+    /// receives, which share a residue of the routing hash, still take
+    /// nearly as many home buckets as random keys would, where under the
+    /// routing hash they would take one in 32.
+    #[cfg(not(feature = "force_hash_collisions"))]
+    #[test]
+    fn table_hash_is_independent_of_the_repartition_hash() {
+        use std::hash::BuildHasher;
+        // `RepartitionExec`'s state is `with_seed(0)`, which is the default.
+        let routing = RandomState::with_seed(0);
+        assert_eq!(
+            routing.hash_one(42u64),
+            RandomState::default().hash_one(42u64)
+        );
+        let map = ArrowBytesMap::<i32, ()>::new(OutputType::Utf8);
+        let view =
+            crate::binary_view_map::ArrowBytesViewMap::<()>::new(OutputType::Utf8View);
+        for state in [&map.random_state, view.random_state()] {
+            assert_eq!(state.hash_one(42u64), AGGREGATION_HASH_SEED.hash_one(42u64));
+        }
+
+        let all: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..200_000).map(|key| format!("key{key}")),
+        ));
+        let mut hashes = vec![0; all.len()];
+        create_hashes([&all], &routing, &mut hashes).unwrap();
+        // The keys of partition 0 of 32.
+        let picked = hashes
+            .iter()
+            .enumerate()
+            .filter(|(_, hash)| *hash % 32 == 0)
+            .map(|(row, _)| row as u32)
+            .collect::<Vec<_>>();
+        let keys =
+            arrow::compute::take(&all, &arrow::array::UInt32Array::from(picked), None)
+                .unwrap();
+        let buckets = (2 * keys.len()).next_power_of_two();
+        let homes = |state: &RandomState| {
+            let mut hashes = vec![0; keys.len()];
+            create_hashes([&keys], state, &mut hashes).unwrap();
+            hashes
+                .iter()
+                .map(|hash| *hash as usize & (buckets - 1))
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        assert!(homes(&routing) <= buckets / 32);
+        let spread = homes(&AGGREGATION_HASH_SEED);
+        assert!(spread * 10 >= keys.len() * 7, "{spread} of {}", keys.len());
     }
 }
