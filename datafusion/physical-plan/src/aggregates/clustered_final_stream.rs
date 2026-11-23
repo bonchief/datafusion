@@ -645,6 +645,9 @@ mod tests {
         // Keep partition 1's incomplete ordered run live while partition 0 spills
         // and replays. Channel inputs return Pending after each supplied batch,
         // making this interleaving independent of task scheduling.
+        // Partition 1 takes 7,040 groups, just below a growth of its table,
+        // so that it holds four fifths of the pool without spilling and
+        // partition 0 spills while it is live.
         let (second_sender, mut second) = new_stream(1)?;
         for batch in 0..55 {
             second_sender
@@ -652,9 +655,10 @@ mod tests {
                 .unwrap();
             assert!(second.next().now_or_never().is_none());
         }
-        // Over half the pool, so that partition 0 spills.
         let held = pool.reserved();
-        assert!(held > 300 * 1024, "held {held}");
+        let spills = aggregate.metrics().unwrap().spill_count().unwrap_or(0);
+        assert_eq!(spills, 0, "partition 1 spilled; held {held}");
+        assert!(held > 480 * 1024, "held {held}");
         // Created after `held` is measured, since the stream reserves its initial table.
         let (first_sender, mut first) = new_stream(0)?;
         for batch in 0..input_batches {
