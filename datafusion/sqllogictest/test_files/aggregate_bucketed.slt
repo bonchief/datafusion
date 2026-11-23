@@ -215,6 +215,72 @@ select count(*), sum(d) from (select concat('key-', cast(v % 5003 as varchar)) a
 ----
 5003 85051
 
+# --- carry_group_hash: the partial aggregation hashes variable-width keys
+# once and the exchange and the final aggregation use that hash. Same
+# results, with the buckets above and with one table.
+
+statement ok
+set datafusion.execution.carry_group_hash = true;
+
+query TT
+explain select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k;
+----
+logical_plan
+01)Projection: concat(Utf8("key-"),t.v % Int64(9973)) AS k, count(Int64(1)) AS count(*) AS c
+02)--Aggregate: groupBy=[[concat(Utf8View("key-"), CAST(t.v % Int64(9973) AS Utf8View)) AS concat(Utf8("key-"),t.v % Int64(9973))]], aggr=[[count(Int64(1))]]
+03)----TableScan: t projection=[v]
+physical_plan
+01)ProjectionExec: expr=[concat(Utf8("key-"),t.v % Int64(9973))@0 as k, count(Int64(1))@1 as c]
+02)--AggregateExec: mode=FinalPartitioned, gby=[concat(Utf8("key-"),t.v % Int64(9973))@0 as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
+03)----RepartitionExec: partitioning=Hash([concat(Utf8("key-"),t.v % Int64(9973))@0], 4), input_partitions=4
+04)------AggregateExec: mode=Partial, gby=[concat(key-, CAST(v@0 % 9973 AS Utf8View)) as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
+05)--------DataSourceExec: partitions=4, partition_sizes=[49, 49, 49, 49]
+
+query IT
+select count(*), min(m) from (select arrow_cast(concat('a-long-enough-string-view-key-', cast(v % 9973 as varchar)), 'Utf8View') as k, min(arrow_cast(concat('a-long-enough-string-view-value-', cast(v as varchar)), 'Utf8View')) m from t group by k);
+----
+9973 a-long-enough-string-view-value-1
+
+query III
+select count(*), sum(c), sum(s) from (select v % 101 as k1, concat('k', cast(v % 103 as varchar)) as k2, v % 7 = 0 as k3, count(*) c, sum(v) s from t group by k1, k2, k3);
+----
+20806 200000 20000100000
+
+# null keys hash alike
+query II
+select count(*), sum(c) from (select case when v % 11 = 0 then null else concat('key-', cast(v % 5003 as varchar)) end as k, count(*) c from t group by k);
+----
+5004 200000
+
+statement ok
+set datafusion.execution.hash_aggregate_bucket_threshold_bytes = 0;
+
+query II
+select count(*), sum(c) from (select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k);
+----
+9973 200000
+
+# the partial aggregation converts rows to states without aggregating
+statement ok
+set datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 1;
+
+statement ok
+set datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.0;
+
+query II
+select count(*), sum(c) from (select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k);
+----
+9973 200000
+
+statement ok
+reset datafusion.execution.skip_partial_aggregation_probe_rows_threshold;
+
+statement ok
+reset datafusion.execution.skip_partial_aggregation_probe_ratio_threshold;
+
+statement ok
+reset datafusion.execution.carry_group_hash;
+
 statement ok
 reset datafusion.execution.hash_aggregate_bucket_threshold_bytes;
 

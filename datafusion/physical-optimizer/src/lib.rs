@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::needless_pass_by_value))]
 
 pub mod aggregate_statistics;
+pub mod carry_group_hash;
 pub mod combine_partial_final_agg;
 pub mod eliminate_constant_join;
 pub mod ensure_coop;

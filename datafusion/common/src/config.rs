@@ -1180,6 +1180,14 @@ config_namespace! {
         /// enabled. Set to 0 to disable.
         pub hash_aggregate_bucket_threshold_bytes: usize, default = 0
 
+        /// (experimental) Hash the group keys of a two-stage hash aggregation
+        /// with variable-width keys once, in its partial stage, and carry the
+        /// hash to the exchange and the final stage in an extra column,
+        /// instead of hashing the keys again in each. The carried hash is the
+        /// exchange's own routing hash, so rows go to the same partitions.
+        /// Costs 8 bytes per row between the stages.
+        pub carry_group_hash: bool, default = false
+
         /// (experimental) Allocated-byte threshold for flushing unordered partial
         /// hash aggregation tables. Checked after each input batch; the table can
         /// exceed this size by one batch. Flushed groups count toward the existing

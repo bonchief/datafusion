@@ -55,7 +55,9 @@ use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_expr::ColumnarValue;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, RangePartitioning};
+use datafusion_physical_expr_common::group_hash::carried_group_hashes;
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 #[cfg(feature = "proto")]
@@ -870,6 +872,10 @@ pub struct BatchPartitioner {
 enum BatchPartitionerState {
     Hash {
         exprs: Vec<Arc<dyn PhysicalExpr>>,
+        /// The column index of each of `exprs`, if they are all columns: a
+        /// batch whose last column carries the group hash of exactly these
+        /// columns (see `AggregateExec::with_group_hash`) is routed by it.
+        keys: Option<Vec<usize>>,
         partition_reducer: StrengthReducedU64,
         hash_buffer: Vec<u64>,
         indices: Vec<Vec<u32>>,
@@ -1260,9 +1266,14 @@ impl BatchPartitioner {
             return internal_err!("Hash repartition requires at least one partition");
         }
 
+        let keys = exprs
+            .iter()
+            .map(|expr| expr.downcast_ref::<Column>().map(Column::index))
+            .collect();
         Ok(Self {
             state: BatchPartitionerState::Hash {
                 exprs,
+                keys,
                 partition_reducer: StrengthReducedU64::new(num_partitions as u64),
                 hash_buffer: vec![],
                 indices: vec![vec![]; num_partitions],
@@ -1477,6 +1488,7 @@ impl BatchPartitioner {
                 }
                 BatchPartitionerState::Hash {
                     exprs,
+                    keys,
                     partition_reducer,
                     hash_buffer,
                     indices,
@@ -1484,17 +1496,25 @@ impl BatchPartitioner {
                     // Tracking time required for distributing indexes across output partitions
                     let timer = self.timer.timer();
 
-                    let arrays =
-                        evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
-
                     hash_buffer.clear();
-                    hash_buffer.resize(batch.num_rows(), 0);
-
-                    create_hashes(
-                        &arrays,
-                        REPARTITION_RANDOM_STATE.random_state(),
-                        hash_buffer,
-                    )?;
+                    // The carried hash is the hash computed below, see
+                    // `GroupHash::STATE`.
+                    match keys
+                        .as_deref()
+                        .and_then(|keys| carried_group_hashes(&batch, keys))
+                    {
+                        Some(carried) => hash_buffer.extend_from_slice(carried),
+                        None => {
+                            let arrays =
+                                evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
+                            hash_buffer.resize(batch.num_rows(), 0);
+                            create_hashes(
+                                &arrays,
+                                REPARTITION_RANDOM_STATE.random_state(),
+                                hash_buffer,
+                            )?;
+                        }
+                    }
 
                     for v in indices.iter_mut() {
                         v.clear();
@@ -3138,6 +3158,53 @@ mod tests {
     }
 
     #[test]
+    fn hash_partitioner_routes_by_carried_group_hash() -> Result<()> {
+        use datafusion_physical_expr_common::group_hash::group_hash_field;
+
+        let partitions_of = |batch: &RecordBatch| -> Result<Vec<(usize, usize)>> {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
+            let keys = vec![col("k", &batch.schema())?];
+            let mut partitioner = BatchPartitioner::new_hash_partitioner(keys, 4, timer)?;
+            let mut routed = vec![];
+            partitioner.partition(batch.clone(), |partition, batch| {
+                routed.push((partition, batch.num_rows()));
+                Ok(())
+            })?;
+            routed.sort_unstable();
+            Ok(routed)
+        };
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
+        // Every row claims the hash 6, which is not the keys' hash
+        let hashes: ArrayRef = Arc::new(UInt64Array::from(vec![6u64; 4]));
+        let batch = |hash_field: Field| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Utf8, false),
+                    hash_field,
+                ])),
+                vec![Arc::clone(&keys), Arc::clone(&hashes)],
+            )
+        };
+
+        // The carried hash of column 0 routes every row to 6 % 4
+        assert_eq!(
+            partitions_of(&batch(group_hash_field(&[0]))?)?,
+            vec![(2, 4)]
+        );
+
+        // A hash of other columns, or a column that only looks like one, is
+        // not used: the keys spread over the partitions
+        for field in [
+            group_hash_field(&[1]),
+            Field::new("__group_hash", DataType::UInt64, false),
+        ] {
+            assert!(partitions_of(&batch(field)?)?.len() > 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn hash_partitioner_requires_nonzero_partitions() {
         let metrics = ExecutionPlanMetricsSet::new();
         let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
@@ -4729,13 +4796,8 @@ mod tests {
     // and without dropping the output stream.
     async fn hash_repartition_with_dropping_output_stream() {
         let task_ctx = Arc::new(TaskContext::default());
-        let partitioning = Partitioning::Hash(
-            vec![Arc::new(crate::expressions::Column::new(
-                "my_awesome_field",
-                0,
-            ))],
-            2,
-        );
+        let partitioning =
+            Partitioning::Hash(vec![Arc::new(Column::new("my_awesome_field", 0))], 2);
 
         // We first collect the results without dropping the output stream.
         let input = Arc::new(make_barrier_exec());
@@ -4868,10 +4930,7 @@ mod tests {
             Arc::new(StringArray::from(vec!["foo"])) as ArrayRef,
         )])
         .unwrap();
-        let partitioning = Partitioning::Hash(
-            vec![Arc::new(crate::expressions::Column::new("a", 0))],
-            2,
-        );
+        let partitioning = Partitioning::Hash(vec![Arc::new(Column::new("a", 0))], 2);
         let schema = batch.schema();
         let input = MockExec::new(vec![Ok(batch)], schema);
         let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
