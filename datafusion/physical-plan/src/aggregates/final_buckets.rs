@@ -432,10 +432,11 @@ fn concat_pieces(
     })
 }
 
-/// The rows `rows` of `array`, in that order, with the bytes of every view
-/// longer than the 12 a view holds inline copied into one buffer of their
-/// own. Unlike `take`, which keeps referencing the source's buffers, the
-/// result references nothing of `array`.
+/// The rows of `array` in the order `rows` lists them, with the bytes of
+/// every view longer than the 12 a view holds inline copied into one buffer
+/// of their own. Unlike `take`, which keeps referencing the source's buffers,
+/// the result references nothing of `array`. `rows` lists every row of
+/// `array` once.
 fn scatter_views<T: ByteViewType + ?Sized>(
     array: &GenericByteViewArray<T>,
     rows: &UInt32Array,
@@ -447,51 +448,77 @@ fn scatter_views<T: ByteViewType + ?Sized>(
     let valid = |row: usize| nulls.is_none_or(|nulls| nulls.is_valid(row));
     let length = |view: u128| view as u32;
 
-    let bytes: usize = rows
-        .values()
-        .iter()
-        .map(|&row| views[row as usize])
-        .filter(|&view| length(view) > INLINE)
-        .map(|view| length(view) as usize)
-        .sum();
+    // The length of a valid view's bytes held outside the view, else 0
+    let outlined = |row: usize| {
+        let len = length(views[row]);
+        if len > INLINE && valid(row) {
+            len as usize
+        } else {
+            0
+        }
+    };
+
+    // Where each row goes, and where its bytes go, in bucket order
+    let rows = rows.values();
+    if rows.len() != array.len() {
+        return internal_err!("Routed rows are not a permutation of the batch");
+    }
+    let mut positions = vec![u32::MAX; rows.len()];
+    let mut offsets = Vec::with_capacity(rows.len());
+    let mut bytes = 0usize;
+    for (position, &row) in rows.iter().enumerate() {
+        let Some(slot) = positions
+            .get_mut(row as usize)
+            .filter(|slot| **slot == u32::MAX)
+        else {
+            return internal_err!("Routed rows are not a permutation of the batch");
+        };
+        *slot = position as u32;
+        offsets.push(bytes);
+        bytes += outlined(row as usize);
+    }
     if u32::try_from(bytes).is_err() {
         return internal_err!(
             "A batch routed into hash buckets holds over 4 GiB of strings"
         );
     }
-    let mut data = Vec::with_capacity(bytes);
-    let mut out = Vec::with_capacity(rows.len());
-    for &row in rows.values() {
-        let row = row as usize;
-        let view = views[row];
-        let len = length(view);
-        if len <= INLINE {
-            out.push(view);
-        } else if !valid(row) {
-            out.push(0);
-        } else {
+
+    // Read the rows in the order they lie in the source, which is the order
+    // their bytes lie in, and write each where it goes
+    let mut data = vec![0u8; bytes];
+    let mut out = vec![0u128; rows.len()];
+    for (row, &view) in views.iter().enumerate() {
+        let position = positions[row] as usize;
+        let len = outlined(row);
+        out[position] = if len > 0 {
             // Long view: length and prefix in the low 64 bits, then the
             // buffer index and the offset into that buffer
             let source = (view >> 64) as u32 as usize;
             let start = (view >> 96) as u32 as usize;
-            let offset = data.len() as u128;
-            data.extend_from_slice(&sources[source][start..start + len as usize]);
-            out.push((view & u128::from(u64::MAX)) | (offset << 96));
-        }
+            let offset = offsets[position];
+            data[offset..offset + len]
+                .copy_from_slice(&sources[source][start..start + len]);
+            (view & u128::from(u64::MAX)) | ((offset as u128) << 96)
+        } else if valid(row) {
+            view
+        } else {
+            0
+        };
     }
     let nulls = nulls.map(|nulls| {
-        let values = rows.values();
-        NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |i| {
-            nulls.is_valid(values[i] as usize)
+        NullBuffer::new(BooleanBuffer::collect_bool(rows.len(), |i| {
+            nulls.is_valid(rows[i] as usize)
         }))
     });
     let buffers = match data.is_empty() {
         true => vec![],
         false => vec![Buffer::from_vec(data)],
     };
-    // SAFETY: every view is a valid view of `array` (or zero, for a null),
-    // and every long view now points at an identical copy of its bytes in
-    // buffer 0, so the views are as valid as `array`'s.
+    // SAFETY: `rows` is a permutation of `array`'s rows (the counting sort of
+    // `FinalBuckets::route`), so every view is written once. Each is a valid
+    // view of `array`, or zero for a null, and every long view now points at
+    // an identical copy of its bytes in buffer 0, so the views are as valid
+    // as `array`'s.
     let array = unsafe {
         GenericByteViewArray::<T>::new_unchecked(
             ScalarBuffer::from(out),
