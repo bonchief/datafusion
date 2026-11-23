@@ -1447,6 +1447,79 @@ mod tests {
         Ok(())
     }
 
+    /// Partial `COUNT(v) GROUP BY k` over 31 batches of 16 rows that cycle
+    /// through 64 keys, flushing at batch size 16 with the given cache budget.
+    /// Returns the emitted state rows, the flush count and the total count.
+    async fn run_partial_flush_batch(budget: usize) -> Result<(usize, usize, i64)> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let batches = (0..31)
+            .map(|batch| {
+                let keys = (0..16).map(|row| (batch * 16 + row) % 64).collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(keys)),
+                        Arc::new(Int32Array::from(vec![1; 16])),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut config = SessionConfig::new().with_batch_size(16);
+        let execution = &mut config.options_mut().execution;
+        execution.partial_aggregation_flush_batch = true;
+        execution.partial_aggregation_flush_batch_bytes = budget;
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+
+        let exec = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".to_string())]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("c")
+                    .build()?,
+            )],
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+        let mut stream =
+            PartialHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?.into_stream();
+        let (mut rows, mut total) = (0, 0);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            rows += batch.num_rows();
+            total += batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().iter().flatten().sum::<i64>();
+        }
+        let flushes = aggregate_exec
+            .metrics()
+            .unwrap()
+            .sum_by_name("table_flush_count")
+            .map_or(0, |value| value.as_usize());
+        Ok((rows, flushes, total))
+    }
+
+    #[tokio::test]
+    async fn test_partial_flush_batch_grows_within_budget() -> Result<()> {
+        // A budget below twice the first table keeps every table at batch
+        // size: each batch brings 16 new keys, so every batch flushes.
+        let (rows, flushes, total) = run_partial_flush_batch(1).await?;
+        assert_eq!((rows, flushes, total), (31 * 16, 31, 31 * 16));
+
+        // A large budget doubles the threshold after each flush: tables of
+        // 16, 32 and 64 groups flush after 1, 2 and 4 batches; the next
+        // threshold, 128, is above the 64 keys there are, so the last table
+        // holds each key once for the remaining 24 batches.
+        let (rows, flushes, total) = run_partial_flush_batch(1 << 30).await?;
+        assert_eq!((rows, flushes, total), (16 + 32 + 64 + 64, 3, 31 * 16));
+        Ok(())
+    }
+
     /// Runs the final hash aggregation of `SELECT group_col, COUNT(value_col)
     /// .. GROUP BY group_col` over partial state that holds every group
     /// `num_partitions` times with a count of 1, as if that many partial
