@@ -37,7 +37,8 @@ pub(super) const MAX_BUCKET_LEVELS: u32 = 4;
 /// whose hash is the same for every row of one final partition modulo the
 /// partition count, and the aggregation seed, so that the rows of one bucket
 /// still spread evenly over the bucket's own hash table.
-const BUCKET_HASH_SEED: RandomState = RandomState::with_seed(5364907223173859721);
+pub(super) const BUCKET_HASH_SEED: RandomState =
+    RandomState::with_seed(5364907223173859721);
 
 /// A bucket is compacted for the first time once it holds this many batches
 /// worth of rows. With 64 buckets per partition this floor is what the

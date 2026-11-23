@@ -12,6 +12,7 @@ use datafusion_expr::{EmitTo, GroupSelection};
 
 pub mod multi_group_by;
 
+mod packed;
 mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
@@ -155,6 +156,9 @@ pub trait GroupValues: Send {
 ///     the specific [`GroupValues`] implementation, such implementation
 ///     will be chosen.
 ///
+///   - If group by several fixed-width columns whose values and null bits fit
+///     in 128 bits, `GroupValuesPacked` packs them into one key per row.
+///
 ///   - If group by multiple columns, and all column types have the specific
 ///     `GroupColumn` implementations, `GroupValuesColumn` will be chosen.
 ///
@@ -206,6 +210,10 @@ pub fn new_group_values(
             }
             _ => {}
         }
+    }
+
+    if let Some(packed) = packed::try_new_packed(&schema) {
+        return Ok(packed);
     }
 
     if multi_group_by::supported_schema(schema.as_ref()) {
