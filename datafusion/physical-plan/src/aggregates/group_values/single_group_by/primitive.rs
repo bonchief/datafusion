@@ -87,13 +87,16 @@ hash_float!(f16, f32, f64);
 pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The data type of the output array
     data_type: DataType,
-    /// Stores the `(group_index, hash)` based on the hash of its value
+    /// Stores `(group_index, value)` under the hash of the value.
     ///
-    /// We also store `hash` is for reducing cost of rehashing. Such cost
-    /// is obvious in high cardinality group by situation.
-    /// More details can see:
-    /// <https://github.com/apache/datafusion/issues/15961>
-    map: HashTable<(usize, u64)>,
+    /// The value is kept in the entry so a probe compares against the
+    /// bucket it already loaded and never reads `values`: one cache miss
+    /// per row less than looking the group's value up by index. Rehashing
+    /// recomputes hashes from the stored values, which for primitives is
+    /// cheaper than the wider entry a stored hash would need (see
+    /// <https://github.com/apache/datafusion/issues/15961> for why the hash
+    /// used to be stored).
+    map: HashTable<(usize, T::Native)>,
     /// The group index of the null value if any
     null_group: Option<usize>,
     /// The values for each group index
@@ -139,17 +142,15 @@ where
                     let hash = key.hash(state);
                     let insert = self.map.entry(
                         hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
-                        },
-                        |&(_, h)| h,
+                        |&(_, k)| k.is_eq(key),
+                        |&(_, k)| k.hash(state),
                     );
 
                     match insert {
                         hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
                         hashbrown::hash_table::Entry::Vacant(v) => {
                             let g = self.values.len();
-                            v.insert((g, hash));
+                            v.insert((g, key));
                             self.values.push(key);
                             g
                         }
@@ -163,7 +164,9 @@ where
 
     fn reserve_groups(&mut self, capacity: usize) {
         self.map
-            .reserve(capacity.saturating_sub(self.map.len()), |entry| entry.1);
+            .reserve(capacity.saturating_sub(self.map.len()), |&(_, k)| {
+                k.hash(&self.random_state)
+            });
         self.values
             .reserve_exact(capacity.saturating_sub(self.values.len()));
     }
@@ -260,7 +263,8 @@ where
     }
 
     fn shrink_to_fit(&mut self) {
-        self.map.shrink_to_fit(|&(_, hash)| hash);
+        let state = &self.random_state;
+        self.map.shrink_to_fit(|&(_, k)| k.hash(state));
         self.values.shrink_to_fit();
     }
 
@@ -352,7 +356,7 @@ mod tests {
 
         // Hashbrown's layout contains entry slots, control bytes, and trailing group bytes.
         // It must strictly exceed the naive entry-only size
-        let entry_only_bytes = group_values.map.capacity() * size_of::<(usize, u64)>();
+        let entry_only_bytes = group_values.map.capacity() * size_of::<(usize, i32)>();
         assert!(table_bytes > entry_only_bytes);
 
         assert_eq!(
