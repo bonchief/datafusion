@@ -225,8 +225,10 @@ impl<E: Copy> Table<E> {
         self.items += 1;
     }
 
-    /// The first empty bucket of `hash`'s probe. The table has room.
-    fn vacant(&self, hash: u64) -> usize {
+    /// The first empty bucket of `hash`'s probe, for [`Self::room`]: where
+    /// an entry goes without looking for an equal one first, as for a hash
+    /// that may already be in the table under another key.
+    pub fn vacant(&self, hash: u64) -> usize {
         let mut pos = hash as usize & self.mask;
         loop {
             let empty = self.group(pos) & HIGH_BITS;

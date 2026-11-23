@@ -115,8 +115,10 @@ impl GroupMap {
         }
     }
 
-    /// Inserts `slot`, which is not in the table, adding to `accounting` the
-    /// bytes hashbrown's table grows by, as `insert_accounted` does.
+    /// Inserts `slot`, adding to `accounting` the bytes hashbrown's table
+    /// grows by, as `insert_accounted` does. Its hash may already be in the
+    /// table: `scalarized_intern` inserts a second entry for a different key
+    /// with the same 64-bit hash, which hashbrown accepts, and so does this.
     pub(super) fn insert_accounted(
         &mut self,
         slot: Slot,
@@ -127,10 +129,7 @@ impl GroupMap {
             Self::Hash(map) => map.insert_accounted(slot, hasher, accounting),
             Self::Staged(table) => {
                 let hash = hasher(&slot);
-                let Err(vacant) = table.find(hash, |entry| entry.0 == hash) else {
-                    unreachable!("an inserted hash is not in the table")
-                };
-                let bucket = table.room(hash, vacant, hash_of);
+                let bucket = table.room(hash, table.vacant(hash), hash_of);
                 table.put(bucket, hash, slot);
             }
         }
@@ -204,5 +203,61 @@ impl GroupMap {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A map of hashbrown's table that has just outgrown the gate.
+    fn past_the_gate() -> GroupMap {
+        let mut map = HashTable::with_capacity(l2_cache_bytes() / size_of::<Slot>());
+        for group in 0..1000u64 {
+            let slot = (
+                group.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                GroupIndexView(group),
+            );
+            map.insert_unique(slot.0, slot, hash_of);
+        }
+        assert!(map.allocation_size() > l2_cache_bytes());
+        GroupMap::Hash(map)
+    }
+
+    /// The prefetchable table a map moves to has hashbrown's bucket count:
+    /// its size grows by no more than the table's own header.
+    #[test]
+    fn moving_at_the_gate_keeps_the_bucket_count() {
+        let mut map = past_the_gate();
+        let GroupMap::Hash(hash) = &map else {
+            unreachable!()
+        };
+        let (before, capacity) = (hash.allocation_size(), hash.capacity());
+        assert!(map.stage());
+        assert_eq!(map.capacity(), capacity);
+        let after = map.staged_size().unwrap();
+        assert!(
+            after <= before + size_of::<Table<Slot>>(),
+            "{before} -> {after}"
+        );
+        assert_eq!(map.len(), 1000);
+    }
+
+    /// `scalarized_intern` inserts a second entry under a hash already in the
+    /// table when two different keys collide; the prefetchable table keeps
+    /// both, as hashbrown's does.
+    #[test]
+    fn staged_insert_keeps_entries_with_equal_hashes() {
+        let mut map = past_the_gate();
+        assert!(map.stage());
+        let mut accounting = 0;
+        for group in [2000, 2001, 2002] {
+            map.insert_accounted((7, GroupIndexView(group)), hash_of, &mut accounting);
+        }
+        for group in [2000, 2001, 2002] {
+            let found = map.find(7, |slot| slot.1.0 == group).map(|slot| slot.1.0);
+            assert_eq!(found, Some(group));
+        }
+        assert_eq!(map.len(), 1003);
     }
 }
