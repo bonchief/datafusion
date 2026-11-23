@@ -13,8 +13,8 @@ use arrow::array::{
 };
 use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
+use crate::group_hash::table_hashes;
 use datafusion_common::hash_utils::RandomState;
-use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::{Result, exec_err};
 use std::any::type_name;
@@ -387,6 +387,43 @@ where
         MP: FnMut(Option<&[u8]>) -> V,
         OP: FnMut(V),
     {
+        self.insert_with(values, None, make_payload_fn, observe_payload_fn)
+    }
+
+    /// [`Self::insert_if_new`] for values whose hashes were computed before:
+    /// `carried[i]` is the [`GroupHash`](crate::group_hash::GroupHash) of
+    /// `values[i]`, and the map probes its table with its
+    /// [`GroupHash::table`](crate::group_hash::GroupHash::table) hash instead
+    /// of hashing the values itself.
+    ///
+    /// A map holds the hashes of one kind only, so a map that is filled by
+    /// this method must never be filled by [`Self::insert_if_new`].
+    pub fn insert_if_new_hashed<MP, OP>(
+        &mut self,
+        values: &ArrayRef,
+        carried: &[u64],
+        make_payload_fn: MP,
+        observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+    {
+        assert_eq!(values.len(), carried.len());
+        self.insert_with(values, Some(carried), make_payload_fn, observe_payload_fn)
+    }
+
+    /// [`Self::insert_if_new`], or [`Self::insert_if_new_hashed`] when
+    /// `carried` is given.
+    fn insert_with<MP, OP>(
+        &mut self,
+        values: &ArrayRef,
+        carried: Option<&[u64]>,
+        make_payload_fn: MP,
+        observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+    {
         // Sanity array type
         match self.output_type {
             OutputType::Binary => {
@@ -396,6 +433,7 @@ where
                 ));
                 self.insert_if_new_inner::<MP, OP, GenericBinaryType<O>>(
                     values,
+                    carried,
                     make_payload_fn,
                     observe_payload_fn,
                 )
@@ -407,6 +445,7 @@ where
                 ));
                 self.insert_if_new_inner::<MP, OP, GenericStringType<O>>(
                     values,
+                    carried,
                     make_payload_fn,
                     observe_payload_fn,
                 )
@@ -426,6 +465,7 @@ where
     fn insert_if_new_inner<MP, OP, B>(
         &mut self,
         values: &ArrayRef,
+        carried: Option<&[u64]>,
         mut make_payload_fn: MP,
         mut observe_payload_fn: OP,
     ) where
@@ -433,14 +473,9 @@ where
         OP: FnMut(V),
         B: ByteArrayType,
     {
-        // step 1: compute hashes
+        // step 1: compute hashes, or take the carried ones
         let batch_hashes = &mut self.hashes_buffer;
-        batch_hashes.clear();
-        batch_hashes.resize(values.len(), 0);
-        create_hashes([values], &self.random_state, batch_hashes)
-            // hash is supported for all types and create_hashes only
-            // returns errors for unsupported types
-            .unwrap();
+        table_hashes(values, carried, &self.random_state, batch_hashes);
 
         // step 2: insert each value into the set, if not already present
         let values = values.as_bytes::<B>();
@@ -750,6 +785,7 @@ where
 mod tests {
     use super::*;
     use arrow::array::{BinaryArray, LargeBinaryArray, StringArray};
+    use datafusion_common::hash_utils::create_hashes;
     use std::collections::HashMap;
 
     /// A lower bound on the bytes a hashbrown table holding `entries` entries
@@ -1469,5 +1505,47 @@ mod tests {
         assert!(homes(&routing) <= buckets / 32);
         let spread = homes(&AGGREGATION_HASH_SEED);
         assert!(spread * 10 >= keys.len() * 7, "{spread} of {}", keys.len());
+    }
+
+    /// A map filled with carried hashes gives every row the payload a map
+    /// that hashes the values itself gives it, and probes with the table
+    /// hash of each carried hash.
+    #[test]
+    fn carried_hashes_intern_like_own_hashes() {
+        use crate::group_hash::GroupHash;
+
+        let values: ArrayRef = Arc::new(StringArray::from_iter((0..5_000).map(|row| {
+            (row % 7 != 3).then(|| format!("a value past any inline length {}", row % 1_700))
+        })));
+        let mut carried = vec![0; values.len()];
+        create_hashes([&values], &GroupHash::STATE, &mut carried).unwrap();
+        let intern = |map: &mut ArrowBytesMap<i32, usize>, carried: Option<&[u64]>| {
+            let mut next = 0;
+            let mut payloads = vec![];
+            let make = |_: Option<&[u8]>| {
+                next += 1;
+                next - 1
+            };
+            let observe = |payload| payloads.push(payload);
+            match carried {
+                Some(carried) => map.insert_if_new_hashed(&values, carried, make, observe),
+                None => map.insert_if_new(&values, make, observe),
+            }
+            payloads
+        };
+
+        let mut own = ArrowBytesMap::<i32, usize>::new(OutputType::Utf8);
+        let mut hashed = ArrowBytesMap::<i32, usize>::new(OutputType::Utf8);
+        let expected = intern(&mut own, None);
+        assert_eq!(intern(&mut hashed, Some(&carried)), expected);
+        // The second time every value is found
+        assert_eq!(intern(&mut hashed, Some(&carried)), expected);
+        assert_eq!(hashed.len(), own.len());
+        let probed = carried
+            .iter()
+            .map(|&hash| GroupHash::new(hash).table())
+            .collect::<Vec<_>>();
+        assert_eq!(hashed.hashes_buffer, probed);
+        assert_eq!(&hashed.into_state(), &own.into_state());
     }
 }

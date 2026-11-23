@@ -20,6 +20,7 @@
 pub mod binary_map;
 pub mod binary_view_map;
 pub mod datum;
+pub mod group_hash;
 pub mod metrics;
 pub mod physical_expr;
 pub mod prefetch;

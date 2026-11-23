@@ -5,6 +5,7 @@
 //! [`ArrowBytesViewMap`] and [`ArrowBytesViewSet`] for storing maps/sets of values from
 //! `StringViewArray`/`BinaryViewArray`.
 use crate::binary_map::{AGGREGATION_HASH_SEED, OutputType, single_null_buffer};
+use crate::group_hash::table_hashes;
 use crate::prefetch::{DISTANCE, l2_cache_bytes, prefetch};
 use arrow::array::cast::AsArray;
 use arrow::array::{
@@ -14,7 +15,6 @@ use arrow::array::{
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::RandomState;
-use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::{Result, exec_err};
 use hashbrown::hash_table::HashTable;
@@ -339,13 +339,57 @@ where
         self.insert(values, None, make_payload_fn, observe_payload_fn)
     }
 
-    /// [`Self::insert_if_new`]. `staged` forces the table the batch is probed
-    /// with: `Some(true)` moves it to the prefetched table and probes in
-    /// stages, `Some(false)` probes one row at a time in whichever table it
-    /// is in, and `None` decides as the type docs say.
+    /// [`Self::insert_if_new`] for values whose hashes were computed before:
+    /// `carried[i]` is the [`GroupHash`](crate::group_hash::GroupHash) of
+    /// `values[i]`, and the map probes its table with its
+    /// [`GroupHash::table`](crate::group_hash::GroupHash::table) hash instead
+    /// of hashing the values itself.
+    ///
+    /// A map holds the hashes of one kind only, so a map that is filled by
+    /// this method must never be filled by [`Self::insert_if_new`].
+    pub fn insert_if_new_hashed<MP, OP>(
+        &mut self,
+        values: &ArrayRef,
+        carried: &[u64],
+        make_payload_fn: MP,
+        observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+    {
+        assert_eq!(values.len(), carried.len());
+        self.insert_with(
+            values,
+            Some(carried),
+            None,
+            make_payload_fn,
+            observe_payload_fn,
+        )
+    }
+
+    /// [`Self::insert_with`] with the map's own hashes.
     fn insert<MP, OP>(
         &mut self,
         values: &ArrayRef,
+        staged: Option<bool>,
+        make_payload_fn: MP,
+        observe_payload_fn: OP,
+    ) where
+        MP: FnMut(Option<&[u8]>) -> V,
+        OP: FnMut(V),
+    {
+        self.insert_with(values, None, staged, make_payload_fn, observe_payload_fn)
+    }
+
+    /// [`Self::insert_if_new`], or [`Self::insert_if_new_hashed`] when
+    /// `carried` is given. `staged` forces the table the batch is probed
+    /// with: `Some(true)` moves it to the prefetched table and probes in
+    /// stages, `Some(false)` probes one row at a time in whichever table it
+    /// is in, and `None` decides as the type docs say.
+    fn insert_with<MP, OP>(
+        &mut self,
+        values: &ArrayRef,
+        carried: Option<&[u64]>,
         staged: Option<bool>,
         make_payload_fn: MP,
         observe_payload_fn: OP,
@@ -359,6 +403,7 @@ where
                 assert!(matches!(values.data_type(), DataType::BinaryView));
                 self.insert_if_new_inner::<MP, OP, BinaryViewType>(
                     values,
+                    carried,
                     staged,
                     make_payload_fn,
                     observe_payload_fn,
@@ -368,6 +413,7 @@ where
                 assert!(matches!(values.data_type(), DataType::Utf8View));
                 self.insert_if_new_inner::<MP, OP, StringViewType>(
                     values,
+                    carried,
                     staged,
                     make_payload_fn,
                     observe_payload_fn,
@@ -388,6 +434,7 @@ where
     fn insert_if_new_inner<MP, OP, B>(
         &mut self,
         values: &ArrayRef,
+        carried: Option<&[u64]>,
         staged: Option<bool>,
         mut make_payload_fn: MP,
         mut observe_payload_fn: OP,
@@ -403,20 +450,20 @@ where
         if moves {
             return self.insert_prefetched::<MP, OP, B>(
                 values,
+                carried,
                 staged,
                 make_payload_fn,
                 observe_payload_fn,
             );
         }
 
-        // step 1: compute hashes
-        let batch_hashes = &mut self.hashes_buffer;
-        batch_hashes.clear();
-        batch_hashes.resize(values.len(), 0);
-        create_hashes([values], &self.random_state, batch_hashes)
-            // hash is supported for all types and create_hashes only
-            // returns errors for unsupported types
-            .unwrap();
+        // step 1: compute hashes, or take the carried ones
+        table_hashes(
+            values,
+            carried,
+            &self.random_state,
+            &mut self.hashes_buffer,
+        );
 
         // step 2: insert each value into the set, if not already present
         let values = values.as_byte_view::<B>();
@@ -537,6 +584,7 @@ where
     fn insert_prefetched<MP, OP, B>(
         &mut self,
         values: &ArrayRef,
+        carried: Option<&[u64]>,
         staged: Option<bool>,
         mut make_payload_fn: MP,
         mut observe_payload_fn: OP,
@@ -551,12 +599,7 @@ where
         };
 
         let mut hashes = mem::take(&mut self.hashes_buffer);
-        hashes.clear();
-        hashes.resize(values.len(), 0);
-        create_hashes([values], &self.random_state, &mut hashes)
-            // hash is supported for all types and create_hashes only
-            // returns errors for unsupported types
-            .unwrap();
+        table_hashes(values, carried, &self.random_state, &mut hashes);
         let values = values.as_byte_view::<B>();
         assert_eq!(values.len(), hashes.len());
         let views = values.views();
@@ -1961,5 +2004,69 @@ mod tests {
                 assert_eq!(group & (0x80 << (8 * at)) != 0, *byte == EMPTY);
             }
         }
+    }
+
+    /// A map filled with carried hashes gives every row the payload a map
+    /// that hashes the values itself gives it, in hashbrown's table and in
+    /// the prefetched one, and probes with the table hash of each carried
+    /// hash.
+    #[test]
+    fn carried_hashes_intern_like_own_hashes() {
+        use crate::group_hash::GroupHash;
+        use datafusion_common::hash_utils::create_hashes;
+
+        let values = mixed_keys(5_000, 11);
+        let mut carried = vec![0; values.len()];
+        create_hashes([&values], &GroupHash::STATE, &mut carried).unwrap();
+        let intern = |map: &mut ArrowBytesViewMap<usize>,
+                      carried: Option<&[u64]>,
+                      staged: Option<bool>| {
+            let mut next = 0;
+            let mut payloads = vec![];
+            map.insert_with(
+                &values,
+                carried,
+                staged,
+                |_| {
+                    next += 1;
+                    next - 1
+                },
+                |payload| payloads.push(payload),
+            );
+            payloads
+        };
+
+        for staged in [Some(false), Some(true)] {
+            let mut own = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+            let mut hashed = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+            let expected = intern(&mut own, None, staged);
+            assert_eq!(intern(&mut hashed, Some(&carried), staged), expected);
+            // The second time every value is found
+            assert_eq!(intern(&mut hashed, Some(&carried), staged), expected);
+            assert_eq!(hashed.len(), own.len());
+            assert_eq!(hashed.table.is_some(), staged == Some(true));
+            let probed = carried
+                .iter()
+                .map(|&hash| GroupHash::new(hash).table())
+                .collect::<Vec<_>>();
+            assert_eq!(hashed.hashes_buffer, probed);
+            assert_eq!(&hashed.into_state(), &own.into_state());
+        }
+
+        // The public entry point takes the same path
+        let mut hashed = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+        let mut groups = vec![];
+        let mut next = 0;
+        hashed.insert_if_new_hashed(
+            &values,
+            &carried,
+            |_| {
+                next += 1;
+                next - 1
+            },
+            |payload| groups.push(payload),
+        );
+        let mut own = ArrowBytesViewMap::<usize>::new(OutputType::Utf8View);
+        assert_eq!(groups, intern(&mut own, None, None));
     }
 }
