@@ -9,267 +9,251 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, PrimitiveArray};
-use arrow::compute::{BatchCoalescer, take_arrays};
-use arrow::datatypes::{SchemaRef, UInt32Type};
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion_common::Result;
-use datafusion_common::hash_utils::{RandomState, create_hashes};
+use arrow::array::{Array, ArrayRef, AsArray, GenericByteViewArray};
+use arrow::compute::{BatchCoalescer, interleave_record_batch};
+use arrow::datatypes::{ByteViewType, DataType, SchemaRef, UInt64Type};
+use arrow::record_batch::RecordBatch;
+use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::{Result, internal_err};
 use datafusion_execution::async_try_stream;
+use datafusion_physical_expr_common::group_hash::GroupHash;
 use futures::StreamExt;
 
+use super::aggregate_hash_table::carries_group_hash;
 use crate::SendableRecordBatchStream;
 use crate::metrics;
+use crate::spill::gc_view_arrays;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
 
-/// Number of bits of the routing hash consumed by one bucketing level.
-const BUCKET_BITS: u32 = 6;
+/// Fewest and most hash bits the first split of a table reads: 16 to 1,024
+/// buckets.
+pub(super) const MIN_FANOUT_BITS: u32 = 4;
+pub(super) const MAX_FANOUT_BITS: u32 = 10;
 
-/// Number of buckets rows are split into at each level.
-const NUM_BUCKETS: usize = 1 << BUCKET_BITS;
-
-/// A bucket that is still too large is split again with the next hash bits,
-/// up to this many levels.
-pub(super) const MAX_BUCKET_LEVELS: u32 = 4;
-
-/// Seed of the routing hash. It differs from both the `RepartitionExec` seed,
-/// whose hash is the same for every row of one final partition modulo the
-/// partition count, and the aggregation seed, so that the rows of one bucket
-/// still spread evenly over the bucket's own hash table.
-const BUCKET_HASH_SEED: RandomState = RandomState::with_seed(5364907223173859721);
-
-/// A bucket is compacted for the first time once it holds this many batches
-/// worth of rows. With 64 buckets per partition this floor is what the
-/// buckets hold when every bucket has few groups, so it is kept small.
-const MIN_COMPACTION_BATCHES: usize = 1;
+/// Hash bits a bucket that is split again reads, when that many are left.
+const SPLIT_BITS: u32 = 6;
 
 /// A compaction that kept more than this share of its rows found (almost) no
-/// repeated groups.
+/// repeated groups: the bucket is spilled the next time instead.
 const POOR_COMPACTION: f64 = 0.8;
-
-/// After a compaction that paid off, the bucket is compacted again once it
-/// has received at most this many times its own rows. Measured on unreduced
-/// input with 5 to 8 rows per group: 2 holds peak memory at about 1.35x of a
-/// single table, 16 lets it reach 2.3x.
-const MAX_COMPACTION_FACTOR: f64 = 2.0;
-
-/// After a poor compaction the bucket waits for this many times its own rows.
-/// Aggregating rows that are already unique again and again is pure rework
-/// (1.1x -> 1.5x run time on a wide string key with a factor of 2). But a
-/// small sample of a bucket with many groups looks unique even when every
-/// group repeats, so the wait must stay short enough to find that out before
-/// the whole input is buffered (16 let peak memory reach 1.8x of a single
-/// table on input with 5 rows per group).
-const POOR_COMPACTION_FACTOR: f64 = 4.0;
 
 /// Time and rows of [`FinalBuckets::route`], shared by the buckets of every
 /// level of one aggregation partition.
 #[derive(Debug, Clone, Default)]
 pub(super) struct RouteMetrics {
-    /// Hashing the group keys and sorting the row indices by bucket
+    /// Reading or computing the rows' hashes and recording each row's bucket
     pub(super) hash_time: metrics::Time,
-    /// Gathering the rows by bucket and appending them to their buckets
+    /// Gathering the rows of a bucket into batches of its own, which happens
+    /// when the bucket is aggregated, or earlier under memory pressure
     pub(super) move_time: metrics::Time,
     /// Rows routed into buckets, counted again at every level
     pub(super) rows: metrics::Count,
 }
 
-/// One hash bucket: its completed batches, held in memory or appended to a
-/// spill file, plus the rows not yet forming a full batch.
+/// One hash bucket.
+#[derive(Default)]
 struct Bucket {
-    coalescer: BatchCoalescer,
+    /// Rows routed here and not gathered yet: `batch << 32 | row`, where
+    /// `batch` indexes [`FinalBuckets::routed`].
+    pending: Vec<u64>,
+    /// Gathered rows, or the state a compaction left of them
     batches: VecDeque<RecordBatch>,
     /// Memory held by `batches`
     batches_bytes: usize,
-    /// Set once the bucket has been spilled: completed batches go here
-    spill_file: Option<InProgressSpillFile>,
-    /// Rows routed to the bucket that are still held in memory
+    /// Rows in `batches`
     rows: usize,
-    /// The bucket is due for compaction once it holds this many rows
-    compact_at: usize,
+    /// Set once the bucket has been spilled: gathered rows go here
+    spill_file: Option<InProgressSpillFile>,
+    /// Rows the last compaction left, if any
+    compacted_rows: Option<usize>,
+    /// The last compaction kept more than [`POOR_COMPACTION`] of its rows
+    poor: bool,
 }
 
-/// Rows of partial aggregate state, split by a hash of their group keys.
+/// Rows of partial aggregate state, split by the bits of their
+/// [`GroupHash`].
 ///
 /// Once the table of a final hash aggregation has outgrown the CPU caches,
 /// every probe and every accumulator update of a further row is a cache
 /// miss. The stream then stops growing that table: it moves the table's
 /// state in here, routes the rest of its input here without aggregating it,
 /// and finally aggregates the buckets one after another, each with a table
-/// that is `NUM_BUCKETS` times smaller. Buckets are independent, so they can
-/// be spilled, read back and released one at a time.
+/// a fraction of the size. Buckets are independent, so they can be spilled,
+/// read back and released one at a time.
 ///
-/// # Compaction
+/// # Routing
 ///
-/// The input may hold the same group many times (for example when the partial
-/// aggregation was skipped), so buffering it as is could take far more memory
-/// than the single table it replaces. A bucket that has grown enough is
-/// therefore *compacted*: the stream aggregates its rows with a small table
-/// and puts the resulting state, one row per group, back in their place. The
-/// next compaction waits for as many new rows as made the last one pay off,
-/// so the buffered rows stay within a small multiple of the groups they hold,
-/// and waits much longer after a compaction that found nothing to merge, so
-/// input that does not reduce is not aggregated over and over.
+/// A row's bucket is read from bits of its [`GroupHash`] (see its bit layout),
+/// which the row carries in its last column when the partial aggregation
+/// computed it (see `AggregateExec::with_group_hash`), and which is
+/// computed here otherwise. Routing records the bucket of every row and keeps
+/// the batch as it came: a bucket's rows are gathered into batches of its own
+/// only when the bucket is aggregated, by one `interleave` that copies the
+/// 16-byte view of a string and not its bytes.
+///
+/// # Memory pressure
+///
+/// Routed batches are charged at the bytes their rows reference. Under memory
+/// pressure every bucket gathers its rows into batches that own their bytes,
+/// releasing the routed batches. Then the largest bucket is compacted (its
+/// rows are aggregated with a small table and replaced by the state, one row
+/// per group) unless its last compaction found nothing to merge or it has
+/// not doubled since, in which case it is spilled. Nothing is compacted
+/// while memory suffices, so input that does not repeat its groups is
+/// aggregated once.
 pub(super) struct FinalBuckets {
-    /// Bucketing level, selects which bits of the routing hash are used
-    level: u32,
+    /// First bucket bit this split reads, and how many: see [`GroupHash::bucket`]
+    offset: u32,
+    bits: u32,
     /// Number of leading columns of a batch that are the group keys
     num_group_columns: usize,
+    /// The rows carry their [`GroupHash`] in their last column
+    carried: bool,
+    /// Batches routed since rows were last gathered
+    routed: Vec<RecordBatch>,
+    /// Memory charged for `routed`
+    routed_bytes: usize,
     buckets: Vec<Bucket>,
     /// `None` if spilling is not supported by the configured `DiskManager`
     spill_manager: Option<SpillManager>,
     batch_size: usize,
-    min_compaction_rows: usize,
     metrics: RouteMetrics,
-    /// Reused buffers
+    /// Reused for hashes computed here
     hashes: Vec<u64>,
-    bucket_sizes: Vec<u32>,
-    reordered_indices: Vec<u32>,
 }
 
 impl FinalBuckets {
+    /// Buckets of rows of `schema` that read `bits` bucket bits from `offset`.
     pub(super) fn new(
         schema: &SchemaRef,
         num_group_columns: usize,
         batch_size: usize,
-        level: u32,
+        offset: u32,
+        bits: u32,
         spill_manager: Option<SpillManager>,
         metrics: RouteMetrics,
     ) -> Self {
-        debug_assert!(level < MAX_BUCKET_LEVELS);
-        let min_compaction_rows = MIN_COMPACTION_BATCHES * batch_size;
-        let buckets = (0..NUM_BUCKETS)
-            .map(|_| Bucket {
-                coalescer: BatchCoalescer::new(Arc::clone(schema), batch_size),
-                batches: VecDeque::new(),
-                batches_bytes: 0,
-                spill_file: None,
-                rows: 0,
-                compact_at: min_compaction_rows,
-            })
-            .collect();
+        debug_assert!(bits > 0 && offset + bits <= GroupHash::BUCKET_BITS);
         Self {
-            level,
+            offset,
+            bits,
             num_group_columns,
-            buckets,
+            carried: carries_group_hash(schema),
+            routed: vec![],
+            routed_bytes: 0,
+            buckets: (0..1 << bits).map(|_| Bucket::default()).collect(),
             spill_manager,
             batch_size,
-            min_compaction_rows,
             metrics,
             hashes: vec![],
-            bucket_sizes: vec![0; NUM_BUCKETS],
-            reordered_indices: vec![],
         }
     }
 
-    pub(super) fn level(&self) -> u32 {
-        self.level
+    /// The bit offset and width of a split of one of these buckets, if
+    /// enough hash bits are left for one.
+    pub(super) fn next_split(&self) -> Option<(u32, u32)> {
+        let offset = self.offset + self.bits;
+        let bits = SPLIT_BITS.min(GroupHash::BUCKET_BITS - offset);
+        (bits >= 2).then_some((offset, bits))
     }
 
-    /// Tells the buckets what share of its input rows the table they are
-    /// split from kept as groups. If that table found (almost) no repeated
-    /// groups, the first compaction of a bucket would most likely find none
-    /// either, so it waits as long as after a poor compaction.
-    pub(super) fn expect_kept(&mut self, kept: f64) {
-        if kept > POOR_COMPACTION {
-            let compact_at =
-                (self.min_compaction_rows as f64 * POOR_COMPACTION_FACTOR) as usize;
-            for bucket in &mut self.buckets {
-                bucket.compact_at = compact_at;
-            }
-        }
-    }
-
-    /// Appends every row of `batch` to the bucket of its group key.
-    pub(super) fn route(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// Records the bucket of every row of `batch` and keeps the batch.
+    pub(super) fn route(&mut self, batch: RecordBatch) -> Result<()> {
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             return Ok(());
         }
+        let Ok(index) = u32::try_from(self.routed.len()) else {
+            return internal_err!("Too many batches routed into hash buckets");
+        };
         self.metrics.rows.add(num_rows);
         let hash_timer = self.metrics.hash_time.timer();
 
-        let group_columns: &[ArrayRef] = &batch.columns()[..self.num_group_columns];
-        self.hashes.clear();
-        self.hashes.resize(num_rows, 0);
-        create_hashes(group_columns, &BUCKET_HASH_SEED, &mut self.hashes)?;
-
-        // Counting sort of the row indices by bucket
-        let shift = self.level * BUCKET_BITS;
-        let bucket_of = |hash: u64| ((hash >> shift) as usize) & (NUM_BUCKETS - 1);
-        self.bucket_sizes.fill(0);
-        for &hash in &self.hashes {
-            self.bucket_sizes[bucket_of(hash)] += 1;
-        }
-        let mut starts = [0u32; NUM_BUCKETS];
-        let mut next = 0;
-        for (start, size) in starts.iter_mut().zip(&self.bucket_sizes) {
-            *start = next;
-            next += size;
-        }
-        self.reordered_indices.clear();
-        self.reordered_indices.resize(num_rows, 0);
-        let mut cursors = starts;
-        for (row, &hash) in self.hashes.iter().enumerate() {
-            let cursor = &mut cursors[bucket_of(hash)];
-            self.reordered_indices[*cursor as usize] = row as u32;
-            *cursor += 1;
+        let hashes: &[u64] = if self.carried {
+            match batch
+                .columns()
+                .last()
+                .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+            {
+                Some(hashes) => hashes.values(),
+                None => return internal_err!("Bucketed rows have no group hash column"),
+            }
+        } else {
+            self.hashes.clear();
+            self.hashes.resize(num_rows, 0);
+            let keys: &[ArrayRef] = &batch.columns()[..self.num_group_columns];
+            create_hashes(keys, &GroupHash::STATE, &mut self.hashes)?;
+            &self.hashes
+        };
+        let index = u64::from(index) << 32;
+        for (row, &hash) in hashes.iter().enumerate() {
+            let bucket = GroupHash::new(hash).bucket(self.offset, self.bits);
+            self.buckets[bucket].pending.push(index | row as u64);
         }
         hash_timer.done();
-        let _move_timer = self.metrics.move_time.timer();
 
-        // One gather for the whole batch, then a slice per bucket. The
-        // coalescer copies the slice, so a bucket owns its batches.
-        let indices: PrimitiveArray<UInt32Type> =
-            std::mem::take(&mut self.reordered_indices).into();
-        let columns = take_arrays(batch.columns(), &indices, None)?;
-        let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
-        let reordered =
-            RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
-
-        for (bucket, (&start, &size)) in self
-            .buckets
-            .iter_mut()
-            .zip(starts.iter().zip(&self.bucket_sizes))
-        {
-            if size == 0 {
-                continue;
-            }
-            let slice = reordered.slice(start as usize, size as usize);
-            match &mut bucket.spill_file {
-                // A spilled bucket holds no memory: its rows go straight to
-                // the file and are combined into batches when read back.
-                Some(spill_file) => {
-                    spill_file.append_batch(&slice)?;
-                }
-                None => {
-                    bucket.coalescer.push_batch(slice)?;
-                    bucket.rows += size as usize;
-                    bucket.collect_completed()?;
-                }
-            }
-        }
+        self.routed_bytes += referenced_bytes(&batch);
+        self.routed.push(batch);
         Ok(())
     }
 
-    /// Returns a bucket that is due for compaction, if any.
-    pub(super) fn bucket_to_compact(&self) -> Option<usize> {
-        self.buckets.iter().position(|bucket| {
-            bucket.spill_file.is_none() && bucket.rows >= bucket.compact_at
-        })
+    /// True if rows were routed since they were last gathered.
+    pub(super) fn has_routed(&self) -> bool {
+        !self.routed.is_empty()
     }
 
-    /// Removes and returns the rows of an in-memory bucket, to be followed by
-    /// [`Self::put_compacted`].
-    pub(super) fn take_bucket(&mut self, index: usize) -> Result<Vec<RecordBatch>> {
+    /// Gathers the routed rows of every bucket into batches that own their
+    /// bytes, or into the bucket's spill file, and releases the routed
+    /// batches.
+    pub(super) fn gather(&mut self) -> Result<()> {
+        if self.routed.is_empty() {
+            return Ok(());
+        }
+        let _timer = self.metrics.move_time.timer();
+        let routed: Vec<&RecordBatch> = self.routed.iter().collect();
+        for bucket in &mut self.buckets {
+            let pending = std::mem::take(&mut bucket.pending);
+            for rows in pending.chunks(self.batch_size) {
+                let batch = gc_view_arrays(&interleave(&routed, rows)?)?;
+                bucket.push(batch)?;
+            }
+        }
+        self.routed.clear();
+        self.routed_bytes = 0;
+        Ok(())
+    }
+
+    /// The largest bucket held in memory, if any. Call [`Self::gather`] first.
+    pub(super) fn largest(&self) -> Option<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| bucket.spill_file.is_none() && bucket.rows > 0)
+            .max_by_key(|(_, bucket)| bucket.batches_bytes)
+            .map(|(index, _)| index)
+    }
+
+    /// True if compacting bucket `index` may pay: its last compaction, if
+    /// any, merged rows, and it has received at least as many rows since.
+    pub(super) fn should_compact(&self, index: usize) -> bool {
+        let bucket = &self.buckets[index];
+        !bucket.poor
+            && bucket.rows
+                >= self
+                    .batch_size
+                    .max(2 * bucket.compacted_rows.unwrap_or_default())
+    }
+
+    /// Removes and returns the gathered rows of an in-memory bucket, to be
+    /// followed by [`Self::put_compacted`].
+    pub(super) fn take_bucket(&mut self, index: usize) -> Vec<RecordBatch> {
         let bucket = &mut self.buckets[index];
-        debug_assert!(bucket.spill_file.is_none());
-        bucket.coalescer.finish_buffered_batch()?;
-        bucket.collect_completed()?;
+        debug_assert!(bucket.spill_file.is_none() && bucket.pending.is_empty());
         bucket.batches_bytes = 0;
-        Ok(bucket.batches.drain(..).collect())
+        bucket.rows = 0;
+        bucket.batches.drain(..).collect()
     }
 
     /// Puts back the aggregated state of the `input_rows` rows that
@@ -279,80 +263,85 @@ impl FinalBuckets {
         index: usize,
         state: Option<RecordBatch>,
         input_rows: usize,
-    ) {
+    ) -> Result<()> {
         let bucket = &mut self.buckets[index];
         let state_rows = state.as_ref().map_or(0, |state| state.num_rows());
         if let Some(state) = state {
-            bucket.batches_bytes += state.get_array_memory_size();
-            bucket.batches.push_back(state);
+            bucket.push(state)?;
         }
-        bucket.rows = state_rows;
+        bucket.compacted_rows = Some(state_rows);
+        bucket.poor = state_rows as f64 > POOR_COMPACTION * input_rows as f64;
+        Ok(())
+    }
 
-        // Compacting again costs about `state_rows + new_rows` and removes
-        // about `(1 - kept) * new_rows` rows, where `kept` is the share of rows
-        // that survived this time. Wait for enough new rows to pay for it.
-        let kept = state_rows as f64 / input_rows.max(1) as f64;
-        let factor = if kept > POOR_COMPACTION {
-            POOR_COMPACTION_FACTOR
-        } else {
-            (kept / (1.0 - kept)).clamp(1.0, MAX_COMPACTION_FACTOR)
+    /// Spills the gathered rows of bucket `index`, which from then on gathers
+    /// its rows into the spill file. Returns false if spilling is not
+    /// supported.
+    pub(super) fn spill(&mut self, index: usize) -> Result<bool> {
+        let Some(spill_manager) = &self.spill_manager else {
+            return Ok(false);
         };
-        let new_rows =
-            ((state_rows as f64 * factor) as usize).max(self.min_compaction_rows);
-        bucket.compact_at = state_rows + new_rows;
+        let bucket = &mut self.buckets[index];
+        let mut spill_file =
+            spill_manager.create_in_progress_file("FinalHashAggregateBucket")?;
+        for batch in bucket.batches.drain(..) {
+            spill_file.append_batch(&batch)?;
+        }
+        bucket.spill_file = Some(spill_file);
+        bucket.batches_bytes = 0;
+        bucket.rows = 0;
+        Ok(true)
     }
 
     /// Memory held by the buckets
     pub(super) fn memory_size(&self) -> usize {
-        self.buckets
-            .iter()
-            .map(|bucket| bucket.batches_bytes + bucket.coalescer.size())
-            .sum::<usize>()
+        self.routed_bytes
+            + self
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    bucket.batches_bytes + bucket.pending.capacity() * size_of::<u64>()
+                })
+                .sum::<usize>()
             + self.hashes.capacity() * size_of::<u64>()
-    }
-
-    /// Spills the in-memory batches of the largest bucket, which from then on
-    /// appends its batches to the spill file. Returns false if nothing can be
-    /// spilled.
-    pub(super) fn spill_largest(&mut self) -> Result<bool> {
-        let Some(spill_manager) = &self.spill_manager else {
-            return Ok(false);
-        };
-        let Some(bucket) = self
-            .buckets
-            .iter_mut()
-            .filter(|bucket| bucket.spill_file.is_none() && bucket.rows > 0)
-            .max_by_key(|bucket| bucket.batches_bytes + bucket.coalescer.size())
-        else {
-            return Ok(false);
-        };
-        bucket.spill_file =
-            Some(spill_manager.create_in_progress_file("FinalHashAggregateBucket")?);
-        // Rows that do not form a full batch yet are spilled as well, and the
-        // coalescer is replaced to give up the buffers it allocated.
-        bucket.coalescer.finish_buffered_batch()?;
-        bucket.collect_completed()?;
-        bucket.coalescer = BatchCoalescer::new(bucket.coalescer.schema(), 1);
-        Ok(true)
     }
 
     /// True if no bucket holds rows in memory.
     pub(super) fn is_fully_spilled(&self) -> bool {
-        self.buckets.iter().all(|bucket| bucket.rows == 0)
+        self.routed.is_empty() && self.buckets.iter().all(|bucket| bucket.rows == 0)
     }
 
-    /// Finishes the buckets and returns the non-empty ones.
-    pub(super) fn into_sources(self) -> Result<Vec<BucketSource>> {
-        let mut sources = Vec::with_capacity(NUM_BUCKETS);
-        for mut bucket in self.buckets {
-            bucket.coalescer.finish_buffered_batch()?;
-            bucket.collect_completed()?;
+    /// Finishes the buckets and returns the non-empty ones, and the memory
+    /// of the routed batches they share, held until the last of them is
+    /// aggregated.
+    pub(super) fn into_sources(mut self) -> Result<(Vec<BucketSource>, usize)> {
+        // A spilled bucket's routed rows go to its file first
+        if self
+            .buckets
+            .iter()
+            .any(|bucket| bucket.spill_file.is_some() && !bucket.pending.is_empty())
+        {
+            let _timer = self.metrics.move_time.timer();
+            let routed: Vec<&RecordBatch> = self.routed.iter().collect();
+            for bucket in &mut self.buckets {
+                if bucket.spill_file.is_none() {
+                    continue;
+                }
+                let pending = std::mem::take(&mut bucket.pending);
+                for rows in pending.chunks(self.batch_size) {
+                    bucket.push(interleave(&routed, rows)?)?;
+                }
+            }
+        }
+
+        let routed = Arc::new(std::mem::take(&mut self.routed));
+        let mut sources = Vec::with_capacity(self.buckets.len());
+        for bucket in self.buckets {
             match bucket.spill_file {
                 Some(mut spill_file) => {
-                    let spill_manager = self
-                        .spill_manager
-                        .as_ref()
-                        .expect("a spilled bucket has a spill manager");
+                    let Some(spill_manager) = &self.spill_manager else {
+                        return internal_err!("A spilled bucket has no spill manager");
+                    };
                     if let Some(file) = spill_file.finish()? {
                         sources.push(BucketSource::Spilled {
                             stream: spill_manager.read_spill_as_stream(file, None)?,
@@ -360,43 +349,91 @@ impl FinalBuckets {
                         });
                     }
                 }
-                None if bucket.batches.is_empty() => {}
+                None if bucket.batches.is_empty() && bucket.pending.is_empty() => {}
                 None => sources.push(BucketSource::Memory {
                     batches: bucket.batches,
                     bytes: bucket.batches_bytes,
+                    pending: bucket.pending,
+                    routed: Arc::clone(&routed),
+                    batch_size: self.batch_size,
+                    move_time: self.metrics.move_time.clone(),
                 }),
             }
         }
-        Ok(sources)
+        Ok((sources, self.routed_bytes))
     }
 }
 
 impl Bucket {
-    /// Moves the batches the coalescer has completed to where the bucket
-    /// lives: the spill file if it has been spilled, memory otherwise.
-    fn collect_completed(&mut self) -> Result<()> {
-        while let Some(batch) = self.coalescer.next_completed_batch() {
-            self.batches_bytes += batch.get_array_memory_size();
-            self.batches.push_back(batch);
-        }
-        if let Some(spill_file) = &mut self.spill_file {
-            for batch in self.batches.drain(..) {
+    /// Adds gathered rows to where the bucket lives: its spill file if it has
+    /// been spilled, memory otherwise.
+    fn push(&mut self, batch: RecordBatch) -> Result<()> {
+        match &mut self.spill_file {
+            Some(spill_file) => {
                 spill_file.append_batch(&batch)?;
             }
-            self.batches_bytes = 0;
-            self.rows = 0;
+            None => {
+                self.rows += batch.num_rows();
+                self.batches_bytes += batch.get_array_memory_size();
+                self.batches.push_back(batch);
+            }
         }
         Ok(())
     }
 }
 
+/// The rows `rows` (`batch << 32 | row`) of `routed`, as one batch.
+fn interleave(routed: &[&RecordBatch], rows: &[u64]) -> Result<RecordBatch> {
+    let indices: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|&row| ((row >> 32) as usize, (row & u64::from(u32::MAX)) as usize))
+        .collect();
+    Ok(interleave_record_batch(routed, &indices)?)
+}
+
+/// Bytes the rows of `batch` take, counting only the bytes of a string or
+/// binary view that its row references: a routed batch shares the data
+/// buffers of the batch it was taken from with the other partitions' rows.
+fn referenced_bytes(batch: &RecordBatch) -> usize {
+    fn views<T: ByteViewType + ?Sized>(array: &GenericByteViewArray<T>) -> usize {
+        let outlined: usize = array
+            .views()
+            .iter()
+            .map(|&view| match view as u32 {
+                len if len > 12 => len as usize,
+                _ => 0,
+            })
+            .sum();
+        array.views().inner().len()
+            + outlined
+            + array.nulls().map_or(0, |nulls| nulls.buffer().len())
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|column| match column.data_type() {
+            DataType::Utf8View => views(column.as_string_view()),
+            DataType::BinaryView => views(column.as_binary_view()),
+            _ => column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size()),
+        })
+        .sum()
+}
+
 /// The rows of one finished bucket
 pub(super) enum BucketSource {
+    /// Gathered rows, then rows still to be gathered from the routed batches
     Memory {
         batches: VecDeque<RecordBatch>,
         bytes: usize,
+        pending: Vec<u64>,
+        routed: Arc<Vec<RecordBatch>>,
+        batch_size: usize,
+        move_time: metrics::Time,
     },
-    /// Rows were appended to the file in pieces much smaller than a batch
+    /// Rows were appended to the file in pieces smaller than a batch
     Spilled {
         stream: SendableRecordBatchStream,
         batch_size: usize,
@@ -404,20 +441,43 @@ pub(super) enum BucketSource {
 }
 
 impl BucketSource {
-    /// Memory held by the bucket's rows
+    /// Memory held by the bucket's own rows: the routed batches it shares
+    /// are counted by [`FinalBuckets::into_sources`].
     pub(super) fn memory_size(&self) -> usize {
         match self {
-            Self::Memory { bytes, .. } => *bytes,
+            Self::Memory { bytes, pending, .. } => {
+                bytes + pending.capacity() * size_of::<u64>()
+            }
             Self::Spilled { .. } => 0,
         }
     }
 
     pub(super) fn into_stream(self, schema: &SchemaRef) -> SendableRecordBatchStream {
         match self {
-            Self::Memory { batches, .. } => Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(schema),
-                futures::stream::iter(batches.into_iter().map(Ok)),
-            )),
+            Self::Memory {
+                batches,
+                pending,
+                routed,
+                batch_size,
+                move_time,
+                ..
+            } => {
+                let gathered = futures::stream::iter(
+                    (0..pending.len())
+                        .step_by(batch_size.max(1))
+                        .map(move |start| {
+                            let _timer = move_time.timer();
+                            let rows =
+                                &pending[start..(start + batch_size).min(pending.len())];
+                            let routed: Vec<&RecordBatch> = routed.iter().collect();
+                            interleave(&routed, rows)
+                        }),
+                );
+                Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(schema),
+                    futures::stream::iter(batches.into_iter().map(Ok)).chain(gathered),
+                ))
+            }
             Self::Spilled { stream, batch_size } => {
                 coalesce_stream(stream, Arc::clone(schema), batch_size)
             }
@@ -452,9 +512,22 @@ fn coalesce_stream(
 mod tests {
     use super::*;
 
-    use arrow::array::{AsArray, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use arrow::array::{Int64Array, StringArray, UInt64Array};
+    use arrow::datatypes::{Field, Int64Type, Schema};
+    use datafusion_physical_expr_common::group_hash::group_hash_field;
     use std::collections::HashMap;
+
+    fn schema(carried: bool) -> SchemaRef {
+        let mut fields = vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, false),
+        ];
+        if carried {
+            fields.push(group_hash_field(&[0, 1]));
+        }
+        Arc::new(Schema::new(fields))
+    }
 
     fn test_batch(schema: &SchemaRef, keys: std::ops::Range<i64>) -> RecordBatch {
         let names: StringArray = keys
@@ -462,79 +535,110 @@ mod tests {
             .map(|k| Some(format!("key-{}", k % 97)))
             .collect();
         let values: Int64Array = keys.clone().map(|k| k * 10).collect::<Vec<_>>().into();
-        let keys: Int64Array = keys.collect::<Vec<_>>().into();
-        RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![Arc::new(keys), Arc::new(names), Arc::new(values)],
-        )
-        .unwrap()
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(keys.clone().collect::<Vec<_>>())),
+            Arc::new(names),
+            Arc::new(values),
+        ];
+        if carries_group_hash(schema) {
+            // A hash that puts key k in bucket k % 64 of the first 6 bits
+            let hashes: UInt64Array = keys
+                .map(|k| ((k as u64) % 64) << GroupHash::BUCKET_SHIFT)
+                .collect::<Vec<_>>()
+                .into();
+            columns.push(Arc::new(hashes));
+        }
+        RecordBatch::try_new(Arc::clone(schema), columns).unwrap()
+    }
+
+    /// Every row of every source, as `(bucket, key, value)`.
+    async fn drain(
+        sources: Vec<BucketSource>,
+        schema: &SchemaRef,
+    ) -> Result<Vec<(usize, i64, i64)>> {
+        let mut rows = vec![];
+        for (bucket, source) in sources.into_iter().enumerate() {
+            let mut stream = source.into_stream(schema);
+            while let Some(batch) = stream.next().await.transpose()? {
+                let keys = batch.column(0).as_primitive::<Int64Type>();
+                let values = batch.column(2).as_primitive::<Int64Type>();
+                for (key, value) in keys.values().iter().zip(values.values()) {
+                    rows.push((bucket, *key, *value));
+                }
+            }
+        }
+        Ok(rows)
     }
 
     #[tokio::test]
     async fn routes_every_row_once_and_keeps_keys_together() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("v", DataType::Int64, false),
-        ]));
+        let schema = schema(false);
         let mut buckets =
-            FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
+            FinalBuckets::new(&schema, 2, 1024, 0, 6, None, RouteMetrics::default());
         // the same keys arrive in two different batches
-        buckets.route(&test_batch(&schema, 0..20_000))?;
-        buckets.route(&test_batch(&schema, 10_000..30_000))?;
+        buckets.route(test_batch(&schema, 0..20_000))?;
+        buckets.route(test_batch(&schema, 10_000..30_000))?;
         assert!(buckets.memory_size() > 0);
-        assert!(
-            !buckets.spill_largest()?,
-            "no spill manager, nothing spilled"
-        );
+        // Half of the rows are gathered early, as under memory pressure
+        buckets.gather()?;
+        assert!(!buckets.has_routed());
+        buckets.route(test_batch(&schema, 0..10_000))?;
 
-        let sources = buckets.into_sources()?;
-        assert!(
-            sources.len() > NUM_BUCKETS / 2,
-            "rows spread over the buckets"
-        );
+        let (sources, routed_bytes) = buckets.into_sources()?;
+        assert!(routed_bytes > 0);
+        assert!(sources.len() > 32, "rows spread over the buckets");
 
+        let rows = drain(sources, &schema).await?;
+        assert_eq!(rows.len(), 50_000);
         let mut bucket_of_key: HashMap<i64, usize> = HashMap::new();
-        let mut rows = 0;
-        for (bucket, source) in sources.into_iter().enumerate() {
-            let mut stream = source.into_stream(&schema);
-            while let Some(batch) = stream.next().await.transpose()? {
-                rows += batch.num_rows();
-                let keys = batch.column(0).as_primitive::<Int64Type>();
-                let values = batch.column(2).as_primitive::<Int64Type>();
-                for (key, value) in keys.values().iter().zip(values.values()) {
-                    assert_eq!(*value, key * 10, "columns stay aligned");
-                    let seen = *bucket_of_key.entry(*key).or_insert(bucket);
-                    assert_eq!(seen, bucket, "key {key} in two buckets");
-                }
-            }
+        for (bucket, key, value) in rows {
+            assert_eq!(value, key * 10, "columns stay aligned");
+            let seen = *bucket_of_key.entry(key).or_insert(bucket);
+            assert_eq!(seen, bucket, "key {key} in two buckets");
         }
-        assert_eq!(rows, 40_000);
         assert_eq!(bucket_of_key.len(), 30_000);
         Ok(())
     }
 
-    #[test]
-    fn levels_use_different_hash_bits() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("v", DataType::Int64, false),
-        ]));
-        // Rows of one level-0 bucket must spread again at level 1
-        let mut level0 =
-            FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
-        level0.route(&test_batch(&schema, 0..50_000))?;
-        let source = level0.into_sources()?.swap_remove(0);
-        let BucketSource::Memory { batches, .. } = source else {
-            unreachable!()
-        };
-        let mut level1 =
-            FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
-        for batch in &batches {
-            level1.route(batch)?;
+    #[tokio::test]
+    async fn routes_by_the_carried_hash() -> Result<()> {
+        let schema = schema(true);
+        let mut buckets =
+            FinalBuckets::new(&schema, 2, 1024, 0, 6, None, RouteMetrics::default());
+        buckets.route(test_batch(&schema, 0..6_400))?;
+        let (sources, _) = buckets.into_sources()?;
+        assert_eq!(sources.len(), 64);
+        for (bucket, key, _) in drain(sources, &schema).await? {
+            assert_eq!(key as usize % 64, bucket);
         }
-        assert!(level1.into_sources()?.len() > NUM_BUCKETS / 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn splits_read_the_next_bits() -> Result<()> {
+        // Rows of one bucket of the first split spread again at the next one
+        let schema = schema(false);
+        let mut first =
+            FinalBuckets::new(&schema, 1, 1024, 0, 10, None, RouteMetrics::default());
+        let (offset, bits) = first.next_split().unwrap();
+        assert_eq!((offset, bits), (10, 6));
+        first.route(test_batch(&schema, 0..200_000))?;
+        let (mut sources, _) = first.into_sources()?;
+        let mut stream = sources.swap_remove(0).into_stream(&schema);
+        let mut second = FinalBuckets::new(
+            &schema,
+            1,
+            1024,
+            offset,
+            bits,
+            None,
+            RouteMetrics::default(),
+        );
+        assert_eq!(second.next_split(), None, "16 bucket bits are used up");
+        while let Some(batch) = stream.next().await.transpose()? {
+            second.route(batch)?;
+        }
+        assert!(second.into_sources()?.0.len() > 32);
         Ok(())
     }
 }

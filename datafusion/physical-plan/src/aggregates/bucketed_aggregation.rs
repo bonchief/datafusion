@@ -19,7 +19,9 @@ use futures::future::BoxFuture;
 
 use super::AggregateExec;
 use super::aggregate_hash_table::{AggregateHashTable, FinalMarker};
-use super::final_buckets::{FinalBuckets, MAX_BUCKET_LEVELS, RouteMetrics};
+use super::final_buckets::{
+    FinalBuckets, MAX_FANOUT_BITS, MIN_FANOUT_BITS, RouteMetrics,
+};
 use crate::SendableRecordBatchStream;
 use crate::metrics;
 use crate::metrics::{BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput};
@@ -49,6 +51,11 @@ pub(super) struct BucketedAggregation {
     output_schema: SchemaRef,
     /// `None` if spilling is not supported by the configured `DiskManager`.
     spill_manager: Option<SpillManager>,
+    /// Bytes of table a bucket is meant to hold:
+    /// `hash_aggregate_piece_bytes`.
+    piece_bytes: usize,
+    /// Rows the partition's input is expected to hold, if known
+    expected_rows: Option<usize>,
     /// Number of times a hash table was split into buckets
     bucket_splits: metrics::Count,
     /// Number of times the rows of a bucket were replaced by their aggregated state
@@ -99,6 +106,7 @@ fn is_fixed_width(data_type: &DataType) -> bool {
 impl BucketedAggregation {
     /// `agg` must aggregate rows of `state_schema` as partial state: see
     /// [`AggregateHashTable::<FinalMarker>::new_over_state`].
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
         trigger: BucketTrigger,
         agg: AggregateExec,
@@ -107,6 +115,8 @@ impl BucketedAggregation {
         state_schema: SchemaRef,
         output_schema: SchemaRef,
         spill_manager: Option<SpillManager>,
+        piece_bytes: usize,
+        expected_rows: Option<usize>,
     ) -> Self {
         let bucket_splits =
             MetricBuilder::new(&agg.metrics).counter("bucket_splits", partition);
@@ -139,6 +149,8 @@ impl BucketedAggregation {
             state_schema,
             output_schema,
             spill_manager,
+            piece_bytes,
+            expected_rows,
             bucket_splits,
             bucket_compactions,
             route_metrics,
@@ -207,75 +219,103 @@ impl BucketedAggregation {
         )
     }
 
-    /// Starts the buckets of `level` with `state`, the state of the table
-    /// that is split. `kept` is the share of its input rows which that table
-    /// kept as groups.
+    /// Bucket bits for the first split of a table of `table_bytes`, which
+    /// has just reached the trigger, after aggregating `table_rows` input
+    /// rows: enough buckets for the table the whole input is expected to
+    /// build, if every further row were a new group, to come in pieces of
+    /// about `piece_bytes`, and of at most half the trigger, so that buckets
+    /// are not split again. 64 buckets if the input's row count is unknown.
+    pub(super) fn fanout_bits(&self, table_bytes: usize, table_rows: usize) -> u32 {
+        let Some(expected_rows) = self.expected_rows else {
+            return 6;
+        };
+        let growth = expected_rows.max(table_rows) as f64 / table_rows.max(1) as f64;
+        let expected_bytes = table_bytes as f64 * growth;
+        let pieces = (expected_bytes / self.piece_bytes.max(1) as f64)
+            .max(2.0 * growth)
+            .max(1.0);
+        (pieces.log2().ceil() as u32).clamp(MIN_FANOUT_BITS, MAX_FANOUT_BITS)
+    }
+
+    /// Starts buckets that read `bits` bucket bits from `offset` with `state`,
+    /// the state of the table that is split.
     pub(super) fn split(
         &self,
-        level: u32,
+        offset: u32,
+        bits: u32,
         state: Option<RecordBatch>,
-        kept: f64,
     ) -> Result<FinalBuckets> {
         let mut buckets = FinalBuckets::new(
             &self.state_schema,
             self.agg.group_by().num_group_exprs(),
             self.batch_size,
-            level,
+            offset,
+            bits,
             self.spill_manager.clone(),
             self.route_metrics.clone(),
         );
         self.bucket_splits.add(1);
-        buckets.expect_kept(kept);
         if let Some(state) = state {
-            buckets.route(&state)?;
+            buckets.route(state)?;
         }
         Ok(buckets)
     }
 
-    /// Replaces the rows of every bucket that is due for it by their aggregated
-    /// state. See the compaction section of [`FinalBuckets`].
-    pub(super) fn compact(
+    /// Replaces the rows of bucket `index` by their aggregated state.
+    fn compact(
         &self,
         buckets: &mut FinalBuckets,
+        index: usize,
         table: &mut Option<AggregateHashTable<FinalMarker>>,
     ) -> Result<()> {
         let _timer = self.compaction_time.timer();
-        while let Some(index) = buckets.bucket_to_compact() {
-            let table = match table {
-                Some(table) => table,
-                None => table.insert(self.new_table()?),
-            };
-            let mut input_rows = 0;
-            for batch in buckets.take_bucket(index)? {
-                input_rows += batch.num_rows();
-                table.aggregate_batch(&batch)?;
-            }
-            buckets.put_compacted(
-                index,
-                table.take_state_batch_keep_capacity()?,
-                input_rows,
-            );
-            self.bucket_compactions.add(1);
-            self.compacted_rows.add(input_rows);
+        let table = match table {
+            Some(table) => table,
+            None => table.insert(self.new_table()?),
+        };
+        let mut input_rows = 0;
+        for batch in buckets.take_bucket(index) {
+            input_rows += batch.num_rows();
+            table.aggregate_batch(&batch)?;
         }
+        buckets.put_compacted(
+            index,
+            table.take_state_batch_keep_capacity()?,
+            input_rows,
+        )?;
+        self.bucket_compactions.add(1);
+        self.compacted_rows.add(input_rows);
         Ok(())
     }
 
-    /// Reserves `other_bytes` plus the memory of `buckets`, spilling buckets
-    /// for as long as the reservation does not fit.
+    /// Reserves `other_bytes` plus the memory of `buckets`. For as long as
+    /// that does not fit, gathers the routed rows, then compacts or spills
+    /// the largest bucket: see the memory pressure section of
+    /// [`FinalBuckets`].
     pub(super) fn reserve(
         &self,
         reservation: &MemoryReservation,
         other_bytes: usize,
         buckets: &mut FinalBuckets,
+        table: &mut Option<AggregateHashTable<FinalMarker>>,
     ) -> Result<()> {
         loop {
             let size = other_bytes.saturating_add(buckets.memory_size());
             match reservation.try_resize(size) {
                 Ok(()) => return Ok(()),
                 Err(e @ DataFusionError::ResourcesExhausted(_)) => {
-                    if buckets.spill_largest()? {
+                    if buckets.has_routed() {
+                        buckets.gather()?;
                         continue;
+                    }
+                    if let Some(index) = buckets.largest() {
+                        if buckets.should_compact(index) {
+                            self.compact(buckets, index, table)?;
+                            continue;
+                        }
+                        if buckets.spill(index)? {
+                            continue;
+                        }
                     }
                     // Every bucket is on disk. What is left is the fixed cost
                     // of routing a batch, which no spill can release, so go on
@@ -342,17 +382,21 @@ impl BucketedAggregation {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let elapsed_compute = output.baseline_metrics.elapsed_compute().clone();
-            let next_level = buckets.level() + 1;
+            let next_split = buckets.next_split();
 
-            let sources = buckets.into_sources()?;
-            // Memory of the buckets that wait for their turn
-            let mut waiting_bytes: usize =
-                sources.iter().map(|source| source.memory_size()).sum();
+            let (sources, routed_bytes) = buckets.into_sources()?;
+            // Memory of the buckets that wait for their turn, and of the
+            // routed batches they share until the last of them is done
+            let mut waiting_bytes: usize = routed_bytes
+                + sources
+                    .iter()
+                    .map(|source| source.memory_size())
+                    .sum::<usize>();
 
             // One table aggregates all the buckets, one after another
             let mut reusable_table = None;
             for source in sources {
-                let mut source_bytes = source.memory_size();
+                let source_bytes = source.memory_size();
                 waiting_bytes -= source_bytes;
                 let mut input = source.into_stream(&self.state_schema);
 
@@ -361,20 +405,21 @@ impl BucketedAggregation {
                     Some(hash_table) => hash_table,
                     None => self.new_table()?.with_restart(),
                 };
-                let mut table_rows = 0usize;
                 let mut sub_buckets: Option<FinalBuckets> = None;
                 let mut compaction_table = None;
 
                 while let Some(batch) = input.next().await.transpose()? {
-                    // Batches of an in-memory bucket are released as they are read
-                    source_bytes =
-                        source_bytes.saturating_sub(batch.get_array_memory_size());
+                    // The bucket's rows are held until it is done
                     let held_bytes = waiting_bytes + source_bytes;
 
                     if let Some(sub_buckets) = sub_buckets.as_mut() {
-                        sub_buckets.route(&batch)?;
-                        self.compact(sub_buckets, &mut compaction_table)?;
-                        self.reserve(&output.reservation, held_bytes, sub_buckets)?;
+                        sub_buckets.route(batch)?;
+                        self.reserve(
+                            &output.reservation,
+                            held_bytes,
+                            sub_buckets,
+                            &mut compaction_table,
+                        )?;
                         output.record_peak();
                         continue;
                     }
@@ -383,9 +428,8 @@ impl BucketedAggregation {
                     hash_table.aggregate_batch(&batch)?;
                     aggregate_timer.done();
                     self.bucket_aggregated_rows.add(batch.num_rows());
-                    table_rows += batch.num_rows();
 
-                    let can_split = next_level < MAX_BUCKET_LEVELS;
+                    let can_split = next_split.is_some();
                     let split = match output
                         .reservation
                         .try_resize(held_bytes + hash_table.memory_size())
@@ -394,15 +438,14 @@ impl BucketedAggregation {
                         Err(DataFusionError::ResourcesExhausted(_)) if can_split => true,
                         Err(e) => return Err(e),
                     };
-                    if split {
-                        let kept = hash_table.building_group_count() as f64
-                            / table_rows.max(1) as f64;
+                    if let (true, Some((offset, bits))) = (split, next_split) {
                         let mut new_buckets =
-                            self.split(next_level, hash_table.take_state_batch()?, kept)?;
+                            self.split(offset, bits, hash_table.take_state_batch()?)?;
                         self.reserve(
                             &output.reservation,
                             held_bytes + hash_table.memory_size(),
                             &mut new_buckets,
+                            &mut compaction_table,
                         )?;
                         sub_buckets = Some(new_buckets);
                     }

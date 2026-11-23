@@ -1180,6 +1180,14 @@ config_namespace! {
         /// enabled. Set to 0 to disable.
         pub hash_aggregate_bucket_threshold_bytes: usize, default = 0
 
+        /// (experimental) Bytes of hash table each bucket of a final hash
+        /// aggregation is meant to hold once its table is split (see
+        /// `hash_aggregate_bucket_threshold`): the table the partition is
+        /// expected to build, from its input's row count, is split into
+        /// about this many bytes per bucket, 16 to 1,024 buckets. About half
+        /// of a core's L2 cache.
+        pub hash_aggregate_piece_bytes: usize, default = 1_048_576
+
         /// (experimental) Hash the group keys of a two-stage hash aggregation
         /// with variable-width keys once, in its partial stage, and carry the
         /// hash to the exchange and the final stage in an extra column,

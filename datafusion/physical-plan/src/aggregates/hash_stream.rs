@@ -33,6 +33,7 @@ use super::spill::AggregateSpill;
 use crate::metrics::{
     BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput, SpillMetrics,
 };
+use crate::statistics::{StatisticsArgs, StatisticsContext};
 use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use crate::{SendableRecordBatchStream, metrics};
 
@@ -721,6 +722,16 @@ impl FinalHashAggregateStream {
             execution.hash_aggregate_bucket_threshold_bytes,
         )
         .filter(|_| group_values_soft_limit.is_none() && spill_context.is_some());
+        // How many rows this partition's input holds, to size the buckets
+        let expected_rows = trigger.and_then(|_| {
+            let statistics = StatisticsContext::new()
+                .compute(
+                    agg.input().as_ref(),
+                    &StatisticsArgs::new().with_partition(Some(partition)),
+                )
+                .ok()?;
+            statistics.num_rows.get_value().copied()
+        });
         let bucketing = trigger.map(|trigger| {
             Arc::new(BucketedAggregation::new(
                 trigger,
@@ -732,6 +743,8 @@ impl FinalHashAggregateStream {
                 spill_context
                     .as_ref()
                     .map(|context| context.spill_manager().clone()),
+                execution.hash_aggregate_piece_bytes,
+                expected_rows,
             ))
         });
 
@@ -866,9 +879,13 @@ impl FinalHashAggregateStream {
             if let (Some(buckets), Some(bucketing)) =
                 (buckets.as_mut(), self.bucketing.as_ref())
             {
-                buckets.route(&batch)?;
-                bucketing.compact(buckets, &mut compaction_table)?;
-                bucketing.reserve(&self.reservation, 0, buckets)?;
+                buckets.route(batch)?;
+                bucketing.reserve(
+                    &self.reservation,
+                    0,
+                    buckets,
+                    &mut compaction_table,
+                )?;
                 continue;
             }
 
@@ -891,14 +908,14 @@ impl FinalHashAggregateStream {
                 && !spilled
                 && bucketing.due(hash_table)
             {
-                let kept =
-                    hash_table.building_group_count() as f64 / table_rows.max(1) as f64;
+                let bits = bucketing.fanout_bits(hash_table.memory_size(), table_rows);
                 let mut new_buckets =
-                    bucketing.split(0, hash_table.take_state_batch()?, kept)?;
+                    bucketing.split(0, bits, hash_table.take_state_batch()?)?;
                 bucketing.reserve(
                     &self.reservation,
                     hash_table.memory_size(),
                     &mut new_buckets,
+                    &mut compaction_table,
                 )?;
                 buckets = Some(new_buckets);
                 continue;
@@ -1649,14 +1666,23 @@ mod tests {
 
     #[tokio::test]
     async fn final_hash_aggregate_compacts_repeated_groups() -> Result<()> {
-        // Every group arrives 40 times, so buffering the input as is would
-        // hold 40 rows per group.
+        // Every group arrives 40 times. While memory suffices the buckets
+        // hold the rows as they came and aggregate each once.
         let (rows, splits, spills) =
             run_final_hash_aggregate(20_000, 40, 1_000, None).await?;
         assert_eq!(rows.len(), 20_000);
         assert!(rows.iter().all(|&(_, count)| count == 40));
         assert!(splits >= 1);
         assert_eq!(spills, 0);
+        let compactions = BUCKET_COMPACTIONS.with(|compactions| compactions.get());
+        assert_eq!(compactions, 0, "nothing compacted without memory pressure");
+
+        // Under memory pressure the largest bucket is compacted to one row
+        // per group before anything is spilled
+        let (pressed, splits, _) =
+            run_final_hash_aggregate(20_000, 40, 1_000, Some(4 << 20)).await?;
+        assert_eq!(pressed, rows);
+        assert!(splits >= 1);
         let compactions = BUCKET_COMPACTIONS.with(|compactions| compactions.get());
         assert!(compactions > 0, "buckets were compacted");
         Ok(())
@@ -2030,13 +2056,13 @@ mod tests {
     /// partial aggregation, a hash exchange into four partitions and a final
     /// aggregation, the way a planner builds it.
     ///
-    /// Returns the rows sorted by key, the final aggregation's
-    /// `bucket_splits` and its spill count.
+    /// Returns the rows sorted by key, and the final aggregation's
+    /// `bucket_splits`, spill count and `bucket_compactions`.
     async fn run_two_stage_text_aggregate(
         num_groups: usize,
         repeats: usize,
         run: TwoStage,
-    ) -> Result<(Vec<(String, i64, String)>, usize, usize)> {
+    ) -> Result<(Vec<(String, i64, String)>, usize, usize, usize)> {
         use crate::repartition::RepartitionExec;
         use datafusion_common::ScalarValue;
         use datafusion_physical_expr::Partitioning;
@@ -2173,10 +2199,18 @@ mod tests {
         }
 
         let metrics = final_agg.metrics().expect("final aggregate has metrics");
-        let splits = metrics
-            .sum_by_name("bucket_splits")
-            .map_or(0, |value| value.as_usize());
-        Ok((rows, splits, metrics.spill_count().unwrap_or(0)))
+        let metric = |name| {
+            metrics
+                .sum_by_name(name)
+                .map_or(0, |value| value.as_usize())
+        };
+        assert!(metric("peak_mem_used") > 0, "peak reservation reported");
+        Ok((
+            rows,
+            metric("bucket_splits"),
+            metrics.spill_count().unwrap_or(0),
+            metric("bucket_compactions"),
+        ))
     }
 
     #[tokio::test]
@@ -2187,7 +2221,7 @@ mod tests {
             bucket_bytes: 0,
             memory_limit: None,
         };
-        let (expected, _, _) = run_two_stage_text_aggregate(20_000, 2, one_table).await?;
+        let (expected, ..) = run_two_stage_text_aggregate(20_000, 2, one_table).await?;
         for skip in [false, true] {
             for bucket_bytes in [0, 1 << 20, 16 << 10] {
                 for carry in [false, true] {
@@ -2197,7 +2231,7 @@ mod tests {
                         bucket_bytes,
                         memory_limit: None,
                     };
-                    let (rows, splits, _) =
+                    let (rows, splits, ..) =
                         run_two_stage_text_aggregate(20_000, 2, run).await?;
                     assert_eq!(rows, expected, "{run:?}");
                     match bucket_bytes {
@@ -2208,6 +2242,37 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn carried_buckets_compact_and_spill_under_memory_limit() -> Result<()> {
+        // Skipping partial aggregation hands every input row to the final
+        // aggregation, so its buckets hold each group several times
+        let one_table = TwoStage {
+            carry: false,
+            skip: true,
+            bucket_bytes: 0,
+            memory_limit: None,
+        };
+        let (expected, ..) = run_two_stage_text_aggregate(30_000, 3, one_table).await?;
+        let mut relieved = false;
+        for memory_limit in [32 << 20, 12 << 20] {
+            for carry in [false, true] {
+                let run = TwoStage {
+                    carry,
+                    skip: true,
+                    bucket_bytes: 64 << 10,
+                    memory_limit: Some(memory_limit),
+                };
+                let (rows, splits, spills, compactions) =
+                    run_two_stage_text_aggregate(30_000, 3, run).await?;
+                assert_eq!(rows, expected, "{run:?}");
+                assert!(splits > 0, "{run:?}");
+                relieved |= carry && spills + compactions > 0;
+            }
+        }
+        assert!(relieved, "memory pressure compacted or spilled buckets");
         Ok(())
     }
 
