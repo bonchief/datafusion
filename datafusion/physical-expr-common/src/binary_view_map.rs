@@ -4,7 +4,7 @@
 
 //! [`ArrowBytesViewMap`] and [`ArrowBytesViewSet`] for storing maps/sets of values from
 //! `StringViewArray`/`BinaryViewArray`.
-use crate::binary_map::{OutputType, single_null_buffer};
+use crate::binary_map::{AGGREGATION_HASH_SEED, OutputType, single_null_buffer};
 use crate::prefetch::{DISTANCE, l2_cache_bytes, prefetch};
 use arrow::array::cast::AsArray;
 use arrow::array::{
@@ -222,10 +222,16 @@ where
             } else {
                 BYTE_VIEW_STARTING_BLOCK_SIZE
             },
-            random_state: RandomState::default(),
+            random_state: AGGREGATION_HASH_SEED,
             hashes_buffer: vec![],
             null: None,
         }
+    }
+
+    /// The state the map hashes its keys with.
+    #[cfg(all(test, not(feature = "force_hash_collisions")))]
+    pub(crate) fn random_state(&self) -> &RandomState {
+        &self.random_state
     }
 
     /// Reserves group slots without preallocating variable-length string payloads.
