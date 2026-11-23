@@ -2013,6 +2013,204 @@ mod tests {
         Ok(())
     }
 
+    /// How [`run_two_stage_text_aggregate`] runs.
+    #[derive(Clone, Copy, Debug)]
+    struct TwoStage {
+        /// The partial aggregation carries its group hashes
+        carry: bool,
+        /// The partial aggregation skips to converting rows into states
+        skip: bool,
+        /// `hash_aggregate_bucket_threshold_bytes`
+        bucket_bytes: usize,
+        memory_limit: Option<usize>,
+    }
+
+    /// `SELECT key, COUNT(value), MIN(label) .. GROUP BY key` over three input
+    /// partitions that each hold every group `repeats` times, run as a
+    /// partial aggregation, a hash exchange into four partitions and a final
+    /// aggregation, the way a planner builds it.
+    ///
+    /// Returns the rows sorted by key, the final aggregation's
+    /// `bucket_splits` and its spill count.
+    async fn run_two_stage_text_aggregate(
+        num_groups: usize,
+        repeats: usize,
+        run: TwoStage,
+    ) -> Result<(Vec<(String, i64, String)>, usize, usize)> {
+        use crate::repartition::RepartitionExec;
+        use datafusion_common::ScalarValue;
+        use datafusion_physical_expr::Partitioning;
+
+        let batch_size = 1024;
+        let num_inputs = 3;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8View, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("label", DataType::Utf8View, false),
+        ]));
+        let key = |group: usize| format!("a group key well past twelve bytes {group:08}");
+        let label = |group: usize, input: usize| {
+            format!("label of group {group:08} from input {input}")
+        };
+        let inputs = (0..num_inputs)
+            .map(|input| {
+                let rows: Vec<usize> = (0..repeats).flat_map(|_| 0..num_groups).collect();
+                rows.chunks(batch_size)
+                    .map(|groups| {
+                        let keys: StringViewArray =
+                            groups.iter().map(|&g| Some(key(g))).collect();
+                        let labels: StringViewArray =
+                            groups.iter().map(|&g| Some(label(g, input))).collect();
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(keys),
+                                Arc::new(Int64Array::from(vec![1i64; groups.len()])),
+                                Arc::new(labels),
+                            ],
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut runtime = RuntimeEnvBuilder::default();
+        if let Some(memory_limit) = run.memory_limit {
+            runtime = runtime.with_memory_limit(memory_limit, 1.0);
+        }
+        let task_ctx = TaskContext::default().with_runtime(runtime.build_arc()?);
+        let (probe_rows, probe_ratio) = if run.skip { (1, 0.0) } else { (100_000, 1.0) };
+        let session_config = task_ctx
+            .session_config()
+            .clone()
+            .set(
+                "datafusion.execution.batch_size",
+                &ScalarValue::UInt64(Some(batch_size as u64)),
+            )
+            .set(
+                "datafusion.execution.hash_aggregate_bucket_threshold_bytes",
+                &ScalarValue::UInt64(Some(run.bucket_bytes as u64)),
+            )
+            .set(
+                "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+                &ScalarValue::UInt64(Some(probe_rows)),
+            )
+            .set(
+                "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                &ScalarValue::Float64(Some(probe_ratio)),
+            );
+        let task_ctx = Arc::new(task_ctx.with_session_config(session_config));
+
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("key", &schema)?, "key".to_string())]);
+        let aggr_expr = vec![
+            Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("count_value")
+                    .build()?,
+            ),
+            Arc::new(
+                AggregateExprBuilder::new(min_udaf(), vec![col("label", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("min_label")
+                    .build()?,
+            ),
+        ];
+        let input = TestMemoryExec::try_new_exec(&inputs, Arc::clone(&schema), None)?;
+        let partial = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by.clone(),
+            aggr_expr.clone(),
+            vec![None, None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let partial = if run.carry {
+            partial.with_group_hash()?
+        } else {
+            partial
+        };
+        let keys = vec![col("key", &partial.schema())?];
+        let exchange = Arc::new(RepartitionExec::try_new(
+            Arc::new(partial),
+            Partitioning::Hash(keys, 4),
+        )?);
+        let final_agg = Arc::new(AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by.as_final(),
+            aggr_expr,
+            vec![None, None],
+            exchange,
+            Arc::clone(&schema),
+        )?);
+        assert_eq!(final_agg.carries_group_hash(), run.carry);
+        // The hashes stay between the stages
+        assert_eq!(final_agg.schema().fields().len(), 3);
+
+        let batches =
+            crate::collect(Arc::clone(&final_agg) as Arc<dyn ExecutionPlan>, task_ctx)
+                .await?;
+        let mut rows = vec![];
+        for batch in &batches {
+            let keys = batch.column(0).as_string_view();
+            let counts = batch.column(1).as_primitive::<Int64Type>();
+            let mins = batch.column(2).as_string_view();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    keys.value(row).to_string(),
+                    counts.value(row),
+                    mins.value(row).to_string(),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows.len(), num_groups, "{run:?}");
+        for (group, (k, count, min)) in rows.iter().enumerate() {
+            assert_eq!(*k, key(group));
+            assert_eq!(*count, (num_inputs * repeats) as i64, "{run:?}");
+            assert_eq!(*min, label(group, 0));
+        }
+
+        let metrics = final_agg.metrics().expect("final aggregate has metrics");
+        let splits = metrics
+            .sum_by_name("bucket_splits")
+            .map_or(0, |value| value.as_usize());
+        Ok((rows, splits, metrics.spill_count().unwrap_or(0)))
+    }
+
+    #[tokio::test]
+    async fn carried_group_hashes_give_the_same_groups() -> Result<()> {
+        let one_table = TwoStage {
+            carry: false,
+            skip: false,
+            bucket_bytes: 0,
+            memory_limit: None,
+        };
+        let (expected, _, _) = run_two_stage_text_aggregate(20_000, 2, one_table).await?;
+        for skip in [false, true] {
+            for bucket_bytes in [0, 1 << 20, 16 << 10] {
+                for carry in [false, true] {
+                    let run = TwoStage {
+                        carry,
+                        skip,
+                        bucket_bytes,
+                        memory_limit: None,
+                    };
+                    let (rows, splits, _) =
+                        run_two_stage_text_aggregate(20_000, 2, run).await?;
+                    assert_eq!(rows, expected, "{run:?}");
+                    match bucket_bytes {
+                        0 => assert_eq!(splits, 0, "{run:?}"),
+                        _ if bucket_bytes < 1 << 20 => assert!(splits > 0, "{run:?}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Builds a partial hash aggregate stream over a single input batch of
     /// `num_groups` distinct groups, running under `memory_limit` bytes.
     ///

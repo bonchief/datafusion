@@ -5,7 +5,11 @@
 //! [`GroupHash`], the hash of a row's group keys that a two-stage aggregation
 //! computes once and carries from its partial to its final stage.
 
-use arrow::array::ArrayRef;
+use std::collections::HashMap;
+
+use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::datatypes::{DataType, Field, UInt64Type};
+use arrow::record_batch::RecordBatch;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 
 /// The hash of a row's group keys, computed once and carried between the
@@ -70,14 +74,62 @@ impl GroupHash {
         Self(table.rotate_right(32))
     }
 
-    /// The bucket, among `1 << bits`, of the row at bucketing level `level`,
-    /// where every level reads the next `bits` bits from
-    /// [`Self::BUCKET_SHIFT`] on. `(level + 1) * bits` must not exceed
-    /// [`Self::BUCKET_BITS`].
-    pub const fn bucket(self, level: u32, bits: u32) -> usize {
-        let shift = Self::BUCKET_SHIFT + level * bits;
+    /// The bucket, among `1 << bits`, that the `bits` bucket bits from
+    /// `offset` on pick: bits `BUCKET_SHIFT + offset ..` of `h`. A bucket
+    /// split again reads the bits after the ones that picked it. `offset +
+    /// bits` must not exceed [`Self::BUCKET_BITS`].
+    pub const fn bucket(self, offset: u32, bits: u32) -> usize {
+        let shift = Self::BUCKET_SHIFT + offset;
         ((self.0 >> shift) & ((1 << bits) - 1)) as usize
     }
+}
+
+/// Name of the column a partial aggregation carries its [`GroupHash`]es in,
+/// after its group keys and aggregate state.
+pub const GROUP_HASH_COLUMN: &str = "__group_hash";
+
+/// Metadata key of the [`GROUP_HASH_COLUMN`] field. Its value lists the
+/// indices of the columns hashed, in order, separated by commas.
+pub const GROUP_HASH_METADATA: &str = "datafusion.group_hash";
+
+/// The field of a column that carries the [`GroupHash`] of the columns
+/// `keys` of its batch.
+pub fn group_hash_field(keys: &[usize]) -> Field {
+    let keys = keys
+        .iter()
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Field::new(GROUP_HASH_COLUMN, DataType::UInt64, false)
+        .with_metadata(HashMap::from([(GROUP_HASH_METADATA.to_string(), keys)]))
+}
+
+/// The indices of the columns whose [`GroupHash`] `field` carries, if it is
+/// a [`group_hash_field`].
+pub fn group_hash_keys(field: &Field) -> Option<Vec<usize>> {
+    if field.name() != GROUP_HASH_COLUMN
+        || field.data_type() != &DataType::UInt64
+        || field.is_nullable()
+    {
+        return None;
+    }
+    let keys = field.metadata().get(GROUP_HASH_METADATA)?;
+    keys.split(',').map(|key| key.parse().ok()).collect()
+}
+
+/// The [`GroupHash`] of every row of `batch`, if its last column carries
+/// them for exactly the columns `keys`, in that order.
+pub fn carried_group_hashes<'a>(
+    batch: &'a RecordBatch,
+    keys: &[usize],
+) -> Option<&'a [u64]> {
+    let schema = batch.schema_ref();
+    let last = schema.fields().len().checked_sub(1)?;
+    if group_hash_keys(schema.field(last))? != keys {
+        return None;
+    }
+    let column = batch.column(last).as_primitive_opt::<UInt64Type>()?;
+    (column.null_count() == 0).then(|| column.values().as_ref())
 }
 
 /// Fills `out` with the hash a byte map probes its table with for each value
@@ -145,9 +197,46 @@ mod tests {
     fn levels_read_disjoint_bits() {
         let hash = GroupHash::new(0b10_1011 << GroupHash::BUCKET_SHIFT);
         assert_eq!(hash.bucket(0, 6), 0b10_1011);
-        assert_eq!(hash.bucket(1, 6), 0);
+        assert_eq!(hash.bucket(6, 6), 0);
         let hash = GroupHash::new(0b11_0001 << (GroupHash::BUCKET_SHIFT + 6));
         assert_eq!(hash.bucket(0, 6), 0);
-        assert_eq!(hash.bucket(1, 6), 0b11_0001);
+        assert_eq!(hash.bucket(6, 6), 0b11_0001);
+        assert_eq!(hash.bucket(6, 4), 0b0001);
+    }
+
+    #[test]
+    fn carried_column_round_trips_its_keys() {
+        use arrow::array::{StringArray, UInt64Array};
+        use arrow::datatypes::Schema;
+        use std::sync::Arc;
+
+        let field = group_hash_field(&[0, 2]);
+        assert_eq!(group_hash_keys(&field), Some(vec![0, 2]));
+        assert_eq!(
+            group_hash_keys(&Field::new("x", DataType::UInt64, false)),
+            None
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Utf8, true),
+            field,
+        ]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["x", "y"]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::clone(&strings),
+                Arc::clone(&strings),
+                strings,
+                Arc::new(UInt64Array::from(vec![7, 9])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(carried_group_hashes(&batch, &[0, 2]), Some(&[7, 9][..]));
+        // Hashes of other keys are not these keys' hashes
+        assert_eq!(carried_group_hashes(&batch, &[0, 1]), None);
+        assert_eq!(carried_group_hashes(&batch, &[0]), None);
     }
 }

@@ -176,7 +176,7 @@ use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     ColumnStatistics, Constraint, Constraints, Result, ScalarValue,
-    assert_eq_or_internal_err, internal_err, not_impl_err,
+    assert_eq_or_internal_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::{Accumulator, Aggregate, AggregateMetrics};
@@ -1093,6 +1093,94 @@ impl AggregateExec {
         &self.mode
     }
 
+    /// This partial aggregation with a last output column that carries the
+    /// [`GroupHash`] of each row's group keys: the hash `RepartitionExec`
+    /// routes by, computed once per row here and reused by the exchange and
+    /// by the final aggregation instead of being computed by each again.
+    ///
+    /// A final aggregation whose input ends with that column uses it on its
+    /// own and does not output it. Plans built without this are unchanged.
+    ///
+    /// Refused unless the aggregation is a plain hash partial aggregation of
+    /// one grouping set whose keys are neither dictionaries nor nested.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    pub fn with_group_hash(self) -> Result<Self> {
+        if !self.can_carry_group_hash()? {
+            return plan_err!(
+                "Only a hash partial aggregation of one grouping set with flat, non-dictionary keys can carry group hashes"
+            );
+        }
+        if aggregate_hash_table::carries_group_hash(&self.schema) {
+            return Ok(self);
+        }
+        let num_keys = self.group_by().expr().len();
+        let keys: Vec<usize> = (0..num_keys).collect();
+        let mut fields = self.schema.fields().to_vec();
+        fields.push(Arc::new(
+            datafusion_physical_expr_common::group_hash::group_hash_field(&keys),
+        ));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        let mut carried = AggregateExec::try_new_with_schema(
+            self.mode,
+            Arc::clone(self.group_by()),
+            self.aggr_expr().to_vec(),
+            self.clone_filter_exprs(),
+            Arc::clone(&self.input),
+            Arc::clone(&self.input_schema),
+            schema,
+        )?;
+        carried.dynamic_filter.clone_from(&self.dynamic_filter);
+        Ok(carried)
+    }
+
+    /// True if [`Self::with_group_hash`] accepts this aggregation.
+    pub fn can_carry_group_hash(&self) -> Result<bool> {
+        let flat_keys = self
+            .group_by()
+            .group_schema(&self.input.schema())?
+            .fields()
+            .iter()
+            .all(|field| {
+                let data_type = field.data_type();
+                !data_type.is_nested() && !matches!(data_type, DataType::Dictionary(..))
+            });
+        Ok(self.mode == AggregateMode::Partial
+            && matches!(self.kind, AggregateKind::General { .. })
+            && self.group_by().is_single()
+            && !self.group_by().expr().is_empty()
+            && self.group_clustering_mode == GroupClusteringMode::None
+            && flat_keys)
+    }
+
+    /// True if this final aggregation can read the group hashes of an input
+    /// built with [`Self::with_group_hash`].
+    pub fn can_read_group_hash(&self) -> bool {
+        matches!(
+            self.mode,
+            AggregateMode::Final | AggregateMode::FinalPartitioned
+        ) && matches!(self.kind, AggregateKind::General { .. })
+            && self.group_by().is_single()
+            && self.group_clustering_mode == GroupClusteringMode::None
+    }
+
+    /// True if this aggregation emits or reads group hashes, see
+    /// [`Self::with_group_hash`].
+    pub fn carries_group_hash(&self) -> bool {
+        match self.mode {
+            AggregateMode::Partial => {
+                aggregate_hash_table::carries_group_hash(&self.schema)
+            }
+            AggregateMode::Final | AggregateMode::FinalPartitioned => {
+                aggregate_hash_table::carries_group_hash(&self.input.schema())
+            }
+            _ => false,
+        }
+    }
+
     /// Set a legacy limit hint. Unsupported requests leave ordinary aggregation.
     #[deprecated(
         since = "56.0.0",
@@ -1332,6 +1420,24 @@ impl AggregateExec {
         partition: usize,
         context: &Arc<TaskContext>,
     ) -> Result<StreamType> {
+        // Group hashes are emitted by the hash partial stream and read by the
+        // hash final stream only.
+        if self.carries_group_hash()
+            && (!context
+                .session_config()
+                .options()
+                .execution
+                .enable_migration_aggregate
+                || self.group_clustering_mode != GroupClusteringMode::None
+                || !self.group_by().is_single()
+                || !matches!(self.kind, AggregateKind::General { .. }))
+        {
+            return internal_err!(
+                "{:?} aggregation that carries group hashes needs the hash aggregation streams",
+                self.mode
+            );
+        }
+
         if self.group_by().is_true_no_grouping() {
             return Ok(StreamType::AggregateStream(AggregateStream::new(
                 self, context, partition,
@@ -2019,6 +2125,9 @@ impl DisplayAs for AggregateExec {
                 write!(f, ", aggr=[{}]", a.join(", "))?;
                 if let Some(config) = self.limit_options() {
                     write!(f, ", lim=[{}]", config.limit)?;
+                }
+                if self.carries_group_hash() {
+                    write!(f, ", group_hash")?;
                 }
 
                 if self.group_clustering_mode != GroupClusteringMode::None {

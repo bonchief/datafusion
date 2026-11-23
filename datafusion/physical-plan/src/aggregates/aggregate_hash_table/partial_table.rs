@@ -8,13 +8,17 @@ use std::sync::Arc;
 use crate::aggregates::group_values::{AccumulatorPhase, new_group_values};
 use crate::aggregates::order::GroupClustering;
 use crate::aggregates::{AggregateExec, evaluate_group_by};
+use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, assert_eq_or_internal_err};
+use datafusion_physical_expr_common::group_hash::GroupHash;
 
 use super::common::{
     AggregateHashTable, AggregateHashTableBuffer, AggregateHashTableState,
-    HashAggregateAccumulator, PartialMarker, PartialSkipMarker,
+    HashAggregateAccumulator, PartialMarker, PartialSkipMarker, RowHashes,
+    carries_group_hash,
 };
 
 /// Implementation specific to partial aggregation, where the table stores
@@ -90,6 +94,7 @@ impl AggregateHashTable<PartialMarker> {
             }),
             recycle_buffer: false,
             recycled_buffer: None,
+            row_hashes: RowHashes::new(&self.input_schema, &[&self.output_schema]),
             _mode: PhantomData,
         })
     }
@@ -130,6 +135,15 @@ impl AggregateHashTable<PartialSkipMarker> {
             "group_values expected to have single element"
         );
         let mut output = grouping_set_args.into_iter().next().unwrap_or_default();
+        // The keys' hashes go downstream with the states, as the table's own
+        // groups do: see `RowHashes`.
+        let hashes = if carries_group_hash(&self.output_schema) {
+            let mut hashes = vec![0; batch.num_rows()];
+            create_hashes(&output, &GroupHash::STATE, &mut hashes)?;
+            Some(hashes)
+        } else {
+            None
+        };
 
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         for (idx, acc) in state.accumulators.iter_mut().enumerate() {
@@ -143,6 +157,9 @@ impl AggregateHashTable<PartialSkipMarker> {
                 AccumulatorPhase::ConvertToState,
                 || acc.convert_to_state(&values),
             )?);
+        }
+        if let Some(hashes) = hashes {
+            output.push(Arc::new(UInt64Array::from(hashes)));
         }
 
         Ok(RecordBatch::try_new(

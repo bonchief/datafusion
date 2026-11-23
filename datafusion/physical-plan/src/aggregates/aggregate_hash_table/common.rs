@@ -8,16 +8,18 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, new_empty_array, new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow::compute::{filter_record_batch, prep_null_mask_filter};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{SchemaRef, UInt64Type};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{AggregateMetrics, EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion_physical_expr_common::group_hash::{GroupHash, group_hash_keys};
 use log::debug;
 
 use crate::PhysicalExpr;
@@ -131,7 +133,110 @@ pub(in crate::aggregates) struct AggregateHashTable<AggrMode> {
     pub(super) recycle_buffer: bool,
     pub(super) recycled_buffer: Option<AggregateHashTableBuffer>,
 
+    /// Where the [`GroupHash`] of each input row comes from.
+    pub(super) row_hashes: RowHashes,
+
     pub(super) _mode: PhantomData<AggrMode>,
+}
+
+/// Where a table takes the [`GroupHash`] of each input row from, decided by
+/// its schemas: a table whose input ends with a group hash column (see
+/// [`group_hash_keys`]) interns with those hashes; a table that emits such a
+/// column but does not read one hashes its group keys itself, once, and the
+/// hashes leave with the groups. See `AggregateExec::with_group_hash`.
+#[derive(Debug)]
+pub(in crate::aggregates) enum RowHashes {
+    /// The table neither reads nor emits group hashes.
+    None,
+    /// The last column of every input batch holds the rows' group hashes.
+    Read,
+    /// The table hashes the group keys of its input with [`GroupHash::STATE`]
+    /// into this buffer.
+    Compute(Vec<u64>),
+}
+
+impl RowHashes {
+    pub(super) fn new(input_schema: &SchemaRef, output_schemas: &[&SchemaRef]) -> Self {
+        if carries_group_hash(input_schema) {
+            Self::Read
+        } else if output_schemas
+            .iter()
+            .any(|schema| carries_group_hash(schema))
+        {
+            Self::Compute(Vec::new())
+        } else {
+            Self::None
+        }
+    }
+
+    /// Interns `cols`, the group keys of the rows of `batch`, with their
+    /// group hashes if the table has them.
+    fn intern(
+        &mut self,
+        batch: &RecordBatch,
+        cols: &[ArrayRef],
+        group_values: &mut dyn GroupValues,
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        match self {
+            Self::None => group_values.intern(cols, groups),
+            Self::Read => {
+                group_values.intern_hashed(cols, carried_column(batch)?, groups)
+            }
+            Self::Compute(hashes) => {
+                hashes.clear();
+                hashes.resize(batch.num_rows(), 0);
+                create_hashes(cols, &GroupHash::STATE, hashes)?;
+                group_values.intern_hashed(cols, hashes, groups)
+            }
+        }
+    }
+}
+
+/// True if the last column of `schema` carries group hashes.
+pub(in crate::aggregates) fn carries_group_hash(schema: &SchemaRef) -> bool {
+    schema
+        .fields()
+        .last()
+        .is_some_and(|field| group_hash_keys(field).is_some())
+}
+
+/// The group hashes in the last column of `batch`.
+fn carried_column(batch: &RecordBatch) -> Result<&[u64]> {
+    match batch
+        .columns()
+        .last()
+        .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+    {
+        Some(hashes) if hashes.null_count() == 0 => Ok(hashes.values()),
+        _ => internal_err!("Aggregation input has no group hash column"),
+    }
+}
+
+/// Appends the group hash column to `columns` if `schema` ends with one.
+/// `columns` starts with the group keys that `group_values` just emitted,
+/// `num_keys` of them; their hashes come from `group_values` if it kept
+/// them, or are computed from the keys otherwise.
+pub(in crate::aggregates) fn push_group_hashes(
+    schema: &SchemaRef,
+    group_values: &mut dyn GroupValues,
+    num_keys: usize,
+    columns: &mut Vec<ArrayRef>,
+) -> Result<()> {
+    if !carries_group_hash(schema) {
+        return Ok(());
+    }
+    let hashes = match group_values.emit_hashes() {
+        Some(hashes) => hashes,
+        None => {
+            let keys = &columns[..num_keys];
+            let mut hashes = vec![0; keys.first().map_or(0, |key| key.len())];
+            create_hashes(keys, &GroupHash::STATE, &mut hashes)?;
+            hashes
+        }
+    };
+    columns.push(Arc::new(UInt64Array::from(hashes)));
+    Ok(())
 }
 
 /// Methods shared by all aggregate hash table modes.
@@ -204,6 +309,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 
         let group_schema = agg.group_by().group_schema(&input_schema)?;
         let group_values = new_group_values(group_schema, &GroupClustering::None)?;
+        let row_hashes = RowHashes::new(&input_schema, &[&output_schema, &state_schema]);
 
         Ok(Self {
             group_by_metrics: metrics.group_by,
@@ -222,6 +328,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
             }),
             recycle_buffer: false,
             recycled_buffer: None,
+            row_hashes,
             _mode: PhantomData,
         })
     }
@@ -273,11 +380,15 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
 
+        let row_hashes = &mut self.row_hashes;
         for group_values in &evaluated_batch.grouping_set_args {
             group_by_metrics.time_group_key_preparation(|| {
-                state
-                    .group_values
-                    .intern(group_values, &mut state.batch_group_indices)
+                row_hashes.intern(
+                    batch,
+                    group_values,
+                    state.group_values.as_mut(),
+                    &mut state.batch_group_indices,
+                )
             })?;
 
             // Register groups from the full input. Each filtered aggregate compacts
@@ -332,6 +443,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                     let emit_to = EmitTo::All;
                     let columns = self.group_by_metrics.time_emitting(|| {
                         let mut columns = state.group_values.emit(emit_to)?;
+                        let num_keys = columns.len();
                         for (idx, acc) in state.accumulators.iter_mut().enumerate() {
                             columns.extend(accumulator_metrics.time(
                                 idx,
@@ -339,6 +451,12 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                                 || materialize_accumulator_fn(acc, emit_to),
                             )?);
                         }
+                        push_group_hashes(
+                            &output_schema,
+                            state.group_values.as_mut(),
+                            num_keys,
+                            &mut columns,
+                        )?;
                         Ok::<_, datafusion_common::DataFusionError>(columns)
                     })?;
 
@@ -457,6 +575,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
             } else {
                 state.group_values.emit(EmitTo::All)?
             };
+            let num_keys = output.len();
             for (idx, acc) in state.accumulators.iter_mut().enumerate() {
                 output.extend(accumulator_metrics.time(
                     idx,
@@ -464,6 +583,12 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                     || acc.state(EmitTo::All),
                 )?);
             }
+            push_group_hashes(
+                &state_schema,
+                state.group_values.as_mut(),
+                num_keys,
+                &mut output,
+            )?;
             Ok::<_, datafusion_common::DataFusionError>(output)
         })?;
 

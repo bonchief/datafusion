@@ -86,7 +86,7 @@ impl AggregateTableMetrics {
 
 pub(super) use common::{
     AggregateHashTable, FinalMarker, PartialMarker, PartialReduceMarker,
-    PartialSkipMarker, SingleMarker, create_group_accumulator,
+    PartialSkipMarker, SingleMarker, carries_group_hash, create_group_accumulator,
 };
 pub(super) use common_clustered::{
     ClusteredAggregateTable, ClusteredAggregateTableMetrics,
