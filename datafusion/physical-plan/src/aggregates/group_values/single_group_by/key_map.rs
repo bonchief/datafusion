@@ -12,7 +12,6 @@ use std::mem;
 use arrow::array::ArrowNativeTypeOp;
 use arrow::buffer::NullBuffer;
 use datafusion_common::hash_utils::RandomState;
-use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr_common::prefetch::{DISTANCE, l2_cache_bytes};
@@ -43,9 +42,13 @@ type Slot<K> = (usize, K);
 /// # Tables
 ///
 /// Each table entry holds `(group, key)` under the key's hash, so a probe
-/// compares the key in the entry it has already loaded and never reads
-/// `values` (apache/datafusion#25247). Growth hashes the stored keys again,
+/// compares the key in the entry it has already loaded and reads nothing
+/// else (apache/datafusion#25247). Growth hashes the stored keys again,
 /// which for a fixed-width key is cheaper than a wider entry with the hash.
+///
+/// The entries are the only copy of the keys: there is no vector of keys by
+/// group id beside them. An emit, the only reader of keys by group id,
+/// visits the table once and writes each key to its group's position.
 ///
 /// The map starts in hashbrown's table, probed one row at a time. Once that
 /// table outgrows one core's share of L2 ([`l2_cache_bytes`]) it moves, once,
@@ -75,8 +78,8 @@ pub(crate) struct KeyMap<K: GroupKey> {
     pub(super) table: Option<Box<Table<Slot<K>>>>,
     /// The group id of the null key, if any
     pub(super) null_group: Option<usize>,
-    /// The key of each group id
-    pub(super) values: Vec<K>,
+    /// Number of groups, the null group included
+    groups: usize,
     /// Hashes of the batch probed in stages
     pub(super) hashes: Vec<u64>,
     random_state: RandomState,
@@ -88,7 +91,7 @@ impl<K: GroupKey> KeyMap<K> {
             map: HashTable::with_capacity(capacity),
             table: None,
             null_group: None,
-            values: Vec::with_capacity(capacity),
+            groups: 0,
             hashes: Vec::new(),
             random_state,
         }
@@ -129,9 +132,8 @@ impl<K: GroupKey> KeyMap<K> {
         for (row, key) in keys.iter().enumerate() {
             let group = if nulls.is_some_and(|nulls| nulls.is_null(row)) {
                 *self.null_group.get_or_insert_with(|| {
-                    let group = self.values.len();
-                    self.values.push(K::default());
-                    group
+                    self.groups += 1;
+                    self.groups - 1
                 })
             } else {
                 // Fold equivalence-class duplicates (e.g. `-0.0` → `+0.0`)
@@ -145,9 +147,9 @@ impl<K: GroupKey> KeyMap<K> {
                 match entry {
                     hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
                     hashbrown::hash_table::Entry::Vacant(v) => {
-                        let group = self.values.len();
+                        let group = self.groups;
                         v.insert((group, key));
-                        self.values.push(key);
+                        self.groups += 1;
                         group
                     }
                 }
@@ -183,19 +185,18 @@ impl<K: GroupKey> KeyMap<K> {
             }
             let group = if nulls.is_some_and(|nulls| nulls.is_null(row)) {
                 *self.null_group.get_or_insert_with(|| {
-                    let group = self.values.len();
-                    self.values.push(K::default());
-                    group
+                    self.groups += 1;
+                    self.groups - 1
                 })
             } else {
                 let key = key.normalize_key();
                 match table.find(hash, |&(_, k)| k.same(key)) {
                     Ok(bucket) => table.entry(bucket).0,
                     Err(vacant) => {
-                        let group = self.values.len();
+                        let group = self.groups;
                         let bucket = table.room(hash, vacant, Self::hash_of(state));
                         table.put(bucket, hash, (group, key));
-                        self.values.push(key);
+                        self.groups += 1;
                         group
                     }
                 }
@@ -220,29 +221,32 @@ impl<K: GroupKey> KeyMap<K> {
                 Self::hash_of(&self.random_state),
             ),
         }
-        self.values
-            .reserve_exact(capacity.saturating_sub(self.values.len()));
     }
 
-    /// Bytes held by the tables, the keys and the scratch hashes.
+    /// Bytes held by the tables, which hold the keys, and the scratch hashes.
     pub(crate) fn size(&self) -> usize {
         self.map.allocation_size()
             + self.table.as_ref().map_or(0, |table| {
                 size_of::<Table<Slot<K>>>() + table.allocation_size()
             })
-            + self.values.allocated_size()
             + self.hashes.allocated_size()
     }
 
     /// Number of groups, the null group included.
     pub(crate) fn len(&self) -> usize {
-        self.values.len()
+        self.groups
     }
 
     /// The key of each group, in group id order; the null group's is the
-    /// default key.
-    pub(crate) fn values(&self) -> &[K] {
-        &self.values
+    /// default key. It visits every entry of the table.
+    pub(crate) fn values(&self) -> Vec<K> {
+        let mut keys = vec![K::default(); self.groups];
+        let mut place = |&(group, key): &Slot<K>| keys[group] = key;
+        match &self.table {
+            Some(table) => table.iter().for_each(&mut place),
+            None => self.map.iter().for_each(&mut place),
+        }
+        keys
     }
 
     /// The group id of the null key, if any.
@@ -256,20 +260,27 @@ impl<K: GroupKey> KeyMap<K> {
     pub(crate) fn emit(&mut self, emit_to: EmitTo) -> (Vec<K>, Option<usize>) {
         match emit_to {
             EmitTo::All => {
+                let keys = self.values();
                 self.map.clear();
                 if let Some(table) = &mut self.table {
                     table.clear();
                 }
-                (mem::take(&mut self.values), self.null_group.take())
+                self.groups = 0;
+                (keys, self.null_group.take())
             }
             EmitTo::First(n) => {
-                // Decrement group index by n, removing those below it
+                // Take the keys of the groups below n and decrement the
+                // others' ids by n.
+                let mut keys = vec![K::default(); n];
                 let shift = |entry: &mut Slot<K>| match entry.0.checked_sub(n) {
                     Some(sub) => {
                         entry.0 = sub;
                         true
                     }
-                    None => false,
+                    None => {
+                        keys[entry.0] = entry.1;
+                        false
+                    }
                 };
                 match &mut self.table {
                     Some(table) => table.retain(shift, Self::hash_of(&self.random_state)),
@@ -283,7 +294,8 @@ impl<K: GroupKey> KeyMap<K> {
                     Some(_) => self.null_group.take(),
                     None => None,
                 };
-                (split_vec_min_alloc(&mut self.values, n), null_group)
+                self.groups -= n;
+                (keys, null_group)
             }
         }
     }
@@ -309,7 +321,6 @@ impl<K: GroupKey> KeyMap<K> {
             }
             None => self.map.shrink_to_fit(Self::hash_of(state)),
         }
-        self.values.shrink_to_fit();
         self.hashes = Vec::new();
     }
 
@@ -317,8 +328,7 @@ impl<K: GroupKey> KeyMap<K> {
     /// table if that is still past the gate, as `take_with_capacity` does for
     /// byte keys, and in hashbrown's table otherwise.
     pub(crate) fn clear_shrink(&mut self, capacity: usize) {
-        self.values.clear();
-        self.values.shrink_to(capacity);
+        self.groups = 0;
         self.null_group = None;
         self.map.clear();
         match self.table.take() {
@@ -385,7 +395,7 @@ mod tests {
             all.extend_from_slice(&groups);
         }
         assert_eq!(map.is_staged(), staged);
-        (all, map.values().to_vec())
+        (all, map.values())
     }
 
     #[test]
@@ -447,5 +457,33 @@ mod tests {
         big.intern(&keys, None, &mut groups);
         assert_eq!(groups, (0..8192).collect::<Vec<_>>());
         assert_eq!(big.values(), small.values());
+    }
+
+    /// A map that outgrows the gate in hashbrown's table moves, at the next
+    /// batch, to a prefetchable table of the same bucket count: its size
+    /// grows by no more than the table's header and the batch's hashes.
+    #[cfg(not(feature = "force_hash_collisions"))]
+    #[test]
+    fn moving_at_the_gate_keeps_the_bucket_count() {
+        let mut map = KeyMap::<i64>::new(0, RandomState::with_seed(7));
+        let mut groups = vec![];
+        let mut next = 0i64;
+        while map.map.allocation_size() <= l2_cache_bytes() {
+            let keys = (next..next + 4096).collect::<Vec<_>>();
+            map.intern(&keys, None, &mut groups);
+            next += 4096;
+        }
+        assert!(!map.is_staged());
+        let (before, capacity) = (map.size(), map.map.capacity());
+        map.intern(&[0], None, &mut groups);
+        assert!(map.is_staged());
+        assert_eq!(groups, [0]);
+        let table = map.table.as_ref().unwrap();
+        assert_eq!(table.capacity(), capacity);
+        let after = map.size() - map.hashes.allocated_size();
+        assert!(
+            after <= before + size_of::<Table<Slot<i64>>>(),
+            "{before} -> {after}"
+        );
     }
 }
