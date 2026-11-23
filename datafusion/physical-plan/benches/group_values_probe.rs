@@ -28,8 +28,11 @@
 //! - `PROBE_MAX_TOTAL`: skip a case whose tables and inputs together would
 //!   exceed this many bytes, default 24 GiB
 //! - `PROBE_ROWS`: rows timed per case and table, at least, default 4 Mi
-//! - `PROBE_ONLY`: comma separated workloads to run (`Flush`, `New`, `Grow`,
-//!   `Half`, `Skewed`), default all
+//! - `PROBE_ONLY`: comma separated workloads to run (`Flush`, `Emit`, `New`,
+//!   `Grow`, `Half`, `Skewed`), default all
+//! - `PROBE_EMIT_GROUPS`: comma separated group counts of the `Emit` case,
+//!   which times `emit(EmitTo::All)` of a full table, default
+//!   `8192,262144,16777216`
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -38,6 +41,7 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, Int16Array, Int32Array, Int64Array, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::instant::Instant;
+use datafusion_expr::EmitTo;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
@@ -301,6 +305,26 @@ fn flush_case(keys: Keys, seed: u64) -> (Duration, usize, usize) {
     (start.elapsed(), rows, size)
 }
 
+/// A table of `groups` distinct keys, interned untimed, then emitted whole:
+/// the time of `emit(EmitTo::All)`, per group.
+fn emit_case(keys: Keys, groups: usize, seed: u64) -> (Duration, usize, usize) {
+    let ids = (0..groups as u64)
+        .map(|id| id.wrapping_add(seed << 40))
+        .collect::<Vec<_>>();
+    let mut values = table(keys);
+    let mut ids_out = vec![];
+    for batch in batches(keys, &ids, BATCH) {
+        intern(values.as_mut(), &batch, &mut ids_out);
+    }
+    let size = values.size();
+    let start = Instant::now();
+    match values.emit(EmitTo::All) {
+        Ok(emitted) => black_box(emitted),
+        Err(error) => panic!("emit: {error}"),
+    };
+    (start.elapsed(), groups, size)
+}
+
 /// Runs `run` on `tables` threads at once and prints the mean ns per row.
 fn report(
     label: &str,
@@ -345,13 +369,18 @@ fn main() {
         .collect::<Vec<_>>();
     let max_bytes = env("PROBE_MAX_BYTES", 256 * MIB);
     let max_total = env("PROBE_MAX_TOTAL", 24 * GIB);
+    let emit_groups = std::env::var("PROBE_EMIT_GROUPS")
+        .unwrap_or_else(|_| "8192,262144,16777216".to_string())
+        .split(',')
+        .filter_map(|count| count.trim().parse::<usize>().ok())
+        .collect::<Vec<_>>();
 
     let mut sizes = std::iter::successors(Some(64 * KIB), |size| Some(size * 4))
         .take_while(|size| *size <= max_bytes)
         .chain(std::iter::once(max_bytes))
         .collect::<Vec<_>>();
     sizes.dedup();
-    // Only the workloads named here (Flush, New, Grow, Half, Skewed), if set.
+    // Only the workloads named here (Flush, Emit, New, Grow, Half, Skewed), if set.
     let only = std::env::var("PROBE_ONLY").ok();
     let wanted = |name: &str| {
         only.as_ref()
@@ -366,6 +395,16 @@ fn main() {
                 tables,
                 |seed| flush_case(keys, seed),
             );
+        }
+        for &groups in emit_groups.iter().filter(|_| wanted("Emit")) {
+            for &tables in &threads {
+                let label = format!("{keys:?},{groups},Emit,{groups}");
+                if tables * groups * 2 * keys.per_group() > max_total {
+                    println!("{label},{tables},skipped,skipped");
+                    continue;
+                }
+                report(&label, tables, |seed| emit_case(keys, groups, seed));
+            }
         }
         for &size in &sizes {
             let groups = (size / keys.per_group()).max(64);
