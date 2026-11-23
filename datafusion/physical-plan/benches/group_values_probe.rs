@@ -28,8 +28,8 @@
 //! - `PROBE_MAX_TOTAL`: skip a case whose tables and inputs together would
 //!   exceed this many bytes, default 24 GiB
 //! - `PROBE_ROWS`: rows timed per case and table, at least, default 4 Mi
-//! - `PROBE_ONLY`: comma separated workloads to run (`Flush`, `New`, `Half`,
-//!   `Skewed`), default all
+//! - `PROBE_ONLY`: comma separated workloads to run (`Flush`, `New`, `Grow`,
+//!   `Half`, `Skewed`), default all
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -56,6 +56,10 @@ enum Workload {
     /// Every row is a key the table has not seen, into a table reserved for
     /// them: a miss and an insert per row.
     New,
+    /// Every row is a key the table has not seen, into a table that starts
+    /// empty and grows, as a final aggregate's table fills: the time
+    /// includes each growth.
+    Grow,
     /// Half the rows are keys the table holds, drawn uniformly, and half are
     /// new keys.
     Half,
@@ -218,7 +222,7 @@ fn case(
     while rows < target {
         let held = (0..groups as u64).map(|id| base + id).collect::<Vec<_>>();
         let (prefill, probe) = match workload {
-            Workload::New => (vec![], held),
+            Workload::New | Workload::Grow => (vec![], held),
             Workload::Half => {
                 let probe = (0..groups as u64)
                     .map(|n| {
@@ -251,7 +255,7 @@ fn case(
         let added = match workload {
             Workload::New => groups,
             Workload::Half => groups / 2 + 1,
-            Workload::Skewed => 0,
+            Workload::Skewed | Workload::Grow => 0,
         };
         values.reserve_groups(values.len() + added);
         let probe = batches(keys, &probe, BATCH);
@@ -347,7 +351,7 @@ fn main() {
         .chain(std::iter::once(max_bytes))
         .collect::<Vec<_>>();
     sizes.dedup();
-    // Only the workloads named here (Flush, New, Half, Skewed), if set.
+    // Only the workloads named here (Flush, New, Grow, Half, Skewed), if set.
     let only = std::env::var("PROBE_ONLY").ok();
     let wanted = |name: &str| {
         only.as_ref()
@@ -365,9 +369,14 @@ fn main() {
         }
         for &size in &sizes {
             let groups = (size / keys.per_group()).max(64);
-            for workload in [Workload::New, Workload::Half, Workload::Skewed]
-                .into_iter()
-                .filter(|workload| wanted(&format!("{workload:?}")))
+            for workload in [
+                Workload::New,
+                Workload::Grow,
+                Workload::Half,
+                Workload::Skewed,
+            ]
+            .into_iter()
+            .filter(|workload| wanted(&format!("{workload:?}")))
             {
                 for &tables in &threads {
                     let label = format!("{keys:?},{size},{workload:?},{groups}");
