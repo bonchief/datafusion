@@ -21,6 +21,7 @@ use datafusion_physical_expr_common::group_hash::GroupHash;
 use futures::StreamExt;
 
 use super::aggregate_hash_table::carries_group_hash;
+use super::bucketed_aggregation::is_fixed_width;
 use crate::SendableRecordBatchStream;
 use crate::metrics;
 use crate::spill::gc_view_arrays;
@@ -32,6 +33,11 @@ use crate::stream::RecordBatchStreamAdapter;
 /// buckets.
 pub(super) const MIN_FANOUT_BITS: u32 = 4;
 pub(super) const MAX_FANOUT_BITS: u32 = 10;
+
+/// Hash bits the first split of fixed-width rows reads: 64 buckets, few
+/// enough that each bucket's slice of a routed batch is worth a copy into its
+/// coalescer. See [`FinalBuckets`].
+pub(super) const FIXED_WIDTH_BITS: u32 = 6;
 
 /// Hash bits a bucket that is split again reads, when that many are left.
 const SPLIT_BITS: u32 = 6;
@@ -58,8 +64,11 @@ pub(super) struct RouteMetrics {
 #[derive(Default)]
 struct Bucket {
     /// Rows routed here and not gathered yet: one slice of each routed
-    /// batch, sharing that batch's buffers
+    /// batch, sharing that batch's buffers. Empty if rows are coalesced.
     pending: Vec<RecordBatch>,
+    /// Gathers each routed slice into batches of the bucket's own while the
+    /// routed batch is in cache, if the rows are fixed width
+    coalescer: Option<BatchCoalescer>,
     /// Gathered rows, or the state a compaction left of them
     batches: VecDeque<RecordBatch>,
     /// Memory held by `batches`
@@ -98,6 +107,16 @@ struct Bucket {
 /// reach back into the batches the exchange sent. A bucket's slices are
 /// concatenated, in order, when the bucket is aggregated.
 ///
+/// Rows of fixed-width columns only take a second route: each bucket's
+/// slice is copied into a [`BatchCoalescer`] of its own while the routed
+/// batch is in cache, and they are split into at most
+/// [`FIXED_WIDTH_BITS`] buckets. Concatenating a bucket's slices when it is
+/// aggregated costs a fixed amount per slice, which a string's bytes
+/// amortise and a fixed-width row does not: on ClickBench Q32 (10 M groups of
+/// two integers) at 8 partitions, slices of about 64 rows from 128 buckets
+/// made the final 1.23x slower than the coalesced route, and 64 buckets
+/// 1.07x. A coalescer, in turn, would copy a string's bytes a second time.
+///
 /// # Memory pressure
 ///
 /// Routed batches are charged at the bytes their rows reference. Under memory
@@ -127,6 +146,8 @@ pub(super) struct FinalBuckets {
     hashes: Vec<u64>,
     /// Reused for the counting sort of a routed batch's rows
     starts: Vec<u32>,
+    /// Every column is fixed width: buckets coalesce their rows as routed
+    coalesced: bool,
 }
 
 impl FinalBuckets {
@@ -141,18 +162,28 @@ impl FinalBuckets {
         metrics: RouteMetrics,
     ) -> Self {
         debug_assert!(bits > 0 && offset + bits <= GroupHash::BUCKET_BITS);
+        let coalesced = schema
+            .fields()
+            .iter()
+            .all(|field| is_fixed_width(field.data_type()));
+        let bucket = || Bucket {
+            coalescer: coalesced
+                .then(|| BatchCoalescer::new(Arc::clone(schema), batch_size)),
+            ..Default::default()
+        };
         Self {
             offset,
             bits,
             num_group_columns,
             carried: carries_group_hash(schema),
             routed_bytes: 0,
-            buckets: (0..1 << bits).map(|_| Bucket::default()).collect(),
+            buckets: (0..1 << bits).map(|_| bucket()).collect(),
             spill_manager,
             batch_size,
             metrics,
             hashes: vec![],
             starts: vec![],
+            coalesced,
         }
     }
 
@@ -229,11 +260,13 @@ impl FinalBuckets {
         let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
         let sorted =
             RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
-        self.routed_bytes += referenced_bytes(&sorted);
+        if !self.coalesced {
+            self.routed_bytes += referenced_bytes(&sorted);
+        }
         for (bucket, range) in self.buckets.iter_mut().zip(starts.windows(2)) {
             let (start, end) = (range[0] as usize, range[1] as usize);
             if end > start {
-                bucket.pending.push(sorted.slice(start, end - start));
+                bucket.append(sorted.slice(start, end - start))?;
             }
         }
         Ok(())
@@ -242,6 +275,12 @@ impl FinalBuckets {
     /// True if rows were routed since they were last gathered.
     pub(super) fn has_routed(&self) -> bool {
         self.routed_bytes > 0
+            || self.buckets.iter().any(|bucket| {
+                bucket
+                    .coalescer
+                    .as_ref()
+                    .is_some_and(|coalescer| coalescer.get_buffered_rows() > 0)
+            })
     }
 
     /// Gathers the routed rows of every bucket into batches that own their
@@ -253,6 +292,7 @@ impl FinalBuckets {
         }
         let _timer = self.metrics.move_time.timer();
         for bucket in &mut self.buckets {
+            bucket.flush()?;
             let pending = std::mem::take(&mut bucket.pending);
             for batch in concat_pieces(pending, self.batch_size) {
                 bucket.push(gc_view_arrays(&batch?)?)?;
@@ -336,7 +376,10 @@ impl FinalBuckets {
             + self
                 .buckets
                 .iter()
-                .map(|bucket| bucket.batches_bytes)
+                .map(|bucket| {
+                    bucket.batches_bytes
+                        + bucket.coalescer.as_ref().map_or(0, BatchCoalescer::size)
+                })
                 .sum::<usize>()
             + self.hashes.capacity() * size_of::<u64>()
             + self.starts.capacity() * size_of::<u32>()
@@ -353,6 +396,10 @@ impl FinalBuckets {
     pub(super) fn into_sources(mut self) -> Result<(Vec<BucketSource>, usize)> {
         // A spilled bucket's routed rows go to its file first
         for bucket in &mut self.buckets {
+            {
+                let _timer = self.metrics.move_time.timer();
+                bucket.flush()?;
+            }
             if bucket.spill_file.is_some() && !bucket.pending.is_empty() {
                 let _timer = self.metrics.move_time.timer();
                 let pending = std::mem::take(&mut bucket.pending);
@@ -391,6 +438,40 @@ impl FinalBuckets {
 }
 
 impl Bucket {
+    /// Adds a routed slice: through the coalescer, if any, or as pending.
+    fn append(&mut self, slice: RecordBatch) -> Result<()> {
+        match &mut self.coalescer {
+            Some(coalescer) => {
+                coalescer.push_batch(slice)?;
+                self.drain()
+            }
+            None => {
+                self.pending.push(slice);
+                Ok(())
+            }
+        }
+    }
+
+    /// Finishes the coalescer's partial batch, if any.
+    fn flush(&mut self) -> Result<()> {
+        if let Some(coalescer) = &mut self.coalescer {
+            coalescer.finish_buffered_batch()?;
+        }
+        self.drain()
+    }
+
+    /// Moves the coalescer's completed batches to where the bucket lives.
+    fn drain(&mut self) -> Result<()> {
+        while let Some(batch) = self
+            .coalescer
+            .as_mut()
+            .and_then(BatchCoalescer::next_completed_batch)
+        {
+            self.push(batch)?;
+        }
+        Ok(())
+    }
+
     /// Adds gathered rows to where the bucket lives: its spill file if it has
     /// been spilled, memory otherwise.
     fn push(&mut self, batch: RecordBatch) -> Result<()> {
@@ -640,7 +721,9 @@ fn coalesce_stream(
 mod tests {
     use super::*;
 
-    use arrow::array::{Int64Array, StringArray, StringViewArray, UInt64Array};
+    use arrow::array::{
+        BooleanArray, Int64Array, StringArray, StringViewArray, UInt64Array,
+    };
     use arrow::datatypes::{Field, Int64Type, Schema};
     use datafusion_physical_expr_common::group_hash::group_hash_field;
     use std::collections::HashMap;
@@ -776,6 +859,58 @@ mod tests {
             }
         }
         assert_eq!(seen, 5_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fixed_width_rows_are_coalesced_as_routed() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = |keys: std::ops::Range<i64>| {
+            let flags: BooleanArray = keys.clone().map(|k| Some(k % 2 == 0)).collect();
+            let values: Int64Array =
+                keys.clone().map(|k| k * 10).collect::<Vec<_>>().into();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.collect::<Vec<_>>())),
+                    Arc::new(flags),
+                    Arc::new(values),
+                ],
+            )
+        };
+        let mut buckets = FinalBuckets::new(
+            &schema,
+            1,
+            1024,
+            0,
+            FIXED_WIDTH_BITS,
+            None,
+            RouteMetrics::default(),
+        );
+        buckets.route(&batch(0..20_000)?)?;
+        // Rows wait in the coalescers, charged as memory, until gathered
+        assert!(buckets.has_routed());
+        assert!(buckets.memory_size() > 0);
+        buckets.gather()?;
+        assert!(!buckets.has_routed());
+        buckets.route(&batch(20_000..30_000)?)?;
+
+        let (sources, routed_bytes) = buckets.into_sources()?;
+        assert_eq!(routed_bytes, 0, "coalesced rows share no routed batch");
+        let rows = drain(sources, &schema).await?;
+        assert_eq!(rows.len(), 30_000);
+        let mut bucket_of_key: HashMap<i64, usize> = HashMap::new();
+        for (bucket, key, value) in rows {
+            assert_eq!(value, key * 10, "columns stay aligned");
+            assert!(
+                bucket_of_key.insert(key, bucket).is_none(),
+                "key {key} twice"
+            );
+        }
         Ok(())
     }
 

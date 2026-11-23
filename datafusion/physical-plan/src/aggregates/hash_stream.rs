@@ -907,6 +907,14 @@ impl FinalHashAggregateStream {
             if let Some(bucketing) = &self.bucketing
                 && !spilled
                 && bucketing.due(hash_table)
+                && !bucketing.grows(table_rows)
+            {
+                // The table keeps the rest of the input
+                self.bucketing = None;
+            }
+            if let Some(bucketing) = &self.bucketing
+                && !spilled
+                && bucketing.due(hash_table)
             {
                 let bits = bucketing.fanout_bits(hash_table.memory_size(), table_rows);
                 let mut new_buckets =

@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use super::AggregateExec;
 use super::aggregate_hash_table::{AggregateHashTable, FinalMarker};
 use super::final_buckets::{
-    FinalBuckets, MAX_FANOUT_BITS, MIN_FANOUT_BITS, RouteMetrics,
+    FIXED_WIDTH_BITS, FinalBuckets, MAX_FANOUT_BITS, MIN_FANOUT_BITS, RouteMetrics,
 };
 use crate::SendableRecordBatchStream;
 use crate::metrics;
@@ -88,6 +88,10 @@ impl BucketOutput {
     }
 }
 
+/// How many times its size a table that reached the byte trigger must be
+/// expected to grow to be split: see [`BucketedAggregation::grows`].
+const MIN_GROWTH: f64 = 2.0;
+
 /// When the hash table of one partition stops growing and is split into
 /// [`FinalBuckets`]. See [`BucketedAggregation::trigger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +103,7 @@ pub(super) enum BucketTrigger {
     Bytes(usize),
 }
 
-fn is_fixed_width(data_type: &DataType) -> bool {
+pub(super) fn is_fixed_width(data_type: &DataType) -> bool {
     data_type.is_primitive() || *data_type == DataType::Boolean
 }
 
@@ -224,8 +228,13 @@ impl BucketedAggregation {
     /// rows: enough buckets for the table the whole input is expected to
     /// build, if every further row were a new group, to come in pieces of
     /// about `piece_bytes`, and of at most half the trigger, so that buckets
-    /// are not split again. 64 buckets if the input's row count is unknown.
+    /// are not split again. 64 buckets if the input's row count is unknown,
+    /// and always [`FIXED_WIDTH_BITS`] for fixed-width rows, which take the
+    /// coalesced route (see [`FinalBuckets`]).
     pub(super) fn fanout_bits(&self, table_bytes: usize, table_rows: usize) -> u32 {
+        if matches!(self.trigger, BucketTrigger::Groups(_)) {
+            return FIXED_WIDTH_BITS;
+        }
         let Some(expected_rows) = self.expected_rows else {
             return 6;
         };
@@ -235,6 +244,33 @@ impl BucketedAggregation {
             .max(2.0 * growth)
             .max(1.0);
         (pieces.log2().ceil() as u32).clamp(MIN_FANOUT_BITS, MAX_FANOUT_BITS)
+    }
+
+    /// True if a table that reached the byte trigger after aggregating
+    /// `table_rows` input rows is expected to grow at least [`MIN_GROWTH`]
+    /// times past it, or if that cannot be told. A table that has taken most
+    /// of its input already gains little from buckets: its rows would be
+    /// moved once more to save misses on the few rows left (ClickBench Q12
+    /// and Q13 at 8 partitions split near their final size and ran 1.8–1.9x
+    /// slower). The group trigger of fixed-width rows keeps splitting as it
+    /// did before this rule.
+    pub(super) fn grows(&self, table_rows: usize) -> bool {
+        Self::expected_to_grow(self.trigger, self.expected_rows, table_rows)
+    }
+
+    /// See [`Self::grows`]: `expected_rows` are the input rows the table is
+    /// expected to take in all.
+    fn expected_to_grow(
+        trigger: BucketTrigger,
+        expected_rows: Option<usize>,
+        table_rows: usize,
+    ) -> bool {
+        match (trigger, expected_rows) {
+            (BucketTrigger::Bytes(_), Some(expected)) => {
+                expected as f64 >= MIN_GROWTH * table_rows as f64
+            }
+            _ => true,
+        }
     }
 
     /// Starts buckets that read `bits` bucket bits from `offset` with `state`,
@@ -542,5 +578,16 @@ mod tests {
             DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
         ]);
         assert_eq!(BucketedAggregation::trigger(&nested, 100, 1_000), None);
+    }
+
+    #[test]
+    fn a_byte_triggered_table_splits_only_if_expected_to_double() {
+        let grows = BucketedAggregation::expected_to_grow;
+        let bytes = BucketTrigger::Bytes(1_000);
+        assert!(!grows(bytes, Some(150), 100), "most of the input is in");
+        assert!(grows(bytes, Some(200), 100));
+        assert!(grows(bytes, None, 100), "unknown input keeps splitting");
+        // The group trigger of fixed-width rows splits as before
+        assert!(grows(BucketTrigger::Groups(100), Some(101), 100));
     }
 }
