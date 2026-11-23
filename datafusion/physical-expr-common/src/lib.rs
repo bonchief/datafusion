@@ -25,5 +25,6 @@ pub mod physical_expr;
 pub mod prefetch;
 pub mod regex;
 pub mod sort_expr;
+pub mod swiss_table;
 pub mod tree_node;
 pub mod utils;
