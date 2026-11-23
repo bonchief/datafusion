@@ -36,7 +36,13 @@ const HISTORY_WINDOWS: usize = 10;
 /// again, since its group goes downstream again: this is the share of rows the
 /// stream hands on. A stream skips when both the last window and a decayed
 /// history of earlier windows exceed `probe_ratio_threshold`, so one odd
-/// window neither starts nor stops skipping on its own.
+/// window neither starts nor stops skipping on its own. Before the stream has
+/// aggregated [`HISTORY_WINDOWS`] windows it skips only keys that barely
+/// repeat, with a ratio more than halfway from the threshold to 1: a key that
+/// reduces to near the threshold overall meets windows on both sides of it,
+/// and the first of them would otherwise decide for the stream. DuckDB
+/// likewise never skips lookups before a million input rows
+/// (`MIN_INPUT_ROWS_BEFORE_LOOKUP_SKIP`).
 ///
 /// The decision is never final. A skipping stream aggregates again after an
 /// interval of skipped rows and re-tests on a fresh window. Each re-test that
@@ -64,6 +70,9 @@ pub(super) struct SkipAggregationProbe {
     recent_rows: usize,
     recent_groups: usize,
 
+    /// Rows aggregated over all windows.
+    aggregated_rows: usize,
+
     /// Whether the stream currently converts rows instead of aggregating them.
     should_skip: bool,
     /// Rows skipped since skipping began.
@@ -88,6 +97,7 @@ impl SkipAggregationProbe {
             window_groups: 0,
             recent_rows: 0,
             recent_groups: 0,
+            aggregated_rows: 0,
             should_skip: false,
             skipped_rows: 0,
             retry_rows: Self::first_retry(probe_rows_threshold),
@@ -120,10 +130,17 @@ impl SkipAggregationProbe {
         }
         self.recent_rows += self.window_rows;
         self.recent_groups += self.window_groups;
+        self.aggregated_rows = self.aggregated_rows.saturating_add(self.window_rows);
         let ratio = |groups: usize, rows: usize| groups as f64 / rows as f64;
-        self.should_skip = ratio(self.window_groups, self.window_rows)
-            > self.probe_ratio_threshold
-            && ratio(self.recent_groups, self.recent_rows) > self.probe_ratio_threshold;
+        let threshold = self.probe_ratio_threshold;
+        let history = ratio(self.recent_groups, self.recent_rows);
+        // Until the history spans HISTORY_WINDOWS, only a ratio halfway from
+        // the threshold to 1 (keys that barely repeat) skips.
+        let settled = self.aggregated_rows
+            >= self.probe_rows_threshold.saturating_mul(HISTORY_WINDOWS);
+        self.should_skip = ratio(self.window_groups, self.window_rows) > threshold
+            && history > threshold
+            && (settled || history > (1.0 + threshold) / 2.0);
         self.window_rows = 0;
         self.window_groups = 0;
         if self.should_skip {
@@ -223,11 +240,11 @@ mod tests {
             ],
         )?;
 
-        // Batch 2: 360 rows with 360 unique NEW groups (starting from group 10)
-        // After batch 2, total: 460 rows, 370 groups
-        // Ratio: 370/460 is about 0.804 (80.4%) > 0.8 -> SHOULD decide to skip
-        let batch2_rows = 360;
-        let batch2_groups = 360;
+        // Batch 2: 1000 rows with 1000 unique NEW groups (starting from group 10)
+        // After batch 2, total: 1100 rows, 1010 groups, ten windows of history
+        // Ratio: 1010/1100 is about 0.918 > 0.8 -> SHOULD decide to skip
+        let batch2_rows = 1000;
+        let batch2_groups = 1000;
         let group_ids_batch2: Vec<i32> = (batch1_groups..(batch1_groups + batch2_groups))
             .map(|x| x as i32)
             .collect();
@@ -366,6 +383,19 @@ mod tests {
         probe.update_state(10, 10);
         assert!(probe.should_skip());
         assert!(skip(&mut probe, 100));
+    }
+
+    #[test]
+    fn test_skip_aggregation_probe_waits_for_history_near_the_threshold() {
+        let mut probe = SkipAggregationProbe::new(10, 0.5, metrics::Count::new());
+        // 0.6 is above the threshold but below 0.75, halfway to 1: no
+        // decision until ten windows of history.
+        for _ in 0..9 {
+            probe.update_state(10, 6);
+            assert!(!probe.should_skip());
+        }
+        probe.update_state(10, 6);
+        assert!(probe.should_skip());
     }
 
     #[test]
