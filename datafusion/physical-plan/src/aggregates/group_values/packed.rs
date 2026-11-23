@@ -47,9 +47,10 @@ use super::single_group_by::primitive::HashValue;
 /// all nulls of a column pack alike whatever their slot holds. Signed
 /// values are packed as their two's complement in their own width and
 /// sign-extended back. Floats are packed as the bits of
-/// [`HashValue::normalize_key`], which folds `-0.0` into `0.0` and every NaN
-/// into one, so they group and emit exactly as [`GroupValuesColumn`]'s
-/// float columns, which store normalized values.
+/// [`HashValue::normalize_key`], which folds `-0.0` into `0.0` and keeps
+/// every NaN payload, so NaNs with different payloads are different groups.
+/// They group and emit exactly as [`GroupValuesColumn`]'s float columns,
+/// which store the same normalized values.
 ///
 /// # Semantics
 ///
