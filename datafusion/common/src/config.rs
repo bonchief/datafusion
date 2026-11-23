@@ -1182,6 +1182,17 @@ config_namespace! {
         /// flush thresholds. String payload buffers use their normal growth policy.
         pub partial_aggregation_flush_batch: bool, default = false
 
+        /// (experimental) Cache budget, in bytes, for the table of
+        /// partial_aggregation_flush_batch. The table starts with room for
+        /// batch_size groups; after each flush, while the flushed table took at
+        /// most half of this budget, the next table holds twice as many groups,
+        /// so a table of narrow keys grows until it fills the cache it fits in
+        /// and catches more repeats of each key before they reach the final
+        /// aggregate. Set to 0 to use one core's share of its L2 cache, as
+        /// detected at run time; a budget below twice the first table's size
+        /// keeps every table at batch_size groups.
+        pub partial_aggregation_flush_batch_bytes: usize, default = 0
+
         /// Should DataFusion use row number estimates at the input to decide
         /// whether increasing parallelism is beneficial or not. By default,
         /// only exact row numbers (not estimates) are used for this decision.

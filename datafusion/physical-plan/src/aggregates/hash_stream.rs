@@ -214,10 +214,37 @@ struct PartialTableFlush {
     group_threshold: usize,
     /// Fixed group capacity reserved for batch-size flushing; zero disables.
     reserve_capacity: usize,
+    /// Batch-size flushing only: the table doubles its group threshold after a
+    /// flush while the flushed table took at most half of these bytes; zero
+    /// keeps the threshold fixed.
+    budget: usize,
+    /// Rows a single input batch can add, which every reserve leaves room for.
+    batch_size: usize,
     /// Previously emitted groups, included in the skip-partial reduction ratio.
     flushed_groups: usize,
     /// Number of emissions triggered by either size threshold.
     flush_count: metrics::Count,
+}
+
+impl PartialTableFlush {
+    /// Group capacity to reserve for the next table, given the bytes the full
+    /// table about to be flushed holds.
+    ///
+    /// A table of `group_threshold` groups that took at most half the budget
+    /// has its threshold doubled, so the next one, about twice the bytes,
+    /// still fits: a table of narrow keys grows to fill the cache while one of
+    /// wide keys stays at its first size. The threshold never shrinks, since
+    /// a refilled table keeps the capacity it already reserved.
+    fn grow(&mut self, bytes: usize) -> usize {
+        if self.reserve_capacity == 0 {
+            return 0;
+        }
+        if self.budget > 0 && bytes.saturating_mul(2) <= self.budget {
+            self.group_threshold = self.group_threshold.saturating_mul(2);
+            self.reserve_capacity = self.group_threshold.saturating_add(self.batch_size);
+        }
+        self.reserve_capacity
+    }
 }
 
 impl PartialHashAggregateStream {
@@ -272,6 +299,15 @@ impl PartialHashAggregateStream {
                 } else {
                     0
                 },
+                budget: if flush_batch {
+                    match execution_options.partial_aggregation_flush_batch_bytes {
+                        0 => datafusion_physical_expr_common::prefetch::l2_cache_bytes(),
+                        bytes => bytes,
+                    }
+                } else {
+                    0
+                },
+                batch_size,
                 flushed_groups: 0,
                 flush_count: MetricBuilder::new(&agg.metrics)
                     .counter("table_flush_count", partition),
@@ -369,11 +405,11 @@ impl PartialHashAggregateStream {
                     HandleInputResult::OOM | HandleInputResult::FlushThresholdReached => {
                         let reserve_capacity = self
                             .table_flush
-                            .as_ref()
+                            .as_mut()
                             .filter(|_| {
                                 last_state == HandleInputResult::FlushThresholdReached
                             })
-                            .map_or(0, |flush| flush.reserve_capacity);
+                            .map_or(0, |flush| flush.grow(hash_table.memory_size()));
                         let materialized_group_states = hash_table
                             .take_state_batch_with_capacity(reserve_capacity)?
                             .ok_or_else(|| {
