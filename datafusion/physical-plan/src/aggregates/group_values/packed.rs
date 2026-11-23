@@ -8,10 +8,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, BooleanBufferBuilder,
-    PrimitiveArray,
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, PrimitiveArray,
 };
-use arrow::buffer::{NullBuffer, ScalarBuffer};
+use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::ArrowNativeType;
 use arrow::datatypes::{
     DataType, Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType,
@@ -316,7 +315,9 @@ impl Packer {
     /// This column of `keys`, as an array.
     fn unpack<K: PackedKey>(&self, keys: &[K]) -> ArrayRef {
         let nulls = self.null_bit.map(|bit| {
-            NullBuffer::from_iter(keys.iter().map(|key| key.get(bit) & 1 == 0))
+            NullBuffer::new(BooleanBuffer::collect_bool(keys.len(), |row| {
+                keys[row].get(bit) & 1 == 0
+            }))
         });
         let nulls = nulls.filter(|nulls| nulls.null_count() > 0);
         match self.kind {
@@ -374,11 +375,10 @@ impl Packer {
             Kind::F32 => self.unpack_values::<Float32Type, K>(keys, nulls),
             Kind::F64 => self.unpack_values::<Float64Type, K>(keys, nulls),
             Kind::Bool => {
-                let mut values = BooleanBufferBuilder::new(keys.len());
-                for key in keys {
-                    values.append(key.get(self.shift) & 1 == 1);
-                }
-                Arc::new(BooleanArray::new(values.finish(), nulls))
+                let values = BooleanBuffer::collect_bool(keys.len(), |row| {
+                    keys[row].get(self.shift) & 1 == 1
+                });
+                Arc::new(BooleanArray::new(values, nulls))
             }
         }
     }
