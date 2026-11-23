@@ -220,9 +220,9 @@ mod spill;
 mod topk;
 
 /// Hard-coded seed for aggregations to ensure hash values differ from `RepartitionExec`, avoiding collisions.
+/// The byte maps of `physical-expr-common` use the same one.
 const AGGREGATION_HASH_SEED: datafusion_common::hash_utils::RandomState =
-    // This seed is chosen to be a large 64-bit number
-    datafusion_common::hash_utils::RandomState::with_seed(15395726432021054657);
+    datafusion_physical_expr_common::binary_map::AGGREGATION_HASH_SEED;
 
 /// Whether an aggregate stage consumes raw input data or intermediate
 /// accumulator state from a previous aggregation stage.
