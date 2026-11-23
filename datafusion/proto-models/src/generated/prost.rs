@@ -2448,6 +2448,10 @@ pub struct AggregateExecNode {
     /// Output schema preserved by physical optimizer rewrites.
     #[prost(message, optional, tag = "14")]
     pub schema: ::core::option::Option<super::datafusion_common::Schema>,
+    /// A partial carries its group hash as the last output column; a final reads
+    /// it from its input. See `AggregateExec::with_group_hash`.
+    #[prost(bool, tag = "15")]
+    pub carry_group_hash: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GlobalLimitExecNode {
@@ -2566,6 +2570,10 @@ pub struct RepartitionExecNode {
     pub partitioning: ::core::option::Option<Partitioning>,
     #[prost(bool, tag = "6")]
     pub preserve_order: bool,
+    /// Route by the group hash the input carries in its last column. See
+    /// `RepartitionExec::with_carried_group_hash`.
+    #[prost(bool, tag = "7")]
+    pub carried_group_hash: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Partitioning {

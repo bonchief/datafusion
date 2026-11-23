@@ -18,7 +18,6 @@ use datafusion_physical_expr_common::group_hash::GroupHash;
 use super::common::{
     AggregateHashTable, AggregateHashTableBuffer, AggregateHashTableState,
     HashAggregateAccumulator, PartialMarker, PartialSkipMarker, RowHashes,
-    carries_group_hash,
 };
 
 /// Implementation specific to partial aggregation, where the table stores
@@ -94,7 +93,12 @@ impl AggregateHashTable<PartialMarker> {
             }),
             recycle_buffer: false,
             recycled_buffer: None,
-            row_hashes: RowHashes::new(&self.input_schema, &[&self.output_schema]),
+            // The skip table emits what this table would have
+            row_hashes: if self.row_hashes.carries() {
+                RowHashes::Compute(Vec::new())
+            } else {
+                RowHashes::None
+            },
             _mode: PhantomData,
         })
     }
@@ -137,7 +141,7 @@ impl AggregateHashTable<PartialSkipMarker> {
         let mut output = grouping_set_args.into_iter().next().unwrap_or_default();
         // The keys' hashes go downstream with the states, as the table's own
         // groups do: see `RowHashes`.
-        let hashes = if carries_group_hash(&self.output_schema) {
+        let hashes = if self.row_hashes.carries() {
             let mut hashes = vec![0; batch.num_rows()];
             create_hashes(&output, &GroupHash::STATE, &mut hashes)?;
             Some(hashes)

@@ -19,7 +19,9 @@ use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{AggregateMetrics, EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion_physical_expr_common::group_hash::{GroupHash, group_hash_keys};
+use datafusion_physical_expr_common::group_hash::{
+    GroupHash, carries_first_keys, group_hash_keys,
+};
 use log::debug;
 
 use crate::PhysicalExpr;
@@ -140,10 +142,11 @@ pub(in crate::aggregates) struct AggregateHashTable<AggrMode> {
 }
 
 /// Where a table takes the [`GroupHash`] of each input row from, decided by
-/// its schemas: a table whose input ends with a group hash column (see
-/// [`group_hash_keys`]) interns with those hashes; a table that emits such a
-/// column but does not read one hashes its group keys itself, once, and the
-/// hashes leave with the groups. See `AggregateExec::with_group_hash`.
+/// its aggregation's plan (`AggregateExec::carries_group_hash`), never by a
+/// schema: a table of a final aggregation that reads the hashes interns with
+/// its input's last column; a table of a partial aggregation that carries
+/// them hashes its group keys itself, once, and the hashes leave with the
+/// groups. Any other table neither reads nor emits them.
 #[derive(Debug)]
 pub(in crate::aggregates) enum RowHashes {
     /// The table neither reads nor emits group hashes.
@@ -156,17 +159,30 @@ pub(in crate::aggregates) enum RowHashes {
 }
 
 impl RowHashes {
-    pub(super) fn new(input_schema: &SchemaRef, output_schemas: &[&SchemaRef]) -> Self {
-        if carries_group_hash(input_schema) {
-            Self::Read
-        } else if output_schemas
-            .iter()
-            .any(|schema| carries_group_hash(schema))
-        {
-            Self::Compute(Vec::new())
-        } else {
-            Self::None
+    /// The hashes of a table of `agg` over batches of `input_schema`.
+    /// Fails if `agg` reads hashes that `input_schema` does not carry for
+    /// exactly its group keys.
+    pub(super) fn new(agg: &AggregateExec, input_schema: &SchemaRef) -> Result<Self> {
+        if !agg.carries_group_hash() {
+            return Ok(Self::None);
         }
+        match agg.mode {
+            AggregateMode::Partial => Ok(Self::Compute(Vec::new())),
+            AggregateMode::Final | AggregateMode::FinalPartitioned
+                if carries_first_keys(input_schema, agg.group_by().expr().len()) =>
+            {
+                Ok(Self::Read)
+            }
+            mode => internal_err!(
+                "A {mode:?} aggregation cannot carry group hashes over its input"
+            ),
+        }
+    }
+
+    /// True if the table's state, and a partial table's output, carry the
+    /// group hashes.
+    pub(super) fn carries(&self) -> bool {
+        !matches!(self, Self::None)
     }
 
     /// Interns `cols`, the group keys of the rows of `batch`, with their
@@ -213,20 +229,26 @@ fn carried_column(batch: &RecordBatch) -> Result<&[u64]> {
     }
 }
 
-/// Appends the group hash column to `columns` if `schema` ends with one.
-/// `columns` starts with the group keys that `group_values` just emitted,
-/// `num_keys` of them; their hashes come from `group_values` if it kept
-/// them, or are computed from the keys otherwise.
+/// Appends the group hash column to `columns` if the table `carries` group
+/// hashes and `schema`, the schema of what it emits, ends with one: the
+/// state of a table that carries them does, the output of a final
+/// aggregation does not. `columns` starts with the group keys that
+/// `group_values` just emitted, `num_keys` of them; their hashes come from
+/// `group_values` if it kept them, or are computed from the keys otherwise.
+/// Hashes `group_values` kept for an emit that does not carry them are
+/// dropped.
 pub(in crate::aggregates) fn push_group_hashes(
+    carries: bool,
     schema: &SchemaRef,
     group_values: &mut dyn GroupValues,
     num_keys: usize,
     columns: &mut Vec<ArrayRef>,
 ) -> Result<()> {
-    if !carries_group_hash(schema) {
+    let kept = group_values.emit_hashes();
+    if !(carries && carries_group_hash(schema)) {
         return Ok(());
     }
-    let hashes = match group_values.emit_hashes() {
+    let hashes = match kept {
         Some(hashes) => hashes,
         None => {
             let keys = &columns[..num_keys];
@@ -309,7 +331,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 
         let group_schema = agg.group_by().group_schema(&input_schema)?;
         let group_values = new_group_values(group_schema, &GroupClustering::None)?;
-        let row_hashes = RowHashes::new(&input_schema, &[&output_schema, &state_schema]);
+        let row_hashes = RowHashes::new(agg, &input_schema)?;
 
         Ok(Self {
             group_by_metrics: metrics.group_by,
@@ -428,6 +450,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         accumulator_phase: AccumulatorPhase,
     ) -> Result<Option<RecordBatch>> {
         let output_schema = Arc::clone(&self.output_schema);
+        let carries = self.row_hashes.carries();
         let batch_size = self.batch_size;
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
 
@@ -452,6 +475,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                             )?);
                         }
                         push_group_hashes(
+                            carries,
                             &output_schema,
                             state.group_values.as_mut(),
                             num_keys,
@@ -562,6 +586,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         capacity: usize,
     ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
+        let carries = self.row_hashes.carries();
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
@@ -584,6 +609,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                 )?);
             }
             push_group_hashes(
+                carries,
                 &state_schema,
                 state.group_values.as_mut(),
                 num_keys,

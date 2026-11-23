@@ -895,6 +895,15 @@ pub struct AggregateExec {
     /// it remains `Some(..)` to enable dynamic filtering during aggregate execution;
     /// otherwise, it is cleared to `None`.
     dynamic_filter: Option<Arc<AggrDynFilter>>,
+    /// The plan says this aggregation carries the [`GroupHash`] of its group
+    /// keys: a partial one appends it to its output as its last column
+    /// ([`Self::with_group_hash`]), a final one reads it from its input's
+    /// last column ([`Self::with_read_group_hash`]). Only those set it, each
+    /// after checking the plan; without it, no table reads or writes the
+    /// column, whatever a schema's names or metadata say.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    group_hash: bool,
 }
 
 impl AggregateExec {
@@ -1081,6 +1090,7 @@ impl AggregateExec {
             group_clustering_mode,
             cache: Arc::new(cache),
             dynamic_filter: None,
+            group_hash: false,
         };
 
         exec.init_dynamic_filter();
@@ -1098,11 +1108,16 @@ impl AggregateExec {
     /// routes by, computed once per row here and reused by the exchange and
     /// by the final aggregation instead of being computed by each again.
     ///
-    /// A final aggregation whose input ends with that column uses it on its
-    /// own and does not output it. Plans built without this are unchanged.
+    /// A final aggregation reads that column only if it is built with
+    /// [`Self::with_read_group_hash`], and does not output it. Plans built
+    /// without these are unchanged.
     ///
     /// Refused unless the aggregation is a plain hash partial aggregation of
     /// one grouping set whose keys are neither dictionaries nor nested.
+    ///
+    /// Every process that runs the plan must know the column: a partial
+    /// aggregation of an older DataFusion would produce batches with one
+    /// column fewer than this plan's schema.
     ///
     /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
     pub fn with_group_hash(self) -> Result<Self> {
@@ -1111,7 +1126,7 @@ impl AggregateExec {
                 "Only a hash partial aggregation of one grouping set with flat, non-dictionary keys can carry group hashes"
             );
         }
-        if aggregate_hash_table::carries_group_hash(&self.schema) {
+        if self.group_hash {
             return Ok(self);
         }
         let num_keys = self.group_by().expr().len();
@@ -1134,7 +1149,38 @@ impl AggregateExec {
             schema,
         )?;
         carried.dynamic_filter.clone_from(&self.dynamic_filter);
+        carried.group_hash = true;
         Ok(carried)
+    }
+
+    /// This final aggregation reading the [`GroupHash`] of each input row
+    /// from its input's last column, which a partial aggregation built with
+    /// [`Self::with_group_hash`] appends, instead of hashing the group keys.
+    ///
+    /// Refused unless [`Self::can_read_group_hash`] holds and the input's
+    /// last column carries the hash of exactly its first columns, the group
+    /// keys, in order.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    pub fn with_read_group_hash(mut self) -> Result<Self> {
+        if !self.can_read_group_hash() || !self.input_carries_group_hash() {
+            return plan_err!(
+                "Only a hash final aggregation of one grouping set whose input carries the hash of its group keys can read group hashes"
+            );
+        }
+        self.group_hash = true;
+        Ok(self)
+    }
+
+    /// True if this aggregation's input ends with the [`GroupHash`] of its
+    /// group keys.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    fn input_carries_group_hash(&self) -> bool {
+        datafusion_physical_expr_common::group_hash::carries_first_keys(
+            &self.input.schema(),
+            self.group_by().expr().len(),
+        )
     }
 
     /// True if [`Self::with_group_hash`] accepts this aggregation.
@@ -1167,18 +1213,10 @@ impl AggregateExec {
             && self.group_clustering_mode == GroupClusteringMode::None
     }
 
-    /// True if this aggregation emits or reads group hashes, see
-    /// [`Self::with_group_hash`].
+    /// True if this aggregation emits or reads group hashes: see
+    /// [`Self::with_group_hash`] and [`Self::with_read_group_hash`].
     pub fn carries_group_hash(&self) -> bool {
-        match self.mode {
-            AggregateMode::Partial => {
-                aggregate_hash_table::carries_group_hash(&self.schema)
-            }
-            AggregateMode::Final | AggregateMode::FinalPartitioned => {
-                aggregate_hash_table::carries_group_hash(&self.input.schema())
-            }
-            _ => false,
-        }
+        self.group_hash
     }
 
     /// Set a legacy limit hint. Unsupported requests leave ordinary aggregation.
@@ -2328,6 +2366,11 @@ impl ExecutionPlan for AggregateExec {
                     me = optimized.data;
                 }
                 me.dynamic_filter.clone_from(&self.dynamic_filter);
+                // A partial aggregation keeps the column its schema has; a
+                // final one reads it only from an input that still carries it
+                me.group_hash = self.group_hash
+                    && (self.mode == AggregateMode::Partial
+                        || me.input_carries_group_hash());
                 Ok(Arc::new(me))
             }
         }
@@ -2570,6 +2613,7 @@ impl ExecutionPlan for AggregateExec {
             // Derived at construction by `Self::compute_properties`.
             cache: _,
             dynamic_filter,
+            group_hash,
         } = self;
 
         let group_by = self.group_by();
@@ -2651,6 +2695,7 @@ impl ExecutionPlan for AggregateExec {
                         has_grouping_set: group_by.has_grouping_set(),
                         dynamic_filter,
                         schema: Some(self.schema.as_ref().try_into()?),
+                        carry_group_hash: *group_hash,
                     },
                 )),
             ),
@@ -2772,6 +2817,7 @@ impl AggregateExec {
             has_grouping_set,
             dynamic_filter,
             schema,
+            carry_group_hash,
         } = hash_agg.as_ref();
 
         let input =
@@ -2897,8 +2943,16 @@ impl AggregateExec {
             .collect::<Result<Vec<_>>>()?;
         let group_by =
             PhysicalGroupBy::new(group_expr, null_expr, groups, *has_grouping_set);
+        let carrying_partial = *carry_group_hash && mode == AggregateMode::Partial;
         let aggregate = if let Some(schema) = schema {
-            let schema = SchemaRef::new(schema.try_into()?);
+            let mut schema: Schema = schema.try_into()?;
+            // `with_group_hash` below appends the carried column again.
+            if carrying_partial {
+                let mut fields = schema.fields().to_vec();
+                fields.pop();
+                schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+            }
+            let schema = SchemaRef::new(schema);
             AggregateExec::try_new_with_schema(
                 mode,
                 group_by,
@@ -2933,6 +2987,11 @@ impl AggregateExec {
                 })?
         } else {
             aggregate
+        };
+        let aggregate = match (*carry_group_hash, carrying_partial) {
+            (false, _) => aggregate,
+            (true, true) => aggregate.with_group_hash()?,
+            (true, false) => aggregate.with_read_group_hash()?,
         };
         let aggregate = if let Some(dynamic_filter) = dynamic_filter {
             let dynamic_filter =

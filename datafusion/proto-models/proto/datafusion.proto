@@ -1635,6 +1635,9 @@ message AggregateExecNode {
   PhysicalExprNode dynamic_filter = 13;
   // Output schema preserved by physical optimizer rewrites.
   datafusion_common.Schema schema = 14;
+  // A partial carries its group hash as the last output column; a final reads
+  // it from its input. See `AggregateExec::with_group_hash`.
+  bool carry_group_hash = 15;
 }
 
 message GlobalLimitExecNode {
@@ -1718,6 +1721,9 @@ message RepartitionExecNode{
   // New partitioning variants are stored in `partitioning`.
   Partitioning partitioning = 5;
   bool preserve_order = 6;
+  // Route by the group hash the input carries in its last column. See
+  // `RepartitionExec::with_carried_group_hash`.
+  bool carried_group_hash = 7;
 }
 
 message Partitioning {

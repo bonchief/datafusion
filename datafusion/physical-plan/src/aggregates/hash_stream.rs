@@ -1093,7 +1093,9 @@ mod tests {
     use crate::test::TestMemoryExec;
     use crate::test::exec::BarrierExec;
 
+    use crate::aggregates::group_values::multi_group_by;
     use arrow::array::{ArrayRef, AsArray, Int32Array, Int64Array, StringViewArray};
+    use arrow::array::{Float64Array, NullArray, StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema};
     use datafusion_common::Result;
     use datafusion_execution::config::SessionConfig;
@@ -1106,7 +1108,9 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::{min_max::min_udaf, sum::sum_udaf};
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
     use futures::channel::mpsc;
     use futures::{FutureExt, StreamExt};
     use std::collections::BTreeMap;
@@ -2132,18 +2136,26 @@ mod tests {
             partial
         };
         let keys = vec![col("key", &partial.schema())?];
-        let exchange = Arc::new(RepartitionExec::try_new(
-            Arc::new(partial),
-            Partitioning::Hash(keys, 4),
-        )?);
-        let final_agg = Arc::new(AggregateExec::try_new(
+        let exchange =
+            RepartitionExec::try_new(Arc::new(partial), Partitioning::Hash(keys, 4))?;
+        let exchange = if run.carry {
+            exchange.with_carried_group_hash()?
+        } else {
+            exchange
+        };
+        let final_agg = AggregateExec::try_new(
             AggregateMode::FinalPartitioned,
             group_by.as_final(),
             aggr_expr,
             vec![None, None],
-            exchange,
+            Arc::new(exchange),
             Arc::clone(&schema),
-        )?);
+        )?;
+        let final_agg = Arc::new(if run.carry {
+            final_agg.with_read_group_hash()?
+        } else {
+            final_agg
+        });
         assert_eq!(final_agg.carries_group_hash(), run.carry);
         // The hashes stay between the stages
         assert_eq!(final_agg.schema().fields().len(), 3);
@@ -2208,6 +2220,253 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Under a memory limit the final aggregation spills its groups and merges
+    /// the spill files back; the carried hashes give the same groups through
+    /// both, with one table and with buckets.
+    #[tokio::test]
+    async fn carried_group_hashes_survive_spill_and_merge() -> Result<()> {
+        let one_table = TwoStage {
+            carry: false,
+            skip: false,
+            bucket_bytes: 0,
+            memory_limit: None,
+        };
+        let (expected, _, _) =
+            run_two_stage_text_aggregate(100_000, 2, one_table).await?;
+        for bucket_bytes in [0, 1 << 20] {
+            for carry in [false, true] {
+                let run = TwoStage {
+                    carry,
+                    skip: false,
+                    bucket_bytes,
+                    memory_limit: Some(12 * 1024 * 1024),
+                };
+                let (rows, _, spills) =
+                    run_two_stage_text_aggregate(100_000, 2, run).await?;
+                assert_eq!(rows, expected, "{run:?}");
+                assert!(spills > 0, "{run:?} spilled");
+            }
+        }
+        Ok(())
+    }
+
+    /// The groups of a two-stage `COUNT(value) .. GROUP BY keys` over
+    /// `inputs`, with and without carried group hashes, as sorted lines.
+    async fn two_stage_groups(
+        inputs: &[Vec<RecordBatch>],
+        keys: &[&str],
+        carry: bool,
+    ) -> Result<Vec<String>> {
+        use crate::repartition::RepartitionExec;
+        use datafusion_physical_expr::Partitioning;
+
+        let schema = inputs[0][0].schema();
+        let group_by = PhysicalGroupBy::new_single(
+            keys.iter()
+                .map(|key| Ok((col(key, &schema)?, (*key).to_string())))
+                .collect::<Result<_>>()?,
+        );
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("count_value")
+                .build()?,
+        )];
+        let input = TestMemoryExec::try_new_exec(inputs, Arc::clone(&schema), None)?;
+        let partial = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by.clone(),
+            aggr_expr.clone(),
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let partial = if carry {
+            partial.with_group_hash()?
+        } else {
+            partial
+        };
+        let exprs = (0..keys.len())
+            .map(|index| {
+                Arc::new(Column::new(keys[index], index)) as Arc<dyn PhysicalExpr>
+            })
+            .collect();
+        let exchange =
+            RepartitionExec::try_new(Arc::new(partial), Partitioning::Hash(exprs, 4))?;
+        let exchange = if carry {
+            exchange.with_carried_group_hash()?
+        } else {
+            exchange
+        };
+        let final_agg = AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by.as_final(),
+            aggr_expr,
+            vec![None],
+            Arc::new(exchange),
+            Arc::clone(&schema),
+        )?;
+        let final_agg = if carry {
+            final_agg.with_read_group_hash()?
+        } else {
+            final_agg
+        };
+        assert_eq!(final_agg.carries_group_hash(), carry);
+        let batches =
+            crate::collect(Arc::new(final_agg), Arc::new(TaskContext::default())).await?;
+        let mut lines: Vec<String> =
+            arrow::util::pretty::pretty_format_batches(&batches)?
+                .to_string()
+                .lines()
+                .filter(|line| line.starts_with("| "))
+                .skip(1)
+                .map(str::to_string)
+                .collect();
+        lines.sort_unstable();
+        Ok(lines)
+    }
+
+    /// Float keys group by their value the way the keys' own hash does:
+    /// -0.0 and +0.0, and every NaN, give the same groups carried or not.
+    #[tokio::test]
+    async fn carried_group_hashes_of_float_keys() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let nan = f64::NAN;
+        let other_nan = f64::from_bits(nan.to_bits() ^ 1);
+        let xs = [0.0, -0.0, nan, other_nan, -nan, 1.5, f64::INFINITY];
+        let floats: Float64Array = xs.iter().copied().map(Some).chain([None]).collect();
+        let num_rows = floats.len();
+        let inputs = (0..3)
+            .map(|input| {
+                // Some names are null, a different few in each input
+                let names: StringArray = (0..num_rows)
+                    .map(|row| {
+                        ((row + input) % 3 != 0).then(|| format!("name-{}", row % 2))
+                    })
+                    .collect();
+                Ok(vec![RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(names),
+                        Arc::new(floats.clone()),
+                        Arc::new(Int64Array::from(vec![1i64; num_rows])),
+                    ],
+                )?])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for keys in [&["name", "x"][..], &["x", "name"][..]] {
+            let expected = two_stage_groups(&inputs, keys, false).await?;
+            assert_eq!(
+                two_stage_groups(&inputs, keys, true).await?,
+                expected,
+                "{keys:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Keys the column-wise group values cannot hold fall back to
+    /// `GroupValuesRows`, which hashes rows itself; the carried hashes still
+    /// route them and the groups are the same.
+    #[tokio::test]
+    async fn carried_group_hashes_with_row_group_values() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("nothing", DataType::Null, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        assert!(!multi_group_by::supported_schema(&Schema::new(vec![
+            schema.field(0).clone(),
+            schema.field(1).clone(),
+        ])));
+        let inputs = (0..3)
+            .map(|_| {
+                let names: StringArray = (0..2000)
+                    .map(|row| Some(format!("name-{}", row % 700)))
+                    .collect();
+                Ok(vec![RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(names),
+                        Arc::new(NullArray::new(2000)),
+                        Arc::new(Int64Array::from(vec![1i64; 2000])),
+                    ],
+                )?])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = ["name", "nothing"];
+        let expected = two_stage_groups(&inputs, &keys, false).await?;
+        assert_eq!(expected.len(), 700);
+        assert_eq!(two_stage_groups(&inputs, &keys, true).await?, expected);
+        Ok(())
+    }
+
+    /// A column that only looks like a carried group hash, with the metadata
+    /// of one, is never read: only `with_read_group_hash` makes a final
+    /// aggregation read it. Here every row claims its own hash, which would
+    /// split each group if it were read.
+    #[tokio::test]
+    async fn forged_group_hash_metadata_is_ignored() -> Result<()> {
+        use datafusion_physical_expr_common::group_hash::group_hash_field;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let state = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("count_value[count]", DataType::Int64, false),
+            group_hash_field(&[0]),
+        ]));
+        let rows = 4000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&state),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|row| format!("key-{}", row % 10)),
+                )),
+                Arc::new(Int64Array::from(vec![1i64; rows])),
+                Arc::new(UInt64Array::from_iter_values(0..rows as u64)),
+            ],
+        )?;
+        let input = TestMemoryExec::try_new_exec(&[vec![batch]], state, None)?;
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("key", &schema)?, "key".to_string())]);
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("count_value")
+                .build()?,
+        )];
+        let final_agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            group_by.as_final(),
+            aggr_expr,
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        assert!(!final_agg.carries_group_hash());
+        let batches =
+            crate::collect(Arc::new(final_agg), Arc::new(TaskContext::default())).await?;
+        let counts: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(counts, vec![400; 10]);
         Ok(())
     }
 

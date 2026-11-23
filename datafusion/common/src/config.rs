@@ -1185,7 +1185,11 @@ config_namespace! {
         /// hash to the exchange and the final stage in an extra column,
         /// instead of hashing the keys again in each. The carried hash is the
         /// exchange's own routing hash, so rows go to the same partitions.
-        /// Costs 8 bytes per row between the stages.
+        /// Costs 8 bytes per row between the stages. A plan that carries the
+        /// hash runs only on processes that know the column: a partial stage
+        /// of an older DataFusion outputs one column fewer than the plan's
+        /// schema. Turn this on only after every process that may run a stage
+        /// of the plan runs a version that has it.
         pub carry_group_hash: bool, default = false
 
         /// (experimental) Allocated-byte threshold for flushing unordered partial
