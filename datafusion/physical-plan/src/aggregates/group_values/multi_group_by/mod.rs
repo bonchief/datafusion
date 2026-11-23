@@ -10,6 +10,7 @@ pub mod bytes_view;
 mod clustered;
 mod dictionary;
 mod fixed_size_binary;
+mod group_map;
 mod list;
 pub(super) use clustered::GroupValuesClustered;
 pub mod primitive;
@@ -36,11 +37,12 @@ use datafusion_common::float_semantics::{has_float_leaf, normalize_floats};
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, not_impl_err};
-use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
+use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
 
-use hashbrown::hash_table::HashTable;
+use datafusion_physical_expr_common::prefetch::DISTANCE;
+use group_map::GroupMap;
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -85,6 +87,13 @@ pub trait GroupColumn: Send + Sync {
     /// Reserves row-addressed storage without changing the logical length.
     fn reserve_groups(&mut self, _capacity: usize) {}
 
+    /// Hints that the stored value of `group` will be read soon: the staged
+    /// probe of a table beyond L2 calls it for a row's candidate group a few
+    /// rows before it compares the row. `group` may be at or past
+    /// [`Self::len`], for a group of the batch not appended yet; the hint
+    /// must not read memory. The default does nothing.
+    fn prefetch(&self, _group: usize) {}
+
     /// Returns the number of rows stored in this builder
     fn len(&self) -> usize;
 
@@ -121,6 +130,13 @@ pub fn nulls_equal_to(lhs_null: bool, rhs_null: bool) -> Option<bool> {
         _ => None,
     }
 }
+
+/// Rows of a batch interned at a time once [`GroupValuesColumn`]'s table is
+/// beyond L2: see [`GroupValuesColumn::vectorized_intern`]. The values the
+/// collect pass prefetches for a slice, about one cache line per column and
+/// row, must still be in cache when its equality pass reads them, so a slice
+/// of a few columns stays well inside L2.
+const STAGE_ROWS: usize = 1024;
 
 /// The view of indices pointing to the actual values in `GroupValues`
 ///
@@ -182,9 +198,13 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// instead we store the `group indices` pointing to values in `GroupValues`.
     /// And we use [`GroupIndexView`] to represent such `group indices` in table.
     ///
-    map: HashTable<(u64, GroupIndexView)>,
+    ///
+    /// Beyond one core's share of L2 the entries move to a prefetchable
+    /// table (see [`GroupMap`]), and the vectorized intern probes it in
+    /// stages: see [`Self::vectorized_intern`].
+    map: GroupMap,
 
-    /// The size of `map` in bytes
+    /// The size of `map` in bytes, while it is in hashbrown's table
     map_size: usize,
 
     /// The lists for group indices with the same hash value
@@ -289,7 +309,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
     /// Create a new instance of GroupValuesColumn if supported for the specified schema
     pub fn try_new(schema: SchemaRef) -> Result<Self> {
-        let map = HashTable::with_capacity(0);
+        let map = GroupMap::default();
         let group_values = Self::build_group_columns(&schema)?;
         Ok(Self {
             schema,
@@ -463,7 +483,63 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///
     /// The vectorized approach can offer higher performance for avoiding row by row
     /// downcast for `cols` and being able to implement even more optimizations(like simd).
+    ///
+    /// # Staged probe
+    ///
+    /// Once the hash table has outgrown one core's share of L2, every probe
+    /// takes the cache misses of the table and of each column's stored value
+    /// one row after another. The table then moves to a prefetchable one, and
+    /// a batch is interned in slices of [`STAGE_ROWS`] rows: while the
+    /// collect pass looks up row `i`, it prefetches the table's control bytes
+    /// and entry at the home bucket of row `i + 2 * DISTANCE` and, for row
+    /// `i + DISTANCE`, the stored value of the group whose entry its hash
+    /// selects in each column ([`GroupColumn::prefetch`]). The slice is small
+    /// enough that those values are still in cache when the equality pass of
+    /// the same slice reads them. Each slice runs the same four steps as a
+    /// whole batch, so a row's group is the same; only the ids of new groups
+    /// whose hash collided with another group's may be numbered differently,
+    /// which the trait leaves open.
     fn vectorized_intern(
+        &mut self,
+        cols: &[ArrayRef],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        if self.map.stage() {
+            return self.vectorized_intern_staged(cols, groups);
+        }
+        self.vectorized_intern_rows::<false>(cols, groups)
+    }
+
+    /// [`Self::vectorized_intern`] beyond the gate, slice by slice. Kept out
+    /// of line so the loop below the gate compiles as it does without it.
+    #[inline(never)]
+    fn vectorized_intern_staged(
+        &mut self,
+        cols: &[ArrayRef],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        let n_rows = cols[0].len();
+        if n_rows <= STAGE_ROWS {
+            return self.vectorized_intern_rows::<true>(cols, groups);
+        }
+        groups.clear();
+        let mut part = Vec::with_capacity(STAGE_ROWS);
+        for start in (0..n_rows).step_by(STAGE_ROWS) {
+            let len = STAGE_ROWS.min(n_rows - start);
+            let slice = cols
+                .iter()
+                .map(|col| col.slice(start, len))
+                .collect::<Vec<_>>();
+            self.vectorized_intern_rows::<true>(&slice, &mut part)?;
+            groups.extend_from_slice(&part);
+        }
+        Ok(())
+    }
+
+    /// The four steps of [`Self::vectorized_intern`] over all rows of
+    /// `cols`, with the collect pass staged if `STAGED`.
+    #[inline(always)]
+    fn vectorized_intern_rows<const STAGED: bool>(
         &mut self,
         cols: &[ArrayRef],
         groups: &mut Vec<usize>,
@@ -500,7 +576,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         //
 
         // 1. Collect vectorized context by checking hash values of `cols` in `map`
-        self.collect_vectorized_process_context(&batch_hashes, groups);
+        self.collect_vectorized_process_context::<STAGED>(&batch_hashes, groups);
 
         // 2. Perform `vectorized_append`
         self.vectorized_append(cols)?;
@@ -530,7 +606,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///   - Check if the `group index view` is `inlined` or `non_inlined`:
     ///     If it is inlined, add to `vectorized_equal_to_group_indices` directly.
     ///     Otherwise get all group indices from `group_index_lists`, and add them.
-    fn collect_vectorized_process_context(
+    ///
+    /// With `STAGED` the map is in its prefetchable table, and each row's
+    /// lookup first prefetches for rows ahead: see [`Self::vectorized_intern`].
+    fn collect_vectorized_process_context<const STAGED: bool>(
         &mut self,
         batch_hashes: &[u64],
         groups: &mut [usize],
@@ -544,6 +623,9 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .clear();
 
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
+            if STAGED {
+                self.prefetch_ahead(batch_hashes, row);
+            }
             let entry = self
                 .map
                 .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
@@ -598,6 +680,30 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 self.vectorized_operation_buffers
                     .equal_to_group_indices
                     .push(group_index);
+            }
+        }
+    }
+
+    /// Staged probe: prefetch the table's home bucket of row `row + 2 *
+    /// DISTANCE`, and each column's value of the group that row
+    /// `row + DISTANCE`'s hash selects, if its entry holds one group with
+    /// that hash. Only hints; the lookup of each row decides.
+    #[inline(always)]
+    fn prefetch_ahead(&self, hashes: &[u64], row: usize) {
+        let Some(table) = self.map.staged() else {
+            return;
+        };
+        if let Some(&ahead) = hashes.get(row + 2 * DISTANCE) {
+            table.prefetch_home(ahead);
+        }
+        if let Some(&ahead) = hashes.get(row + DISTANCE)
+            && let Some((hash, view)) = table.candidate(ahead)
+            && *hash == ahead
+            && !view.is_non_inlined()
+        {
+            let group = view.value() as usize;
+            for column in &self.group_values {
+                column.prefetch(group);
             }
         }
     }
@@ -1126,7 +1232,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 .sum::<usize>();
         size_of::<Self>()
             + group_values_size
-            + self.map_size
+            + self.map.staged_size().unwrap_or(self.map_size)
             + group_index_lists_size
             + self.emit_group_index_list_buffer.allocated_size()
             + self.vectorized_operation_buffers.size()
@@ -1327,8 +1433,7 @@ mod tests {
 
     use arrow::array::{
         Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
-        Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
     use arrow::datatypes::{
@@ -1339,7 +1444,7 @@ mod tests {
         compute::{concat_batches, take},
         util::pretty::pretty_format_batches,
     };
-    use datafusion_common::{Result, utils::proxy::HashTableAllocExt};
+    use datafusion_common::Result;
     use datafusion_expr::{EmitTo, GroupSelection};
 
     use crate::aggregates::group_values::{

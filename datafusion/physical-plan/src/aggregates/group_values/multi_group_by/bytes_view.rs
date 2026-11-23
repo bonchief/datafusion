@@ -15,6 +15,7 @@ use arrow::datatypes::ByteViewType;
 use datafusion_common::Result;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_expr::GroupSelection;
+use datafusion_physical_expr_common::prefetch::prefetch;
 use std::marker::PhantomData;
 use std::mem::{self, replace, size_of};
 use std::sync::Arc;
@@ -614,6 +615,12 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
 
     fn len(&self) -> usize {
         self.views.len()
+    }
+
+    /// Prefetches the group's view. Its bytes, for a value longer than 12
+    /// bytes, are only found by reading the view, which a hint must not do.
+    fn prefetch(&self, group: usize) {
+        prefetch(self.views.as_ptr().wrapping_add(group));
     }
 
     fn size(&self) -> usize {

@@ -19,6 +19,7 @@ use datafusion_common::Result;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::GroupSelection;
+use datafusion_physical_expr_common::prefetch::prefetch;
 use std::iter;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -252,6 +253,10 @@ where
 
     fn len(&self) -> usize {
         self.group_values.len()
+    }
+
+    fn prefetch(&self, group: usize) {
+        prefetch(self.group_values.as_ptr().wrapping_add(group));
     }
 
     fn size(&self) -> usize {
