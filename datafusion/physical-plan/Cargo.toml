@@ -132,6 +132,10 @@ name = "partial_ordering"
 
 [[bench]]
 harness = false
+name = "view_dedupe"
+
+[[bench]]
+harness = false
 name = "partial_sort"
 required-features = ["test_utils"]
 
