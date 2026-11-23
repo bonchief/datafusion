@@ -17,6 +17,15 @@ const FIRST_RETRY_WINDOWS: usize = 10;
 /// never repeats spends at most one window in this many aggregating.
 const MAX_RETRY_WINDOWS: usize = 160;
 
+/// Windows of aggregated rows the decayed history holds before it is halved.
+///
+/// A single window is noisy: on ClickBench's URL key a stream that reduces to
+/// 0.3-0.4 of its rows overall still meets 100K-row runs above 0.5, so a
+/// history as short as one window keeps switching such a stream to skipping.
+/// Ten windows hold about a million rows, enough to average over such runs
+/// while still following a key pattern that changes for good.
+const HISTORY_WINDOWS: usize = 10;
+
 /// Decides, window by window, whether a partial aggregation reduces its input
 /// enough to be worth its hash table, or should convert rows to partial states
 /// one for one instead.
@@ -51,7 +60,7 @@ pub(super) struct SkipAggregationProbe {
     window_rows: usize,
     window_groups: usize,
     /// Input rows and created groups of earlier windows, halved whenever they
-    /// reach a window's worth, so recent windows weigh most.
+    /// reach [`HISTORY_WINDOWS`] windows' worth, so recent windows weigh most.
     recent_rows: usize,
     recent_groups: usize,
 
@@ -101,7 +110,11 @@ impl SkipAggregationProbe {
         if self.window_rows < self.probe_rows_threshold {
             return;
         }
-        if self.recent_rows >= self.probe_rows_threshold {
+        if self.recent_rows
+            >= self
+                .probe_rows_threshold
+                .saturating_mul(HISTORY_WINDOWS)
+        {
             self.recent_rows /= 2;
             self.recent_groups /= 2;
         }
@@ -356,16 +369,18 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_aggregation_probe_one_bad_window_does_not_skip() {
+    fn test_skip_aggregation_probe_history_outlasts_a_run_of_bad_windows() {
         let mut probe = SkipAggregationProbe::new(10, 0.5, metrics::Count::new());
         for _ in 0..4 {
             probe.update_state(10, 1);
         }
-        // A window of 0.8 against a history near 0.05: the history keeps
-        // the stream aggregating.
-        probe.update_state(10, 8);
-        assert!(!probe.should_skip());
-        // A second such window moves the decayed history above the ratio.
+        // Windows of 0.8 after a history of 0.1: the history keeps the stream
+        // aggregating through five of them.
+        for _ in 0..5 {
+            probe.update_state(10, 8);
+            assert!(!probe.should_skip());
+        }
+        // The sixth moves the history to 52 groups in 100 rows.
         probe.update_state(10, 8);
         assert!(probe.should_skip());
     }
