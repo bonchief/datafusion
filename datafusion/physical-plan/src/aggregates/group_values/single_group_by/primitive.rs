@@ -199,9 +199,48 @@ mod tests {
     use arrow::array::types::Int32Type;
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
+    use datafusion_common::utils::proxy::VecAllocExt;
     use datafusion_expr::EmitTo;
     use std::mem::size_of;
     use std::sync::Arc;
+
+    /// Mirror of the `EmitTo::take_needed` regression test, applied to the
+    /// concrete `GroupValuesPrimitive` accumulator.
+    ///
+    /// When `n` is small, the old `split_off(n) + swap` pattern used inside
+    /// `emit(EmitTo::First(n))` left `self.values` with a small fresh allocation
+    /// and returned the emitted prefix carrying the original large backing.
+    ///
+    /// With `split_vec_min_alloc` and `n * 2 <= len`, the drain branch is taken:
+    /// the emitted prefix gets a compact allocation and `self.values` retains the
+    /// original large one.
+    #[test]
+    fn emit_first_small_n_allocates_minimally() -> Result<()> {
+        let mut gv = GroupValuesPrimitive::<Int32Type>::new(DataType::Int32);
+
+        // Intern 20 distinct values; `new()` pre-allocates capacity 128 for `values`.
+        let arr: ArrayRef = Arc::new(Int32Array::from_iter_values(0..20i32));
+        let mut groups = vec![];
+        gv.intern(&[arr], &mut groups)?;
+        let capacity_before = gv.keys.values.capacity(); // 128
+
+        // n=4, n*2=8 <= len=20 -> drain branch
+        let emitted = gv.emit(EmitTo::First(4))?;
+
+        assert_eq!(emitted[0].len(), 4);
+
+        // `self.values` must retain its original large allocation.
+        // Old split_off+swap left it with a fresh small allocation (~16).
+        assert_eq!(
+            gv.keys.values.capacity(),
+            capacity_before,
+            "self.values capacity {} should equal original {} after small First(n) emit",
+            gv.keys.values.capacity(),
+            capacity_before,
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn test_exact_hash_table_allocation_accounting() {
@@ -214,7 +253,10 @@ mod tests {
         let initial_map_bytes = group_values.keys.map.allocation_size();
         assert!(group_values.keys.map.capacity() >= 128);
         assert!(initial_map_bytes > 0);
-        assert_eq!(group_values.size(), self_size + initial_map_bytes,);
+        assert_eq!(
+            group_values.size(),
+            self_size + group_values.keys.values.allocated_size() + initial_map_bytes,
+        );
 
         // 2. Insert keys and observe table allocation growth
         let num_distinct = 500_i32;
@@ -233,7 +275,10 @@ mod tests {
             group_values.keys.map.capacity() * size_of::<(usize, i32)>();
         assert!(table_bytes > entry_only_bytes);
 
-        assert_eq!(group_values.size(), self_size + table_bytes,);
+        assert_eq!(
+            group_values.size(),
+            self_size + group_values.keys.values.allocated_size() + table_bytes,
+        );
 
         // 3. Partial emit (EmitTo::First)
         let emit_count = 200;
@@ -243,7 +288,10 @@ mod tests {
 
         // Retained capacity is still charged until the table releases it
         assert_eq!(group_values.keys.map.allocation_size(), table_bytes);
-        assert_eq!(group_values.size(), self_size + table_bytes,);
+        assert_eq!(
+            group_values.size(),
+            self_size + group_values.keys.values.allocated_size() + table_bytes,
+        );
 
         // 4. Emit all (EmitTo::All)
         let remaining_count = group_values.len();
@@ -258,7 +306,10 @@ mod tests {
         group_values.clear_shrink(16);
         let shrunken_table_bytes = group_values.keys.map.allocation_size();
         assert!(shrunken_table_bytes < table_bytes);
-        assert_eq!(group_values.size(), self_size + shrunken_table_bytes,);
+        assert_eq!(
+            group_values.size(),
+            self_size + group_values.keys.values.allocated_size() + shrunken_table_bytes,
+        );
 
         // 6. Reinsert new distinct values into the shrunken table
         let new_arr: ArrayRef = Arc::new(Int32Array::from_iter_values(
@@ -269,7 +320,9 @@ mod tests {
         assert!(group_values.keys.map.allocation_size() > shrunken_table_bytes);
         assert_eq!(
             group_values.size(),
-            self_size + group_values.keys.map.allocation_size(),
+            self_size
+                + group_values.keys.values.allocated_size()
+                + group_values.keys.map.allocation_size(),
         );
     }
 
