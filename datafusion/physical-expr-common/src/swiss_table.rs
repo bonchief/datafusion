@@ -368,13 +368,17 @@ pub(crate) fn max_items(buckets: usize) -> usize {
 
 /// The smallest table, a power of two of at least [`GROUP`] buckets, that
 /// holds `entries` entries; none for no entries.
+///
+/// A table of `B` buckets holds `B - B / 8` entries, so it needs `entries +
+/// ceil(entries / 7)` buckets: exactly `B` for hashbrown's capacity of `B`
+/// buckets, which is the same `B - B / 8`. A map moved from hashbrown's
+/// table at its capacity keeps its bucket count.
 pub fn buckets_for(entries: usize) -> usize {
     if entries == 0 {
         return 0;
     }
     entries
-        .saturating_add(entries / 7)
-        .saturating_add(1)
+        .saturating_add(entries.div_ceil(7))
         .max(GROUP)
         .checked_next_power_of_two()
         .unwrap_or(1 << (usize::BITS - 1))
@@ -403,6 +407,16 @@ mod tests {
             assert!(buckets >= GROUP);
             assert!(max_items(buckets) >= entries);
             assert!(max_items(buckets) < buckets);
+        }
+        // A full table, and hashbrown's capacity for as many buckets,
+        // need no more buckets than that.
+        for buckets in (3..30).map(|bits| 1usize << bits) {
+            assert_eq!(buckets_for(max_items(buckets)), buckets);
+            assert_eq!(buckets_for(max_items(buckets) + 1), 2 * buckets);
+        }
+        for buckets in (3..18).map(|bits| 1usize << bits) {
+            let map = hashbrown::HashTable::<u64>::with_capacity(max_items(buckets));
+            assert_eq!(map.capacity(), max_items(buckets));
         }
     }
 
