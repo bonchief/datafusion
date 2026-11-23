@@ -2411,9 +2411,11 @@ mod tests {
     /// A column that only looks like a carried group hash, with the metadata
     /// of one, is never read: only `with_read_group_hash` makes a final
     /// aggregation read it. Here every row claims its own hash, which would
-    /// split each group if it were read.
+    /// split each group if it were read. The column passes through the
+    /// aggregation's state when it spills or splits into buckets.
     #[tokio::test]
     async fn forged_group_hash_metadata_is_ignored() -> Result<()> {
+        use datafusion_common::ScalarValue;
         use datafusion_physical_expr_common::group_hash::group_hash_field;
 
         let schema = Arc::new(Schema::new(vec![
@@ -2425,18 +2427,28 @@ mod tests {
             Field::new("count_value[count]", DataType::Int64, false),
             group_hash_field(&[0]),
         ]));
-        let rows = 4000;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&state),
-            vec![
-                Arc::new(StringArray::from_iter_values(
-                    (0..rows).map(|row| format!("key-{}", row % 10)),
-                )),
-                Arc::new(Int64Array::from(vec![1i64; rows])),
-                Arc::new(UInt64Array::from_iter_values(0..rows as u64)),
-            ],
-        )?;
-        let input = TestMemoryExec::try_new_exec(&[vec![batch]], state, None)?;
+        let (num_groups, repeats, batch_size) = (20_000, 10, 1024);
+        let inputs = (0..num_groups * repeats)
+            .collect::<Vec<_>>()
+            .chunks(batch_size)
+            .map(|rows| {
+                RecordBatch::try_new(
+                    Arc::clone(&state),
+                    vec![
+                        Arc::new(StringArray::from_iter_values(rows.iter().map(|row| {
+                            format!(
+                                "a group key well past twelve bytes {}",
+                                row % num_groups
+                            )
+                        }))),
+                        Arc::new(Int64Array::from(vec![1i64; rows.len()])),
+                        Arc::new(UInt64Array::from_iter_values(
+                            rows.iter().map(|&row| row as u64),
+                        )),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let group_by =
             PhysicalGroupBy::new_single(vec![(col("key", &schema)?, "key".to_string())]);
         let aggr_expr = vec![Arc::new(
@@ -2445,28 +2457,59 @@ mod tests {
                 .alias("count_value")
                 .build()?,
         )];
-        let final_agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            group_by.as_final(),
-            aggr_expr,
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
-        assert!(!final_agg.carries_group_hash());
-        let batches =
-            crate::collect(Arc::new(final_agg), Arc::new(TaskContext::default())).await?;
-        let counts: Vec<i64> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(1)
-                    .as_primitive::<Int64Type>()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(counts, vec![400; 10]);
+        // One table, a table that spills, and buckets
+        for (bucket_bytes, memory_limit) in
+            [(0, None), (0, Some(2 << 20)), (64 << 10, None)]
+        {
+            let input = TestMemoryExec::try_new_exec(
+                &[inputs.clone()],
+                Arc::clone(&state),
+                None,
+            )?;
+            let final_agg = Arc::new(AggregateExec::try_new(
+                AggregateMode::Final,
+                group_by.as_final(),
+                aggr_expr.clone(),
+                vec![None],
+                input,
+                Arc::clone(&schema),
+            )?);
+            assert!(!final_agg.carries_group_hash());
+            let mut runtime = RuntimeEnvBuilder::default();
+            if let Some(memory_limit) = memory_limit {
+                runtime = runtime.with_memory_limit(memory_limit, 1.0);
+            }
+            let task_ctx = TaskContext::default().with_runtime(runtime.build_arc()?);
+            let config = task_ctx
+                .session_config()
+                .clone()
+                .with_batch_size(batch_size)
+                .set(
+                    "datafusion.execution.hash_aggregate_bucket_threshold_bytes",
+                    &ScalarValue::UInt64(Some(bucket_bytes as u64)),
+                );
+            let task_ctx = Arc::new(task_ctx.with_session_config(config));
+            let batches = crate::collect(Arc::clone(&final_agg) as _, task_ctx).await?;
+            let counts: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(1)
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(counts, vec![repeats as i64; num_groups], "{memory_limit:?}");
+            let metrics = final_agg.metrics().expect("final aggregate has metrics");
+            if memory_limit.is_some() {
+                assert!(metrics.spill_count().unwrap_or(0) > 0, "spilled");
+            }
+            if bucket_bytes > 0 {
+                let splits = metrics.sum_by_name("bucket_splits");
+                assert!(splits.is_some_and(|splits| splits.as_usize() > 0), "split");
+            }
+        }
         Ok(())
     }
 

@@ -229,23 +229,25 @@ fn carried_column(batch: &RecordBatch) -> Result<&[u64]> {
     }
 }
 
-/// Appends the group hash column to `columns` if the table `carries` group
-/// hashes and `schema`, the schema of what it emits, ends with one: the
-/// state of a table that carries them does, the output of a final
-/// aggregation does not. `columns` starts with the group keys that
-/// `group_values` just emitted, `num_keys` of them; their hashes come from
-/// `group_values` if it kept them, or are computed from the keys otherwise.
-/// Hashes `group_values` kept for an emit that does not carry them are
-/// dropped.
+/// Appends the group hash column to `columns` if `schema`, the schema of
+/// what the table emits, ends with one, so that the batch matches it: the
+/// output of a partial aggregation built with `with_group_hash` does, and so
+/// does the state of a final aggregation whose input has such a column,
+/// whether it reads it or not. The output of a final aggregation never does.
+/// Writing the column never makes anything read it: only the plan does.
+///
+/// `columns` starts with the group keys that `group_values` just emitted,
+/// `num_keys` of them; their hashes come from `group_values` if it kept them,
+/// or are computed from the keys otherwise. Hashes `group_values` kept for an
+/// emit without the column are dropped.
 pub(in crate::aggregates) fn push_group_hashes(
-    carries: bool,
     schema: &SchemaRef,
     group_values: &mut dyn GroupValues,
     num_keys: usize,
     columns: &mut Vec<ArrayRef>,
 ) -> Result<()> {
     let kept = group_values.emit_hashes();
-    if !(carries && carries_group_hash(schema)) {
+    if !carries_group_hash(schema) {
         return Ok(());
     }
     let hashes = match kept {
@@ -450,7 +452,6 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         accumulator_phase: AccumulatorPhase,
     ) -> Result<Option<RecordBatch>> {
         let output_schema = Arc::clone(&self.output_schema);
-        let carries = self.row_hashes.carries();
         let batch_size = self.batch_size;
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
 
@@ -475,7 +476,6 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                             )?);
                         }
                         push_group_hashes(
-                            carries,
                             &output_schema,
                             state.group_values.as_mut(),
                             num_keys,
@@ -586,7 +586,6 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         capacity: usize,
     ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
-        let carries = self.row_hashes.carries();
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
@@ -609,7 +608,6 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                 )?);
             }
             push_group_hashes(
-                carries,
                 &state_schema,
                 state.group_values.as_mut(),
                 num_keys,
