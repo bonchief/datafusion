@@ -256,7 +256,7 @@ impl BucketedAggregation {
         );
         self.bucket_splits.add(1);
         if let Some(state) = state {
-            buckets.route(state)?;
+            buckets.route(&state)?;
         }
         Ok(buckets)
     }
@@ -413,7 +413,7 @@ impl BucketedAggregation {
                     let held_bytes = waiting_bytes + source_bytes;
 
                     if let Some(sub_buckets) = sub_buckets.as_mut() {
-                        sub_buckets.route(batch)?;
+                        sub_buckets.route(&batch)?;
                         self.reserve(
                             &output.reservation,
                             held_bytes,

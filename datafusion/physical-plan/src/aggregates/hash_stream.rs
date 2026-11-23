@@ -879,7 +879,7 @@ impl FinalHashAggregateStream {
             if let (Some(buckets), Some(bucketing)) =
                 (buckets.as_mut(), self.bucketing.as_ref())
             {
-                buckets.route(batch)?;
+                buckets.route(&batch)?;
                 bucketing.reserve(
                     &self.reservation,
                     0,
