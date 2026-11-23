@@ -652,8 +652,9 @@ mod tests {
                 .unwrap();
             assert!(second.next().now_or_never().is_none());
         }
+        // Over half the pool, so that partition 0 spills.
         let held = pool.reserved();
-        assert!(held > 500 * 1024);
+        assert!(held > 300 * 1024, "held {held}");
         // Created after `held` is measured, since the stream reserves its initial table.
         let (first_sender, mut first) = new_stream(0)?;
         for batch in 0..input_batches {
