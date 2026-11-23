@@ -1134,13 +1134,18 @@ config_namespace! {
 
         /// Aggregation ratio (number of groups the partial aggregation creates /
         /// number of input rows) threshold for skipping partial aggregation. A key
-        /// that returns after an early emit under memory pressure counts again.
-        /// If the value is greater then partial aggregation will skip aggregation
-        /// for further input
+        /// that returns after its table was emitted, early under memory pressure
+        /// or at a flush threshold, counts again. If the ratio of the last window
+        /// and of the decayed earlier windows are both greater, partial
+        /// aggregation converts further input to partial states without
+        /// aggregating it, and re-tests on a fresh window after an interval of
+        /// skipped rows that doubles each time it skips again
         pub skip_partial_aggregation_probe_ratio_threshold: f64, default = 0.8
 
-        /// Number of input rows partial aggregation partition should process, before
-        /// aggregation ratio check and trying to switch to skipping aggregation mode
+        /// Number of input rows in each window over which a partial aggregation
+        /// partition measures its aggregation ratio before deciding whether to
+        /// skip aggregation. A skipping partition first re-tests after ten
+        /// windows of skipped rows, and at most after 160
         pub skip_partial_aggregation_probe_rows_threshold: usize, default = 100_000
 
         /// (experimental) Number of groups in one final hash aggregation

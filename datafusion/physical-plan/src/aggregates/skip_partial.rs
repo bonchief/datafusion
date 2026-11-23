@@ -6,51 +6,63 @@ use arrow::record_batch::RecordBatch;
 
 use crate::metrics;
 
-/// Tracks if the aggregate should skip partial aggregations
+/// Rows a stream skips before its first re-test, in windows of
+/// `probe_rows_threshold`. DuckDB retries lookups after 128K to 1M skipped
+/// rows (`RadixHTAdaptivity::MIN_LOOKUP_RETRY_ROWS`), Trino re-enables partial
+/// aggregation after 200 times its window (`PartialAggregationController`).
+const FIRST_RETRY_WINDOWS: usize = 10;
+
+/// Upper bound on the skipped rows between two re-tests, in windows: each
+/// re-test that skips again doubles the interval up to this, so input that
+/// never repeats spends at most one window in this many aggregating.
+const MAX_RETRY_WINDOWS: usize = 160;
+
+/// Decides, window by window, whether a partial aggregation reduces its input
+/// enough to be worth its hash table, or should convert rows to partial states
+/// one for one instead.
 ///
-/// Used by [`crate::aggregates::hash_stream::PartialHashAggregateStream`].
+/// The reduction is measured as groups created per input row over a window of
+/// `probe_rows_threshold` aggregated rows. A key that returns after its table
+/// was flushed, at a fixed group capacity or under memory pressure, counts
+/// again, since its group goes downstream again: this is the share of rows the
+/// stream hands on. A stream skips when both the last window and a decayed
+/// history of earlier windows exceed `probe_ratio_threshold`, so one odd
+/// window neither starts nor stops skipping on its own.
+///
+/// The decision is never final. A skipping stream aggregates again after an
+/// interval of skipped rows and re-tests on a fresh window. Each re-test that
+/// skips again doubles the interval, up to [`MAX_RETRY_WINDOWS`]; a window that
+/// keeps aggregating resets it. Input whose order changes how much repeats
+/// nearby, such as files written in different orders, so settles on what the
+/// rows show over the stream rather than on its first rows, as DuckDB's
+/// `RadixHTAdaptivity` does with its decayed lookup history and retries.
+///
+/// Used by [`crate::aggregates::hash_stream::PartialHashAggregateStream`],
+/// which re-tests, and by the legacy `GroupedHashAggregateStream`, which keeps
+/// skipping once it starts.
 pub(super) struct SkipAggregationProbe {
-    // ========================================================================
-    // PROPERTIES:
-    // These fields are initialized at the start and remain constant throughout
-    // the execution.
-    // ========================================================================
-    /// Aggregation ratio check performed when the number of input rows exceeds
-    /// this threshold (from `SessionConfig`)
+    /// Aggregated rows in a window (from `SessionConfig`).
     probe_rows_threshold: usize,
-    /// Maximum ratio of `num_groups` to `input_rows` for continuing aggregation
-    /// (from `SessionConfig`). If the ratio exceeds this value, aggregation
-    /// is skipped and input rows are directly converted to output
+    /// Groups per input row above which aggregation is skipped (from
+    /// `SessionConfig`).
     probe_ratio_threshold: f64,
 
-    // ========================================================================
-    // STATES:
-    // Fields changes during execution. Can be buffer, or state flags that
-    // influence the execution in the parent aggregate stream
-    // ========================================================================
-    /// Number of processed input rows (updated during probing)
-    input_rows: usize,
-    /// Number of groups created for `input_rows` (updated during probing).
-    /// A key that returns after an early emit is counted again, so this is the
-    /// number of rows the stream outputs for `input_rows`.
-    num_groups: usize,
+    /// Input rows and created groups of the current window.
+    window_rows: usize,
+    window_groups: usize,
+    /// Input rows and created groups of earlier windows, halved whenever they
+    /// reach a window's worth, so recent windows weigh most.
+    recent_rows: usize,
+    recent_groups: usize,
 
-    /// Flag indicating further data aggregation may be skipped (decision made
-    /// when probing complete)
+    /// Whether the stream currently converts rows instead of aggregating them.
     should_skip: bool,
-    /// Flag indicating further updates of `SkipAggregationProbe` state won't
-    /// make any effect (set either while probing or on probing completion)
-    is_locked: bool,
+    /// Rows skipped since skipping began.
+    skipped_rows: usize,
+    /// Skipped rows after which the stream re-tests.
+    retry_rows: usize,
 
-    // ========================================================================
-    // METRICS:
-    // ========================================================================
-    /// Number of rows where state was output without aggregation.
-    ///
-    /// * If 0, all input rows were aggregated (should_skip was always false)
-    ///
-    /// * if greater than zero, the number of rows which were output directly
-    ///   without aggregation
+    /// Number of rows output as partial states without aggregation.
     skipped_aggregation_rows: metrics::Count,
 }
 
@@ -61,33 +73,50 @@ impl SkipAggregationProbe {
         skipped_aggregation_rows: metrics::Count,
     ) -> Self {
         Self {
-            input_rows: 0,
-            num_groups: 0,
             probe_rows_threshold,
             probe_ratio_threshold,
+            window_rows: 0,
+            window_groups: 0,
+            recent_rows: 0,
+            recent_groups: 0,
             should_skip: false,
-            is_locked: false,
+            skipped_rows: 0,
+            retry_rows: Self::first_retry(probe_rows_threshold),
             skipped_aggregation_rows,
         }
     }
 
-    /// Updates `SkipAggregationProbe` state:
-    /// - adds the input rows of a batch and the groups it created
-    /// - on `probe_rows_threshold` exceeded calculates
-    ///   aggregation ratio and sets `should_skip` flag
-    /// - if `should_skip` is set, locks further state updates
+    fn first_retry(window: usize) -> usize {
+        window.max(1).saturating_mul(FIRST_RETRY_WINDOWS)
+    }
+
+    /// Adds the input rows of an aggregated batch and the groups it created,
+    /// and decides at the end of each window whether to start skipping.
     pub(super) fn update_state(&mut self, input_rows: usize, new_groups: usize) {
-        if self.is_locked {
+        if self.should_skip {
             return;
         }
-        self.input_rows += input_rows;
-        self.num_groups += new_groups;
-        if self.input_rows >= self.probe_rows_threshold {
-            self.should_skip = self.num_groups as f64 / self.input_rows as f64
-                > self.probe_ratio_threshold;
-            // Set is_locked to true only if we have decided to skip, otherwise we can try to skip
-            // during processing the next record_batch.
-            self.is_locked = self.should_skip;
+        self.window_rows += input_rows;
+        self.window_groups += new_groups;
+        if self.window_rows < self.probe_rows_threshold {
+            return;
+        }
+        if self.recent_rows >= self.probe_rows_threshold {
+            self.recent_rows /= 2;
+            self.recent_groups /= 2;
+        }
+        self.recent_rows += self.window_rows;
+        self.recent_groups += self.window_groups;
+        let ratio = |groups: usize, rows: usize| groups as f64 / rows as f64;
+        self.should_skip = ratio(self.window_groups, self.window_rows)
+            > self.probe_ratio_threshold
+            && ratio(self.recent_groups, self.recent_rows) > self.probe_ratio_threshold;
+        self.window_rows = 0;
+        self.window_groups = 0;
+        if self.should_skip {
+            self.skipped_rows = 0;
+        } else {
+            self.retry_rows = Self::first_retry(self.probe_rows_threshold);
         }
     }
 
@@ -98,6 +127,22 @@ impl SkipAggregationProbe {
     /// Record the number of rows that were output directly without aggregation
     pub(super) fn record_skipped(&mut self, batch: &RecordBatch) {
         self.skipped_aggregation_rows.add(batch.num_rows());
+        self.skipped_rows += batch.num_rows();
+    }
+
+    /// Whether a skipping stream has skipped enough rows to aggregate again
+    /// and re-test. Returns true once per interval, and doubles the next.
+    pub(super) fn should_resume(&mut self) -> bool {
+        if !self.should_skip || self.skipped_rows < self.retry_rows {
+            return false;
+        }
+        self.should_skip = false;
+        self.retry_rows = self.retry_rows.saturating_mul(2).min(
+            self.probe_rows_threshold
+                .max(1)
+                .saturating_mul(MAX_RETRY_WINDOWS),
+        );
+        true
     }
 }
 
@@ -267,6 +312,62 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_skip_aggregation_probe_retests_and_resumes() {
+        let mut probe = SkipAggregationProbe::new(10, 0.5, metrics::Count::new());
+        let skip = |probe: &mut SkipAggregationProbe, rows: usize| {
+            let mut resumed = false;
+            for _ in 0..rows {
+                assert!(probe.should_skip());
+                probe.skipped_rows += 1;
+                resumed = probe.should_resume();
+                if resumed {
+                    break;
+                }
+            }
+            resumed
+        };
+
+        // A first window of unique keys starts skipping.
+        probe.update_state(10, 10);
+        assert!(probe.should_skip());
+        // It re-tests after ten windows of skipped rows, not before.
+        assert!(!skip(&mut probe, 99));
+        assert!(skip(&mut probe, 1));
+        assert!(!probe.should_skip());
+
+        // A re-test that still finds unique keys skips again, and the next
+        // interval is twice as long.
+        probe.update_state(10, 10);
+        assert!(probe.should_skip());
+        assert!(!skip(&mut probe, 199));
+        assert!(skip(&mut probe, 1));
+
+        // Keys that now repeat: the window is good, so aggregation continues
+        // although the history of unique keys is still above the ratio.
+        probe.update_state(10, 1);
+        assert!(!probe.should_skip());
+        // A window that keeps aggregating resets the interval to ten windows.
+        probe.update_state(10, 10);
+        assert!(probe.should_skip());
+        assert!(skip(&mut probe, 100));
+    }
+
+    #[test]
+    fn test_skip_aggregation_probe_one_bad_window_does_not_skip() {
+        let mut probe = SkipAggregationProbe::new(10, 0.5, metrics::Count::new());
+        for _ in 0..4 {
+            probe.update_state(10, 1);
+        }
+        // A window of 0.8 against a history near 0.05: the history keeps
+        // the stream aggregating.
+        probe.update_state(10, 8);
+        assert!(!probe.should_skip());
+        // A second such window moves the decayed history above the ratio.
+        probe.update_state(10, 8);
+        assert!(probe.should_skip());
     }
 
     #[test]

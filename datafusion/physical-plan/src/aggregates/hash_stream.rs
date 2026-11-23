@@ -14,6 +14,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
     DataFusionError, Result, assert_ne_or_internal_err, internal_datafusion_err,
+    internal_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
@@ -214,8 +215,6 @@ struct PartialTableFlush {
     group_threshold: usize,
     /// Fixed group capacity reserved for batch-size flushing; zero disables.
     reserve_capacity: usize,
-    /// Previously emitted groups, included in the skip-partial reduction ratio.
-    flushed_groups: usize,
     /// Number of emissions triggered by either size threshold.
     flush_count: metrics::Count,
 }
@@ -272,7 +271,6 @@ impl PartialHashAggregateStream {
                 } else {
                     0
                 },
-                flushed_groups: 0,
                 flush_count: MetricBuilder::new(&agg.metrics)
                     .counter("table_flush_count", partition),
             });
@@ -355,16 +353,64 @@ impl PartialHashAggregateStream {
             debug_assert!(hash_table.is_building());
             let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
-            let mut last_state = HandleInputResult::ProcessNext;
+            // Built on the first switch to skipping and kept, since a stream
+            // that skips re-tests its reduction at intervals and may switch
+            // back and forth several times.
+            let mut skip_table: Option<AggregateHashTable<PartialSkipMarker>> = None;
+            let mut skipping = false;
             while let Some(batch) = self.input.next().await.transpose()? {
+                if skipping {
+                    let Some(skip_table) = skip_table.as_mut() else {
+                        return internal_err!(
+                            "Partial hash aggregate skips without a skip table"
+                        );
+                    };
+                    let states = {
+                        let _timer = elapsed_compute.timer();
+                        skip_table.convert_batch_to_state(&batch)?
+                    };
+                    if let Some(probe) = self.skip_aggregation_probe.as_mut() {
+                        probe.record_skipped(&batch);
+                        // Aggregate the next batches into the table, emptied
+                        // when skipping began, to measure the reduction again.
+                        skipping = !probe.should_resume();
+                    }
+                    emitter
+                        .emit(states.record_output(&self.baseline_metrics))
+                        .await;
+                    continue;
+                }
+
                 let timer = elapsed_compute.timer();
-                last_state = self.handle_input_batch(&batch, &mut hash_table)?;
+                let last_state = self.handle_input_batch(&batch, &mut hash_table)?;
 
                 match last_state {
                     HandleInputResult::ProcessNext => {}
-                    HandleInputResult::ReachedLimit
-                    | HandleInputResult::SwitchToSkipAggregation => {
-                        break;
+                    HandleInputResult::ReachedLimit => break,
+                    HandleInputResult::SwitchToSkipAggregation => {
+                        if skip_table.is_none() {
+                            skip_table = Some(hash_table.partial_skip_table()?);
+                        }
+                        skipping = true;
+                        // Hand on what the table holds and keep the table for
+                        // when aggregating pays again.
+                        let reserve_capacity = self
+                            .table_flush
+                            .as_ref()
+                            .map_or(0, |flush| flush.reserve_capacity);
+                        let states = if reserve_capacity > 0 {
+                            hash_table.take_state_batch_with_capacity(reserve_capacity)?
+                        } else {
+                            hash_table.take_state_batch()?
+                        };
+                        self.reservation.try_resize(hash_table.memory_size())?;
+                        timer.done();
+                        if let Some(states) = states {
+                            self.reduction_factor.add_part(states.num_rows());
+                            emitter
+                                .emit(states.record_output(&self.baseline_metrics))
+                                .await;
+                        }
                     }
                     HandleInputResult::OOM | HandleInputResult::FlushThresholdReached => {
                         let reserve_capacity = self
@@ -385,8 +431,6 @@ impl PartialHashAggregateStream {
                         if let Some(table_flush) = self.table_flush.as_mut()
                             && last_state == HandleInputResult::FlushThresholdReached
                         {
-                            table_flush.flushed_groups +=
-                                materialized_group_states.num_rows();
                             table_flush.flush_count.add(1);
                         } else {
                             self.early_emit_count.add(1);
@@ -415,24 +459,11 @@ impl PartialHashAggregateStream {
             }
 
             let timer = elapsed_compute.timer();
-
-            let skip_hash_table =
-                if last_state == HandleInputResult::SwitchToSkipAggregation {
-                    Some(hash_table.partial_skip_table()?)
-                } else {
-                    self.close_input();
-
-                    None
-                };
+            self.close_input();
             hash_table.start_output()?;
-
             timer.done();
 
             self.produce_output(hash_table, &mut emitter).await?;
-
-            if let Some(hash_table) = skip_hash_table {
-                self.skip_rest_of_aggregation(hash_table, emitter).await?;
-            }
 
             Ok(())
         })
@@ -603,34 +634,6 @@ impl PartialHashAggregateStream {
                 .await;
             timer = elapsed_compute.timer();
         }
-    }
-
-    /// convert raw input directly to partial states.
-    async fn skip_rest_of_aggregation(
-        &mut self,
-        mut hash_table: AggregateHashTable<PartialSkipMarker>,
-        mut emitter: TryEmitter<RecordBatch, DataFusionError>,
-    ) -> Result<()> {
-        let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
-
-        while let Some(batch) = self.input.next().await.transpose()? {
-            if let Some(probe) = self.skip_aggregation_probe.as_mut() {
-                probe.record_skipped(&batch);
-            }
-
-            let result = {
-                let _timer = elapsed_compute.timer();
-                hash_table.convert_batch_to_state(&batch)?
-            };
-
-            emitter
-                .emit(result.record_output(&self.baseline_metrics))
-                .await;
-        }
-
-        self.close_input();
-
-        Ok(())
     }
 }
 
@@ -1406,6 +1409,76 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_partial_hash_stream_resumes_aggregation_after_skipping() -> Result<()> {
+        // 400 unique keys, then 1,600 rows over 10 keys, in batches of 100.
+        // A window of 100 rows at ratio 0.5: the first window skips, the
+        // re-test after 1,000 skipped rows finds 10 groups in 100 rows and
+        // aggregates the rest. Skipping for good would hand on 2,000 rows.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let batches = (0..20)
+            .map(|batch| {
+                let keys = (0..100)
+                    .map(|row| match batch * 100 + row {
+                        key if key < 400 => key,
+                        key => key % 10,
+                    })
+                    .collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(keys)),
+                        Arc::new(Int32Array::from(vec![1; 100])),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut config = SessionConfig::new().with_batch_size(100);
+        let execution = &mut config.options_mut().execution;
+        execution.skip_partial_aggregation_probe_rows_threshold = 100;
+        execution.skip_partial_aggregation_probe_ratio_threshold = 0.5;
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+
+        let exec = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".to_string())]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("c")
+                    .build()?,
+            )],
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+        let mut stream =
+            PartialHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?.into_stream();
+        let (mut rows, mut total) = (0, 0);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            rows += batch.num_rows();
+            total += batch
+                .column(1)
+                .as_primitive::<Int64Type>()
+                .iter()
+                .flatten()
+                .sum::<i64>();
+        }
+        let skipped = aggregate_exec
+            .metrics()
+            .unwrap()
+            .sum_by_name("skipped_aggregation_rows")
+            .map_or(0, |value| value.as_usize());
+        assert_eq!((skipped, rows, total), (1000, 100 + 1000 + 10, 2000));
+        Ok(())
+    }
+
     /// Runs the final hash aggregation of `SELECT group_col, COUNT(value_col)
     /// .. GROUP BY group_col` over partial state that holds every group
     /// `num_partitions` times with a count of 1, as if that many partial
@@ -1527,7 +1600,7 @@ mod tests {
             let groups = batch.column(0).as_primitive::<Int32Type>();
             let counts = batch
                 .column(1)
-                .as_primitive::<arrow::datatypes::Int64Type>();
+                .as_primitive::<Int64Type>();
             rows.extend(
                 groups
                     .values()
