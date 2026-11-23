@@ -712,7 +712,9 @@ impl Stream for GroupedHashAggregateStream {
                                 // Check if we should switch to skip aggregation mode
                                 // It's important that we do this before we early emit since we've
                                 // already updated the probe.
-                                let new_groups = self.group_values.len() - groups_before;
+                                // A table that emitted inside the call holds fewer groups than before it.
+                                let new_groups =
+                                    self.group_values.len().saturating_sub(groups_before);
                                 self.update_skip_aggregation_probe(
                                     input_rows, new_groups,
                                 );

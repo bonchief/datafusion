@@ -522,7 +522,10 @@ impl PartialHashAggregateStream {
         // ----------------------------------------------
         // Step 3: Skip partial aggregation optimization
         // ----------------------------------------------
-        let new_groups = hash_table.building_group_count() - groups_before;
+        // A table that emitted inside the call holds fewer groups than before it.
+        let new_groups = hash_table
+            .building_group_count()
+            .saturating_sub(groups_before);
         self.update_skip_aggregation_probe(input_rows, new_groups);
 
         // True branch: a decision has been made to skip partial aggregation.
