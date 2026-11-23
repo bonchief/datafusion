@@ -438,6 +438,26 @@ fn compact(batch: &RecordBatch) -> Result<RecordBatch> {
     )?)
 }
 
+/// String bytes a [`LimitedBatchCoalescer`] copies when `batch` is pushed
+/// into it: arrow's coalescer copies a view column's bytes when its buffers
+/// hold more than twice the bytes its views reference, and shares them
+/// otherwise.
+fn copied_bytes(batch: &RecordBatch) -> usize {
+    fn view<T: ByteViewType>(array: &arrow::array::ArrayRef) -> Option<usize> {
+        let array = array.as_byte_view_opt::<T>()?;
+        let used = array.total_buffer_bytes_used();
+        let held: usize = array.data_buffers().iter().map(|b| b.capacity()).sum();
+        Some(if held > used.saturating_mul(2) { used } else { 0 })
+    }
+    batch
+        .columns()
+        .iter()
+        .filter_map(|column| {
+            view::<StringViewType>(column).or_else(|| view::<BinaryViewType>(column))
+        })
+        .sum()
+}
+
 /// A producer-side coalescer shared across all input tasks targeting a
 /// single output partition.
 ///
@@ -1844,6 +1864,14 @@ struct RepartitionMetrics {
     ///
     /// One metric per output partition.
     send_time: Vec<metrics::Time>,
+    /// Time in nanos spent pushing batches into the output coalescers,
+    /// which includes the string bytes they copy (see `coalesce_copied_bytes`)
+    coalesce_time: metrics::Time,
+    /// Rows pushed into the output coalescers
+    coalesce_rows: metrics::Count,
+    /// String bytes the output coalescers copy: those of every view column
+    /// whose buffers hold more than twice the bytes its views reference
+    coalesce_copied_bytes: metrics::Count,
 }
 
 impl RepartitionMetrics {
@@ -1875,6 +1903,12 @@ impl RepartitionMetrics {
             fetch_time,
             repartition_time,
             send_time,
+            coalesce_time: MetricBuilder::new(metrics)
+                .subset_time("coalesce_time", input_partition),
+            coalesce_rows: MetricBuilder::new(metrics)
+                .counter("coalesce_rows", input_partition),
+            coalesce_copied_bytes: MetricBuilder::new(metrics)
+                .counter("coalesce_copied_bytes", input_partition),
         }
     }
 }
@@ -2769,7 +2803,13 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
+                    if output_channel.shared_coalescer.is_some() {
+                        metrics.coalesce_rows.add(batch.num_rows());
+                        metrics.coalesce_copied_bytes.add(copied_bytes(&batch));
+                    }
+                    let coalesce_timer = metrics.coalesce_time.timer();
                     output_channel.coalesce(batch, &mut coalesced)?;
+                    coalesce_timer.done();
                     for batch in coalesced.drain(..) {
                         if output_channel.send(batch, true).await.is_err() {
                             // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
