@@ -61,6 +61,8 @@ pub(super) struct BucketedAggregation {
     compacted_rows: metrics::Count,
     /// Time spent aggregating the rows of finished buckets
     bucket_aggregate_time: metrics::Time,
+    /// Rows aggregated from finished buckets
+    bucket_aggregated_rows: metrics::Count,
 }
 
 /// What [`BucketedAggregation::output_stream`] works with while it runs.
@@ -126,6 +128,9 @@ impl BucketedAggregation {
             .counter("bucket_compacted_rows", partition);
         let bucket_aggregate_time = MetricBuilder::new(&agg.metrics)
             .subset_time("bucket_aggregate_time", partition);
+        let bucket_aggregated_rows = MetricBuilder::new(&agg.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("bucket_aggregated_rows", partition);
         Self {
             trigger,
             agg,
@@ -140,6 +145,7 @@ impl BucketedAggregation {
             compaction_time,
             compacted_rows,
             bucket_aggregate_time,
+            bucket_aggregated_rows,
         }
     }
 
@@ -376,6 +382,7 @@ impl BucketedAggregation {
                     let aggregate_timer = self.bucket_aggregate_time.timer();
                     hash_table.aggregate_batch(&batch)?;
                     aggregate_timer.done();
+                    self.bucket_aggregated_rows.add(batch.num_rows());
                     table_rows += batch.num_rows();
 
                     let can_split = next_level < MAX_BUCKET_LEVELS;
