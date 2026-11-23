@@ -19,6 +19,7 @@ use datafusion_execution::async_try_stream;
 use futures::StreamExt;
 
 use crate::SendableRecordBatchStream;
+use crate::metrics;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
@@ -62,6 +63,18 @@ const MAX_COMPACTION_FACTOR: f64 = 2.0;
 /// the whole input is buffered (16 let peak memory reach 1.8x of a single
 /// table on input with 5 rows per group).
 const POOR_COMPACTION_FACTOR: f64 = 4.0;
+
+/// Time and rows of [`FinalBuckets::route`], shared by the buckets of every
+/// level of one aggregation partition.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RouteMetrics {
+    /// Hashing the group keys and sorting the row indices by bucket
+    pub(super) hash_time: metrics::Time,
+    /// Gathering the rows by bucket and appending them to their buckets
+    pub(super) move_time: metrics::Time,
+    /// Rows routed into buckets, counted again at every level
+    pub(super) rows: metrics::Count,
+}
 
 /// One hash bucket: its completed batches, held in memory or appended to a
 /// spill file, plus the rows not yet forming a full batch.
@@ -109,6 +122,7 @@ pub(super) struct FinalBuckets {
     spill_manager: Option<SpillManager>,
     batch_size: usize,
     min_compaction_rows: usize,
+    metrics: RouteMetrics,
     /// Reused buffers
     hashes: Vec<u64>,
     bucket_sizes: Vec<u32>,
@@ -122,6 +136,7 @@ impl FinalBuckets {
         batch_size: usize,
         level: u32,
         spill_manager: Option<SpillManager>,
+        metrics: RouteMetrics,
     ) -> Self {
         debug_assert!(level < MAX_BUCKET_LEVELS);
         let min_compaction_rows = MIN_COMPACTION_BATCHES * batch_size;
@@ -142,6 +157,7 @@ impl FinalBuckets {
             spill_manager,
             batch_size,
             min_compaction_rows,
+            metrics,
             hashes: vec![],
             bucket_sizes: vec![0; NUM_BUCKETS],
             reordered_indices: vec![],
@@ -172,6 +188,8 @@ impl FinalBuckets {
         if num_rows == 0 {
             return Ok(());
         }
+        self.metrics.rows.add(num_rows);
+        let hash_timer = self.metrics.hash_time.timer();
 
         let group_columns: &[ArrayRef] = &batch.columns()[..self.num_group_columns];
         self.hashes.clear();
@@ -199,6 +217,8 @@ impl FinalBuckets {
             self.reordered_indices[*cursor as usize] = row as u32;
             *cursor += 1;
         }
+        hash_timer.done();
+        let _move_timer = self.metrics.move_time.timer();
 
         // One gather for the whole batch, then a slice per bucket. The
         // coalescer copies the slice, so a bucket owns its batches.
@@ -457,7 +477,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("v", DataType::Int64, false),
         ]));
-        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None);
+        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
         // the same keys arrive in two different batches
         buckets.route(&test_batch(&schema, 0..20_000))?;
         buckets.route(&test_batch(&schema, 10_000..30_000))?;
@@ -501,13 +521,13 @@ mod tests {
             Field::new("v", DataType::Int64, false),
         ]));
         // Rows of one level-0 bucket must spread again at level 1
-        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None);
+        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
         level0.route(&test_batch(&schema, 0..50_000))?;
         let source = level0.into_sources()?.swap_remove(0);
         let BucketSource::Memory { batches, .. } = source else {
             unreachable!()
         };
-        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None);
+        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
         for batch in &batches {
             level1.route(batch)?;
         }

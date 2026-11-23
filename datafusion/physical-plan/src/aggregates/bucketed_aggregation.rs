@@ -19,10 +19,10 @@ use futures::future::BoxFuture;
 
 use super::AggregateExec;
 use super::aggregate_hash_table::{AggregateHashTable, FinalMarker};
-use super::final_buckets::{FinalBuckets, MAX_BUCKET_LEVELS};
+use super::final_buckets::{FinalBuckets, MAX_BUCKET_LEVELS, RouteMetrics};
 use crate::SendableRecordBatchStream;
 use crate::metrics;
-use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
+use crate::metrics::{BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
 
@@ -53,14 +53,30 @@ pub(super) struct BucketedAggregation {
     bucket_splits: metrics::Count,
     /// Number of times the rows of a bucket were replaced by their aggregated state
     bucket_compactions: metrics::Count,
+    /// Time and rows of routing rows into buckets
+    route_metrics: RouteMetrics,
+    /// Time spent compacting buckets
+    compaction_time: metrics::Time,
+    /// Rows aggregated again by compactions
+    compacted_rows: metrics::Count,
+    /// Time spent aggregating the rows of finished buckets
+    bucket_aggregate_time: metrics::Time,
 }
 
 /// What [`BucketedAggregation::output_stream`] works with while it runs.
 struct BucketOutput {
     reservation: MemoryReservation,
     baseline_metrics: BaselineMetrics,
+    /// The stream's `peak_mem_used`
+    peak_mem_used: metrics::Gauge,
     /// Combines the output of small buckets into batches of the target size.
     coalescer: BatchCoalescer,
+}
+
+impl BucketOutput {
+    fn record_peak(&self) {
+        self.peak_mem_used.set_max(self.reservation.size());
+    }
 }
 
 /// When the hash table of one partition stops growing and is split into
@@ -94,6 +110,22 @@ impl BucketedAggregation {
             MetricBuilder::new(&agg.metrics).counter("bucket_splits", partition);
         let bucket_compactions =
             MetricBuilder::new(&agg.metrics).counter("bucket_compactions", partition);
+        let route_metrics = RouteMetrics {
+            hash_time: MetricBuilder::new(&agg.metrics)
+                .subset_time("bucket_route_hash_time", partition),
+            move_time: MetricBuilder::new(&agg.metrics)
+                .subset_time("bucket_route_move_time", partition),
+            rows: MetricBuilder::new(&agg.metrics)
+                .with_category(MetricCategory::Rows)
+                .counter("bucket_routed_rows", partition),
+        };
+        let compaction_time = MetricBuilder::new(&agg.metrics)
+            .subset_time("bucket_compaction_time", partition);
+        let compacted_rows = MetricBuilder::new(&agg.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("bucket_compacted_rows", partition);
+        let bucket_aggregate_time = MetricBuilder::new(&agg.metrics)
+            .subset_time("bucket_aggregate_time", partition);
         Self {
             trigger,
             agg,
@@ -104,6 +136,10 @@ impl BucketedAggregation {
             spill_manager,
             bucket_splits,
             bucket_compactions,
+            route_metrics,
+            compaction_time,
+            compacted_rows,
+            bucket_aggregate_time,
         }
     }
 
@@ -180,6 +216,7 @@ impl BucketedAggregation {
             self.batch_size,
             level,
             self.spill_manager.clone(),
+            self.route_metrics.clone(),
         );
         self.bucket_splits.add(1);
         buckets.expect_kept(kept);
@@ -196,6 +233,7 @@ impl BucketedAggregation {
         buckets: &mut FinalBuckets,
         table: &mut Option<AggregateHashTable<FinalMarker>>,
     ) -> Result<()> {
+        let _timer = self.compaction_time.timer();
         while let Some(index) = buckets.bucket_to_compact() {
             let table = match table {
                 Some(table) => table,
@@ -212,6 +250,7 @@ impl BucketedAggregation {
                 input_rows,
             );
             self.bucket_compactions.add(1);
+            self.compacted_rows.add(input_rows);
         }
         Ok(())
     }
@@ -259,6 +298,7 @@ impl BucketedAggregation {
         buckets: FinalBuckets,
         reservation: MemoryReservation,
         baseline_metrics: BaselineMetrics,
+        peak_mem_used: metrics::Gauge,
     ) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.output_schema);
         let batch_size = self.batch_size;
@@ -266,6 +306,7 @@ impl BucketedAggregation {
             let mut output = BucketOutput {
                 reservation,
                 baseline_metrics,
+                peak_mem_used,
                 coalescer: BatchCoalescer::new(
                     Arc::clone(&self.output_schema),
                     batch_size,
@@ -328,10 +369,13 @@ impl BucketedAggregation {
                         sub_buckets.route(&batch)?;
                         self.compact(sub_buckets, &mut compaction_table)?;
                         self.reserve(&output.reservation, held_bytes, sub_buckets)?;
+                        output.record_peak();
                         continue;
                     }
 
+                    let aggregate_timer = self.bucket_aggregate_time.timer();
                     hash_table.aggregate_batch(&batch)?;
+                    aggregate_timer.done();
                     table_rows += batch.num_rows();
 
                     let can_split = next_level < MAX_BUCKET_LEVELS;
@@ -355,6 +399,7 @@ impl BucketedAggregation {
                         )?;
                         sub_buckets = Some(new_buckets);
                     }
+                    output.record_peak();
                 }
                 drop(input);
 

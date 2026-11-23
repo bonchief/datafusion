@@ -197,6 +197,10 @@ pub(crate) struct FinalHashAggregateStream {
     /// `hash_aggregate_bucket_threshold_bytes` (variable-width state) is set
     /// and applies.
     bucketing: Option<Arc<BucketedAggregation>>,
+    /// Largest size of `reservation`, sampled after each input batch and,
+    /// when the table was split into buckets, after each batch of a bucket.
+    /// The merge of spilled runs reserves its own memory, which is not counted.
+    peak_mem_used: metrics::Gauge,
 }
 
 #[derive(PartialEq)]
@@ -670,6 +674,8 @@ impl FinalHashAggregateStream {
         let batch_size = context.session_config().batch_size();
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
         let spill_metrics = SpillMetrics::new(&agg.metrics, partition);
+        let peak_mem_used = MetricBuilder::new(&agg.metrics)
+            .peak_memory_usage("peak_mem_used", partition);
 
         let hash_table = AggregateHashTable::<FinalMarker>::new(
             agg,
@@ -738,6 +744,7 @@ impl FinalHashAggregateStream {
             hash_table: Some(hash_table),
             spill_context,
             bucketing,
+            peak_mem_used,
         })
     }
 
@@ -775,6 +782,7 @@ impl FinalHashAggregateStream {
                     buckets,
                     bucket_reservation,
                     self.baseline_metrics.clone(),
+                    self.peak_mem_used.clone(),
                 );
                 while let Some(batch) = output.next().await.transpose()? {
                     emitter.emit(batch).await;
@@ -852,6 +860,8 @@ impl FinalHashAggregateStream {
 
         while let Some(batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
+            // The size reached by the previous batch
+            self.peak_mem_used.set_max(self.reservation.size());
 
             if let (Some(buckets), Some(bucketing)) =
                 (buckets.as_mut(), self.bucketing.as_ref())
@@ -945,6 +955,7 @@ impl FinalHashAggregateStream {
                 Err(e) => return Err(e),
             }
         }
+        self.peak_mem_used.set_max(self.reservation.size());
 
         Ok(buckets)
     }
@@ -1949,10 +1960,14 @@ mod tests {
         }
 
         let metrics = final_agg.metrics().expect("final aggregate has metrics");
-        let bucket_splits = metrics
-            .sum_by_name("bucket_splits")
-            .map(|value| value.as_usize())
-            .unwrap_or(0);
+        let metric = |name| metrics.sum_by_name(name).map_or(0, |value| value.as_usize());
+        let bucket_splits = metric("bucket_splits");
+        // The stream reports its peak reservation, and the buckets the rows
+        // routed into them: every group at least once
+        assert!(metric("peak_mem_used") > 0, "peak reservation reported");
+        if bucket_splits > 0 {
+            assert!(metric("bucket_routed_rows") >= num_groups);
+        }
         Ok((rows, bucket_splits, metrics.spill_count().unwrap_or(0)))
     }
 
