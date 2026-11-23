@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
     ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray,
@@ -15,6 +15,7 @@ use datafusion_common::hash_utils::RandomState;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{EmitTo, GroupSelection};
+use datafusion_physical_expr_common::group_hash::GroupHash;
 use half::f16;
 use hashbrown::hash_table::HashTable;
 #[cfg(not(feature = "force_hash_collisions"))]
@@ -100,6 +101,8 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     values: Vec<T::Native>,
     /// The random state used to generate hashes
     random_state: RandomState,
+    /// The hash of every group, when interned with carried hashes
+    carried: CarriedHashes,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
@@ -111,19 +114,25 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            carried: CarriedHashes::default(),
         }
     }
-}
 
-impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
-where
-    T::Native: HashValue,
-{
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    /// Interns the values of `cols`, probing with the [`GroupHash::table`]
+    /// hashes of `carried` when given and with the values' own hashes
+    /// otherwise.
+    fn intern_with(
+        &mut self,
+        cols: &[ArrayRef],
+        carried: Option<&[u64]>,
+        groups: &mut Vec<usize>,
+    ) where
+        T::Native: HashValue,
+    {
         assert_eq!(cols.len(), 1);
         groups.clear();
 
-        for v in cols[0].as_primitive::<T>() {
+        for (row, v) in cols[0].as_primitive::<T>().iter().enumerate() {
             let group_id = match v {
                 None => *self.null_group.get_or_insert_with(|| {
                     let group_id = self.values.len();
@@ -135,8 +144,10 @@ where
                     // so the bit-equal `is_eq` matches and the stored value is
                     // the canonical representative.
                     let key = key.normalize_key();
-                    let state = &self.random_state;
-                    let hash = key.hash(state);
+                    let hash = match carried {
+                        Some(carried) => GroupHash::new(carried[row]).table(),
+                        None => key.hash(&self.random_state),
+                    };
                     let insert = self.map.entry(
                         hash,
                         |&(g, h)| unsafe {
@@ -158,7 +169,41 @@ where
             };
             groups.push(group_id)
         }
+    }
+}
+
+impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
+where
+    T::Native: HashValue,
+{
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        if self.carried.is_carried() {
+            let hashes = self.carried.hash_rows(cols)?;
+            let interned = self.intern_hashed(cols, &hashes, groups);
+            self.carried.reuse(hashes);
+            return interned;
+        }
+        self.intern_with(cols, None, groups);
         Ok(())
+    }
+
+    fn intern_hashed(
+        &mut self,
+        cols: &[ArrayRef],
+        hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        assert_eq!(cols[0].len(), hashes.len());
+        self.carried.admit(self.values.len())?;
+        let first_new = self.values.len();
+        self.intern_with(cols, Some(hashes), groups);
+        self.carried
+            .record(first_new, self.values.len(), groups, hashes);
+        Ok(())
+    }
+
+    fn emit_hashes(&mut self) -> Option<Vec<u64>> {
+        self.carried.take_emitted()
     }
 
     fn reserve_groups(&mut self, capacity: usize) {
@@ -169,7 +214,10 @@ where
     }
 
     fn size(&self) -> usize {
-        size_of::<Self>() + self.map.allocation_size() + self.values.allocated_size()
+        size_of::<Self>()
+            + self.map.allocation_size()
+            + self.values.allocated_size()
+            + self.carried.size()
     }
 
     fn is_empty(&self) -> bool {
@@ -196,6 +244,7 @@ where
             PrimitiveArray::<T>::new(values.into(), nulls)
         }
 
+        self.carried.emit(emit_to);
         let array: PrimitiveArray<T> = match emit_to {
             EmitTo::All => {
                 self.map.clear();
@@ -272,6 +321,7 @@ where
 
         // Reset the null group index
         self.null_group = None;
+        self.carried.clear();
     }
 }
 

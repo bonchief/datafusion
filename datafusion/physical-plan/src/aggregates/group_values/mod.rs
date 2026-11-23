@@ -28,8 +28,11 @@ use crate::aggregates::{
     order::GroupClustering,
 };
 
+mod carried;
 mod metrics;
 mod null_builder;
+
+pub(crate) use carried::CarriedHashes;
 
 pub(crate) use metrics::{
     AccumulatorPhase, AggregateAccumulatorMetrics, AggregateArgumentMetrics,
@@ -83,6 +86,39 @@ pub trait GroupValues: Send {
     /// assigned. If a row has a new value, the next available group id is
     /// assigned.
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
+
+    /// [`Self::intern`] for rows whose group keys were hashed before:
+    /// `hashes[i]` is the [`GroupHash`] of row `i` of `cols`, computed with
+    /// [`GroupHash::STATE`] over the same key arrays.
+    ///
+    /// An implementation that supports it probes its table with those hashes
+    /// instead of hashing the rows, keeps the hash of every group for
+    /// [`Self::emit_hashes`], and from then on hashes the rows that
+    /// [`Self::intern`] gives it the same way, so that its table never mixes
+    /// hashes of two kinds (see `CarriedHashes`). The default ignores the
+    /// hashes.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    /// [`GroupHash::STATE`]: datafusion_physical_expr_common::group_hash::GroupHash::STATE
+    fn intern_hashed(
+        &mut self,
+        cols: &[ArrayRef],
+        hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        let _ = hashes;
+        self.intern(cols, groups)
+    }
+
+    /// The [`GroupHash`]es of the groups the last [`Self::emit`] (or
+    /// [`Self::emit_with_capacity`]) returned, in the same order, if this
+    /// implementation was interned with [`Self::intern_hashed`] and keeps
+    /// them. Each emit's hashes can be taken once. The default keeps none.
+    ///
+    /// [`GroupHash`]: datafusion_physical_expr_common::group_hash::GroupHash
+    fn emit_hashes(&mut self) -> Option<Vec<u64>> {
+        None
+    }
 
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///

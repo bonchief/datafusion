@@ -18,7 +18,8 @@ pub mod row_backed;
 use std::mem::{self, size_of};
 use std::sync::Arc;
 
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::carried::table_hashes;
+use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
     bytes_view::ByteViewGroupValueBuilder,
@@ -34,8 +35,7 @@ use arrow::datatypes::{
 };
 use datafusion_common::float_semantics::{has_float_leaf, normalize_floats};
 use datafusion_common::hash_utils::RandomState;
-use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{Result, not_impl_err};
+use datafusion_common::{Result, internal_err, not_impl_err};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
@@ -221,6 +221,9 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
 
     /// Random state for creating hashes
     random_state: RandomState,
+
+    /// The hash of every group, when interned with carried hashes
+    carried: CarriedHashes,
 }
 
 /// Buffers to store intermediate results in `vectorized_append`
@@ -301,6 +304,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             group_values,
             hashes_buffer: Default::default(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            carried: CarriedHashes::default(),
         })
     }
 
@@ -365,18 +369,16 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     fn scalarized_intern(
         &mut self,
         cols: &[ArrayRef],
+        carried: Option<&[u64]>,
         groups: &mut Vec<usize>,
     ) -> Result<()> {
-        let n_rows = cols[0].len();
-
         // tracks to which group each of the input rows belongs
         groups.clear();
 
-        // 1.1 Calculate the group keys for the group values
+        // 1.1 Calculate the group keys for the group values, or take the
+        // carried ones
         let batch_hashes = &mut self.hashes_buffer;
-        batch_hashes.clear();
-        batch_hashes.resize(n_rows, 0);
-        create_hashes(cols, &self.random_state, batch_hashes)?;
+        table_hashes(cols, carried, &self.random_state, batch_hashes)?;
 
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
             let entry = self
@@ -466,6 +468,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     fn vectorized_intern(
         &mut self,
         cols: &[ArrayRef],
+        carried: Option<&[u64]>,
         groups: &mut Vec<usize>,
     ) -> Result<()> {
         let n_rows = cols[0].len();
@@ -475,9 +478,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         groups.resize(n_rows, usize::MAX);
 
         let mut batch_hashes = mem::take(&mut self.hashes_buffer);
-        batch_hashes.clear();
-        batch_hashes.resize(n_rows, 0);
-        create_hashes(cols, &self.random_state, &mut batch_hashes)?;
+        table_hashes(cols, carried, &self.random_state, &mut batch_hashes)?;
 
         // General steps for one round `vectorized equal_to & append`:
         //   1. Collect vectorized context by checking hash values of `cols` in `map`,
@@ -1057,6 +1058,12 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
 
 impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        if self.carried.is_carried() {
+            let hashes = self.carried.hash_rows(cols)?;
+            let interned = self.intern_hashed(cols, &hashes, groups);
+            self.carried.reuse(hashes);
+            return interned;
+        }
         let normalized: Option<Vec<ArrayRef>> = cols
             .iter()
             .any(|col| col.data_type().is_nested() && has_float_leaf(col.data_type()))
@@ -1067,10 +1074,43 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         // `self.group_values` populated with one builder per schema field,
         // so no lazy initialization is needed here.
         if !STREAMING {
-            self.vectorized_intern(cols, groups)
+            self.vectorized_intern(cols, None, groups)
         } else {
-            self.scalarized_intern(cols, groups)
+            self.scalarized_intern(cols, None, groups)
         }
+    }
+
+    /// Nested keys with float leaves are not supported: they are normalized
+    /// before they are hashed, so a hash carried over the keys as they were
+    /// could tell apart rows that this table must group together.
+    fn intern_hashed(
+        &mut self,
+        cols: &[ArrayRef],
+        hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        if cols
+            .iter()
+            .any(|col| col.data_type().is_nested() && has_float_leaf(col.data_type()))
+        {
+            return internal_err!(
+                "Carried group hashes are not supported for nested keys with float values"
+            );
+        }
+        assert_eq!(cols[0].len(), hashes.len());
+        let first_new = self.len();
+        self.carried.admit(first_new)?;
+        if !STREAMING {
+            self.vectorized_intern(cols, Some(hashes), groups)?;
+        } else {
+            self.scalarized_intern(cols, Some(hashes), groups)?;
+        }
+        self.carried.record(first_new, self.len(), groups, hashes);
+        Ok(())
+    }
+
+    fn emit_hashes(&mut self) -> Option<Vec<u64>> {
+        self.carried.take_emitted()
     }
 
     fn emit_with_capacity(&mut self, capacity: usize) -> Result<Vec<ArrayRef>> {
@@ -1131,6 +1171,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             + self.emit_group_index_list_buffer.allocated_size()
             + self.vectorized_operation_buffers.size()
             + self.hashes_buffer.allocated_size()
+            + self.carried.size()
     }
 
     fn is_empty(&self) -> bool {
@@ -1146,6 +1187,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        self.carried.emit(emit_to);
         let output = match emit_to {
             EmitTo::All => {
                 // Replace the column builders with a fresh set so the
@@ -1290,6 +1332,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(num_rows);
+        self.carried.clear();
 
         // Such structures are only used in `non-streaming` case
         if !STREAMING {

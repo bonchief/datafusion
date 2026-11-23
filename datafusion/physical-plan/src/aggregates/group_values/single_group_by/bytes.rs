@@ -4,7 +4,7 @@
 
 use std::mem::size_of;
 
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait};
 use datafusion_common::Result;
@@ -22,6 +22,8 @@ pub struct GroupValuesBytes<O: OffsetSizeTrait> {
     map: ArrowBytesMap<O, usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+    /// The hash of every group, when interned with carried hashes
+    carried: CarriedHashes,
 }
 
 impl<O: OffsetSizeTrait> GroupValuesBytes<O> {
@@ -31,12 +33,19 @@ impl<O: OffsetSizeTrait> GroupValuesBytes<O> {
             // worth pre-allocating the hash table and the value buffer.
             map: ArrowBytesMap::with_capacity(output_type, INITIAL_MAP_CAPACITY),
             num_groups: 0,
+            carried: CarriedHashes::default(),
         }
     }
 }
 
 impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        if self.carried.is_carried() {
+            let hashes = self.carried.hash_rows(cols)?;
+            let interned = self.intern_hashed(cols, &hashes, groups);
+            self.carried.reuse(hashes);
+            return interned;
+        }
         assert_eq!(cols.len(), 1);
 
         // look up / add entries in the table
@@ -63,8 +72,42 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
         Ok(())
     }
 
+    fn intern_hashed(
+        &mut self,
+        cols: &[ArrayRef],
+        hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        assert_eq!(cols.len(), 1);
+        self.carried.admit(self.num_groups)?;
+        let first_new = self.num_groups;
+
+        let arr = &cols[0];
+        groups.clear();
+        self.map.insert_if_new_hashed(
+            arr,
+            hashes,
+            |_value| {
+                let group_idx = self.num_groups;
+                self.num_groups += 1;
+                group_idx
+            },
+            |group_idx| {
+                groups.push(group_idx);
+            },
+        );
+        assert_eq!(groups.len(), arr.len());
+        self.carried
+            .record(first_new, self.num_groups, groups, hashes);
+        Ok(())
+    }
+
+    fn emit_hashes(&mut self) -> Option<Vec<u64>> {
+        self.carried.take_emitted()
+    }
+
     fn size(&self) -> usize {
-        self.map.size() + size_of::<Self>()
+        self.map.size() + size_of::<Self>() + self.carried.size()
     }
 
     fn is_empty(&self) -> bool {
@@ -76,6 +119,7 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        self.carried.emit(emit_to);
         // Reset the map to default, and convert it into a single array
         let map_contents = self.map.take().into_state();
 
@@ -98,6 +142,8 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
                     map_contents.slice(n, map_contents.len() - n);
 
                 self.num_groups = 0;
+                // The groups left are interned again, with the hashes they carry
+                self.carried.restart();
                 let mut group_indexes = Vec::with_capacity(remaining_group_values.len());
                 self.intern(&[remaining_group_values], &mut group_indexes)?;
 
@@ -129,6 +175,7 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
         // capacities that `take` keeps for the emit path.
         self.map.clear_and_release();
         self.num_groups = 0;
+        self.carried.clear();
     }
 }
 

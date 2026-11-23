@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::{CarriedHashes, GroupValues};
 use arrow::array::{Array, ArrayRef};
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
@@ -20,6 +20,8 @@ pub struct GroupValuesBytesView {
     map: ArrowBytesViewMap<usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+    /// The hash of every group, when interned with carried hashes
+    carried: CarriedHashes,
 }
 
 impl GroupValuesBytesView {
@@ -29,6 +31,7 @@ impl GroupValuesBytesView {
             // worth pre-allocating the hash table.
             map: ArrowBytesViewMap::with_capacity(output_type, INITIAL_MAP_CAPACITY),
             num_groups: 0,
+            carried: CarriedHashes::default(),
         }
     }
 }
@@ -39,6 +42,12 @@ impl GroupValues for GroupValuesBytesView {
         cols: &[ArrayRef],
         groups: &mut Vec<usize>,
     ) -> datafusion_common::Result<()> {
+        if self.carried.is_carried() {
+            let hashes = self.carried.hash_rows(cols)?;
+            let interned = self.intern_hashed(cols, &hashes, groups);
+            self.carried.reuse(hashes);
+            return interned;
+        }
         assert_eq!(cols.len(), 1);
 
         // look up / add entries in the table
@@ -65,6 +74,40 @@ impl GroupValues for GroupValuesBytesView {
         Ok(())
     }
 
+    fn intern_hashed(
+        &mut self,
+        cols: &[ArrayRef],
+        hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> datafusion_common::Result<()> {
+        assert_eq!(cols.len(), 1);
+        self.carried.admit(self.num_groups)?;
+        let first_new = self.num_groups;
+
+        let arr = &cols[0];
+        groups.clear();
+        self.map.insert_if_new_hashed(
+            arr,
+            hashes,
+            |_value| {
+                let group_idx = self.num_groups;
+                self.num_groups += 1;
+                group_idx
+            },
+            |group_idx| {
+                groups.push(group_idx);
+            },
+        );
+        assert_eq!(groups.len(), arr.len());
+        self.carried
+            .record(first_new, self.num_groups, groups, hashes);
+        Ok(())
+    }
+
+    fn emit_hashes(&mut self) -> Option<Vec<u64>> {
+        self.carried.take_emitted()
+    }
+
     fn reserve_groups(&mut self, capacity: usize) {
         self.map.reserve_groups(capacity);
     }
@@ -74,11 +117,12 @@ impl GroupValues for GroupValuesBytesView {
         capacity: usize,
     ) -> datafusion_common::Result<Vec<ArrayRef>> {
         self.num_groups = 0;
+        self.carried.emit(EmitTo::All);
         Ok(vec![self.map.take_with_capacity(capacity)])
     }
 
     fn size(&self) -> usize {
-        self.map.size() + size_of::<Self>()
+        self.map.size() + size_of::<Self>() + self.carried.size()
     }
 
     fn is_empty(&self) -> bool {
@@ -90,6 +134,7 @@ impl GroupValues for GroupValuesBytesView {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {
+        self.carried.emit(emit_to);
         // Reset the map to default, and convert it into a single array
         let map_contents = self.map.take().into_state();
 
@@ -112,6 +157,8 @@ impl GroupValues for GroupValuesBytesView {
                     map_contents.slice(n, map_contents.len() - n);
 
                 self.num_groups = 0;
+                // The groups left are interned again, with the hashes they carry
+                self.carried.restart();
                 let mut group_indexes = Vec::with_capacity(remaining_group_values.len());
                 self.intern(&[remaining_group_values], &mut group_indexes)?;
 
@@ -143,6 +190,7 @@ impl GroupValues for GroupValuesBytesView {
         // capacity that `take` keeps for the emit path.
         self.map.clear_and_release();
         self.num_groups = 0;
+        self.carried.clear();
     }
 }
 
