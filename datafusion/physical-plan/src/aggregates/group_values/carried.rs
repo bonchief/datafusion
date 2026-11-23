@@ -141,12 +141,12 @@ impl CarriedHashes {
         self.0.as_mut().and_then(|kept| kept.emitted.take())
     }
 
-    /// Forgets every group's hash and whether hashes are carried, for an
-    /// implementation that dropped its groups. Hashes already emitted stay
-    /// until they are taken.
+    /// Forgets every group's hash, the hashes of the last emit and whether
+    /// hashes are carried, for an implementation that dropped its groups.
     pub(crate) fn clear(&mut self) {
         if let Some(kept) = &mut self.0 {
             kept.groups = None;
+            kept.emitted = None;
             kept.buffer = Vec::new();
         }
     }

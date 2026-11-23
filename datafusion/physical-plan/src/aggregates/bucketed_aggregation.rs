@@ -306,7 +306,7 @@ impl BucketedAggregation {
             let _timer = self.bucket_state_time.timer();
             table.take_state_batch()?
         };
-        let mut buckets = FinalBuckets::new(
+        let buckets = FinalBuckets::new(
             &self.state_schema,
             self.agg.group_by().num_group_exprs(),
             self.batch_size,
@@ -315,6 +315,11 @@ impl BucketedAggregation {
             self.spill_manager.clone(),
             self.route_metrics.clone(),
         );
+        let mut buckets = if self.agg.carries_group_hash() {
+            buckets.read_carried()
+        } else {
+            buckets
+        };
         self.bucket_splits.add(1);
         if let Some(state) = state {
             self.bucket_state_rows.add(state.num_rows());

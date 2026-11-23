@@ -50,14 +50,16 @@ use datafusion_common::{
     ColumnStatistics, DataFusionError, HashMap, SplitPoint, assert_or_internal_err,
     internal_datafusion_err, internal_err,
 };
-use datafusion_common::{Result, not_impl_err};
+use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, RangePartitioning};
-use datafusion_physical_expr_common::group_hash::carried_group_hashes;
+use datafusion_physical_expr_common::group_hash::{
+    carried_group_hashes, carries_first_keys,
+};
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 #[cfg(feature = "proto")]
@@ -400,6 +402,16 @@ impl OutputChannel {
 /// views reference rewritten into buffers of exactly those bytes
 /// ([`arrow::array::GenericByteViewArray::gc`]); its other columns, and a view column
 /// within that bound, are shared as they are.
+/// Whether `exprs` are exactly the columns `0..n`, in order: the keys a
+/// carried group hash covers (see `AggregateExec::with_group_hash`).
+fn are_first_columns(exprs: &[Arc<dyn PhysicalExpr>]) -> bool {
+    !exprs.is_empty()
+        && exprs.iter().enumerate().all(|(index, expr)| {
+            expr.downcast_ref::<Column>()
+                .is_some_and(|column| column.index() == index)
+        })
+}
+
 fn compact(batch: &RecordBatch) -> Result<RecordBatch> {
     fn view<T: ByteViewType>(
         array: &arrow::array::ArrayRef,
@@ -674,6 +686,7 @@ impl RepartitionExecState {
         input: &Arc<dyn ExecutionPlan>,
         metrics: &ExecutionPlanMetricsSet,
         partitioning: &Partitioning,
+        carried_group_hash: bool,
         preserve_order: bool,
         memory_wait: bool,
         name: &str,
@@ -859,6 +872,7 @@ impl RepartitionExecState {
                 stream,
                 txs,
                 partitioning.clone(),
+                carried_group_hash,
                 range_router.clone(),
                 metrics,
                 // preserve_order depends on partition index to start from 0
@@ -892,10 +906,10 @@ pub struct BatchPartitioner {
 enum BatchPartitionerState {
     Hash {
         exprs: Vec<Arc<dyn PhysicalExpr>>,
-        /// The column index of each of `exprs`, if they are all columns: a
-        /// batch whose last column carries the group hash of exactly these
-        /// columns (see `AggregateExec::with_group_hash`) is routed by it.
-        keys: Option<Vec<usize>>,
+        /// The key columns `0..n` whose group hash each batch carries in its
+        /// last column, set by [`BatchPartitioner::with_carried_group_hash`].
+        /// Each batch is then routed by that column instead of hashing `exprs`.
+        carried: Option<Vec<usize>>,
         partition_reducer: StrengthReducedU64,
         hash_buffer: Vec<u64>,
         indices: Vec<Vec<u32>>,
@@ -1286,20 +1300,39 @@ impl BatchPartitioner {
             return internal_err!("Hash repartition requires at least one partition");
         }
 
-        let keys = exprs
-            .iter()
-            .map(|expr| expr.downcast_ref::<Column>().map(Column::index))
-            .collect();
         Ok(Self {
             state: BatchPartitionerState::Hash {
                 exprs,
-                keys,
+                carried: None,
                 partition_reducer: StrengthReducedU64::new(num_partitions as u64),
                 hash_buffer: vec![],
                 indices: vec![vec![]; num_partitions],
             },
             timer,
         })
+    }
+
+    /// Route each batch by the group hash it carries in its last column (see
+    /// `AggregateExec::with_group_hash`) instead of hashing the partitioning
+    /// expressions. The carried hash is the hash the partitioner computes (see
+    /// `GroupHash::STATE`), so both route a row to the same partition.
+    ///
+    /// # Errors
+    /// Returns an error unless this is a hash partitioner whose expressions
+    /// are exactly the columns `0..n`. A batch that does not then carry the
+    /// hash of those columns fails to partition.
+    pub fn with_carried_group_hash(mut self) -> Result<Self> {
+        match &mut self.state {
+            BatchPartitionerState::Hash { exprs, carried, .. }
+                if are_first_columns(exprs) =>
+            {
+                *carried = Some((0..exprs.len()).collect());
+                Ok(self)
+            }
+            _ => internal_err!(
+                "A carried group hash routes only by the hash of the columns 0..n"
+            ),
+        }
     }
 
     /// Create a new [`BatchPartitioner`] for round-robin repartitioning.
@@ -1508,7 +1541,7 @@ impl BatchPartitioner {
                 }
                 BatchPartitionerState::Hash {
                     exprs,
-                    keys,
+                    carried,
                     partition_reducer,
                     hash_buffer,
                     indices,
@@ -1519,11 +1552,15 @@ impl BatchPartitioner {
                     hash_buffer.clear();
                     // The carried hash is the hash computed below, see
                     // `GroupHash::STATE`.
-                    match keys
-                        .as_deref()
-                        .and_then(|keys| carried_group_hashes(&batch, keys))
-                    {
-                        Some(carried) => hash_buffer.extend_from_slice(carried),
+                    match carried.as_deref() {
+                        Some(keys) => {
+                            let Some(hashes) = carried_group_hashes(&batch, keys) else {
+                                return internal_err!(
+                                    "Hash repartition expected a batch carrying the group hash of columns {keys:?}"
+                                );
+                            };
+                            hash_buffer.extend_from_slice(hashes);
+                        }
                         None => {
                             let arrays =
                                 evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
@@ -1812,6 +1849,9 @@ pub struct RepartitionExec {
     /// Whether producers wait for consumers to drain memory instead of
     /// spilling. See [`Self::with_memory_wait`].
     memory_wait: bool,
+    /// Whether rows are routed by the group hash the input carries. See
+    /// [`Self::with_carried_group_hash`].
+    carried_group_hash: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1890,6 +1930,12 @@ impl RepartitionExec {
         self.preserve_order
     }
 
+    /// Whether rows are routed by the group hash the input carries. See
+    /// [`Self::with_carried_group_hash`].
+    pub fn carries_group_hash(&self) -> bool {
+        self.carried_group_hash
+    }
+
     /// Get name used to display this Exec
     pub fn name(&self) -> &str {
         "RepartitionExec"
@@ -1921,6 +1967,10 @@ impl DisplayAs for RepartitionExec {
 
                 if let Some(sort_exprs) = self.sort_exprs() {
                     write!(f, ", sort_exprs={}", sort_exprs.clone())?;
+                }
+
+                if self.carried_group_hash {
+                    write!(f, ", carried_group_hash=true")?;
                 }
             }
             DisplayFormatType::TreeRender => {
@@ -1992,6 +2042,11 @@ impl ExecutionPlan for RepartitionExec {
                     repartition = repartition.with_preserve_order();
                 }
                 repartition.memory_wait = self.memory_wait;
+                // A new input routes by its carried hash only if it still
+                // carries one; otherwise the partitioner hashes the same keys
+                // to the same partitions.
+                repartition.carried_group_hash =
+                    self.carried_group_hash && repartition.can_carry_group_hash();
                 Ok(Arc::new(repartition))
             }
         }
@@ -2043,6 +2098,7 @@ impl ExecutionPlan for RepartitionExec {
         let metrics = self.metrics.clone();
         let preserve_order = self.sort_exprs().is_some();
         let memory_wait = self.memory_wait;
+        let carried_group_hash = self.carried_group_hash;
         let name = self.name().to_owned();
         let schema = self.schema();
         let schema_captured = Arc::clone(&schema);
@@ -2081,6 +2137,7 @@ impl ExecutionPlan for RepartitionExec {
                     &input,
                     &metrics,
                     &partitioning,
+                    carried_group_hash,
                     preserve_order,
                     memory_wait,
                     &name,
@@ -2379,6 +2436,7 @@ impl ExecutionPlan for RepartitionExec {
             cache: new_properties.into(),
             batch_size: self.batch_size,
             memory_wait: self.memory_wait,
+            carried_group_hash: self.carried_group_hash,
         })))
     }
 
@@ -2403,6 +2461,7 @@ impl ExecutionPlan for RepartitionExec {
             // Opt-in wait for memory, set by the planner that knows every output
             // has its own reader; not part of the wire format.
             memory_wait: _,
+            carried_group_hash,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -2416,6 +2475,7 @@ impl ExecutionPlan for RepartitionExec {
                         input: Some(Box::new(input)),
                         partitioning: Some(partitioning),
                         preserve_order: *preserve_order,
+                        carried_group_hash: *carried_group_hash,
                     },
                 )),
             ),
@@ -2439,6 +2499,7 @@ impl RepartitionExec {
             input,
             partitioning,
             preserve_order,
+            carried_group_hash,
         } = &**repart;
         let input =
             ctx.decode_required_child(input.as_deref(), "RepartitionExec", "input")?;
@@ -2464,6 +2525,9 @@ impl RepartitionExec {
         if *preserve_order {
             repart_exec = repart_exec.with_preserve_order();
         }
+        if *carried_group_hash {
+            repart_exec = repart_exec.with_carried_group_hash()?;
+        }
         Ok(Arc::new(repart_exec))
     }
 }
@@ -2486,6 +2550,7 @@ impl RepartitionExec {
             cache: Arc::new(cache),
             batch_size: None,
             memory_wait: false,
+            carried_group_hash: false,
         })
     }
 
@@ -2611,6 +2676,40 @@ impl RepartitionExec {
         self
     }
 
+    /// Route each row by the group hash its input carries in the last column
+    /// instead of hashing the partitioning expressions again. The carried hash
+    /// is the hash this operator computes (see `GroupHash::STATE`), so every
+    /// row goes to the same partition either way.
+    ///
+    /// The hash partitioning must be on exactly the columns `0..n` and the
+    /// input must carry their group hash, as a partial aggregate set with
+    /// `AggregateExec::with_group_hash` does. The plan decides this, not the
+    /// batches: an input whose batch then lacks the column fails.
+    ///
+    /// # Errors
+    /// Returns an error if the partitioning or the input does not qualify.
+    pub fn with_carried_group_hash(mut self) -> Result<Self> {
+        if !self.can_carry_group_hash() {
+            return plan_err!(
+                "RepartitionExec routes by a carried group hash only for a hash partitioning on the columns 0..n of an input that carries their hash"
+            );
+        }
+        self.carried_group_hash = true;
+        Ok(self)
+    }
+
+    /// Whether this is a hash partitioning on the columns `0..n` of an input
+    /// that carries their group hash.
+    fn can_carry_group_hash(&self) -> bool {
+        match self.partitioning() {
+            Partitioning::Hash(exprs, _) => {
+                are_first_columns(exprs)
+                    && carries_first_keys(&self.input.schema(), exprs.len())
+            }
+            _ => false,
+        }
+    }
+
     /// Return the sort expressions that are used to merge
     fn sort_exprs(&self) -> Option<&LexOrdering> {
         if self.preserve_order {
@@ -2624,10 +2723,12 @@ impl RepartitionExec {
     /// output partitions based on the desired partitioning
     ///
     /// `output_channels` holds the output sending channels for each output partition
+    #[expect(clippy::too_many_arguments)]
     async fn pull_from_input(
         mut stream: SendableRecordBatchStream,
         mut output_channels: HashMap<usize, OutputChannel>,
         partitioning: Partitioning,
+        carried_group_hash: bool,
         range_router: Option<Arc<RangeRouter>>,
         metrics: RepartitionMetrics,
         input_partition: usize,
@@ -2644,12 +2745,19 @@ impl RepartitionExec {
                     metrics.repartition_time.clone(),
                 )
             }
-            (partitioning, _) => BatchPartitioner::try_new(
-                partitioning,
-                metrics.repartition_time.clone(),
-                input_partition,
-                num_input_partitions,
-            )?,
+            (partitioning, _) => {
+                let partitioner = BatchPartitioner::try_new(
+                    partitioning,
+                    metrics.repartition_time.clone(),
+                    input_partition,
+                    num_input_partitions,
+                )?;
+                if carried_group_hash {
+                    partitioner.with_carried_group_hash()?
+                } else {
+                    partitioner
+                }
+            }
         };
 
         // While there are still outputs to send to, keep pulling inputs
@@ -3201,19 +3309,25 @@ mod tests {
     fn hash_partitioner_routes_by_carried_group_hash() -> Result<()> {
         use datafusion_physical_expr_common::group_hash::group_hash_field;
 
-        let partitions_of = |batch: &RecordBatch| -> Result<Vec<(usize, usize)>> {
-            let metrics = ExecutionPlanMetricsSet::new();
-            let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
-            let keys = vec![col("k", &batch.schema())?];
-            let mut partitioner = BatchPartitioner::new_hash_partitioner(keys, 4, timer)?;
-            let mut routed = vec![];
-            partitioner.partition(batch.clone(), |partition, batch| {
-                routed.push((partition, batch.num_rows()));
-                Ok(())
-            })?;
-            routed.sort_unstable();
-            Ok(routed)
-        };
+        let partitions_of =
+            |batch: &RecordBatch, carried: bool| -> Result<Vec<(usize, usize)>> {
+                let metrics = ExecutionPlanMetricsSet::new();
+                let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
+                let keys = vec![col("k", &batch.schema())?];
+                let partitioner = BatchPartitioner::new_hash_partitioner(keys, 4, timer)?;
+                let mut partitioner = if carried {
+                    partitioner.with_carried_group_hash()?
+                } else {
+                    partitioner
+                };
+                let mut routed = vec![];
+                partitioner.partition(batch.clone(), |partition, batch| {
+                    routed.push((partition, batch.num_rows()));
+                    Ok(())
+                })?;
+                routed.sort_unstable();
+                Ok(routed)
+            };
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
         // Every row claims the hash 6, which is not the keys' hash
         let hashes: ArrayRef = Arc::new(UInt64Array::from(vec![6u64; 4]));
@@ -3226,21 +3340,128 @@ mod tests {
                 vec![Arc::clone(&keys), Arc::clone(&hashes)],
             )
         };
+        let carrying = batch(group_hash_field(&[0]))?;
 
-        // The carried hash of column 0 routes every row to 6 % 4
-        assert_eq!(
-            partitions_of(&batch(group_hash_field(&[0]))?)?,
-            vec![(2, 4)]
-        );
+        // Told to, the partitioner routes every row by its carried hash: 6 % 4
+        assert_eq!(partitions_of(&carrying, true)?, vec![(2, 4)]);
 
-        // A hash of other columns, or a column that only looks like one, is
-        // not used: the keys spread over the partitions
+        // Not told to, it hashes the keys whatever the batch's metadata says:
+        // the keys spread over the partitions
+        assert!(partitions_of(&carrying, false)?.len() > 1);
+
+        // Told to, a batch without the hash of exactly its keys is an error
         for field in [
             group_hash_field(&[1]),
             Field::new("__group_hash", DataType::UInt64, false),
         ] {
-            assert!(partitions_of(&batch(field)?)?.len() > 1);
+            assert!(partitions_of(&batch(field)?, true).is_err());
         }
+
+        // Only a partitioning on the columns 0..n can route by a carried hash
+        let metrics = ExecutionPlanMetricsSet::new();
+        let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
+        let on_second = vec![Arc::new(Column::new("h", 1)) as Arc<dyn PhysicalExpr>];
+        assert!(
+            BatchPartitioner::new_hash_partitioner(on_second, 4, timer)?
+                .with_carried_group_hash()
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// The output of a partial aggregation that carries its group hash goes to
+    /// the same partitions routed by that hash as by hashing its keys, for
+    /// every row.
+    #[tokio::test]
+    async fn carried_group_hash_routes_rows_where_their_keys_do() -> Result<()> {
+        use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+        use arrow::array::Int64Array;
+        use datafusion_functions_aggregate::count::count_udaf;
+        use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let rows = 5000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from_iter((0..rows).map(|row| {
+                    (row % 13 != 0).then(|| format!("a group name {}", row % 1009))
+                }))),
+                Arc::new(Int64Array::from_iter(
+                    (0..rows as i64).map(|row| (row % 7 != 0).then_some(row % 31)),
+                )),
+                Arc::new(Int64Array::from(vec![1i64; rows])),
+            ],
+        )?;
+        let group_by = PhysicalGroupBy::new_single(vec![
+            (col("name", &schema)?, "name".to_string()),
+            (col("n", &schema)?, "n".to_string()),
+        ]);
+        let count = AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("count_value")
+            .build()?;
+        let partial = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by,
+            vec![Arc::new(count)],
+            vec![None],
+            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?,
+            Arc::clone(&schema),
+        )?
+        .with_group_hash()?;
+        let carrying =
+            collect(Arc::new(partial), Arc::new(TaskContext::default())).await?;
+
+        let route = |batch: &RecordBatch,
+                     carried: bool|
+         -> Result<Vec<(usize, String)>> {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let timer = MetricBuilder::new(&metrics).subset_time("test", 0);
+            let exprs = vec![
+                Arc::new(Column::new("name", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("n", 1)),
+            ];
+            let partitioner = BatchPartitioner::new_hash_partitioner(exprs, 7, timer)?;
+            let mut partitioner = if carried {
+                partitioner.with_carried_group_hash()?
+            } else {
+                partitioner
+            };
+            let mut routed = vec![];
+            partitioner.partition(batch.clone(), |partition, batch| {
+                let names = batch.column(0).as_string::<i32>();
+                let ns = batch
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int64Type>();
+                for row in 0..batch.num_rows() {
+                    let key = format!(
+                        "{:?}/{:?}",
+                        names.is_valid(row).then(|| names.value(row)),
+                        ns.is_valid(row).then(|| ns.value(row))
+                    );
+                    routed.push((partition, key));
+                }
+                Ok(())
+            })?;
+            routed.sort_unstable();
+            Ok(routed)
+        };
+        let mut groups = HashSet::new();
+        for batch in &carrying {
+            let keys_only = batch.project(&[0, 1, 2])?;
+            let by_keys = route(&keys_only, false)?;
+            assert_eq!(route(batch, true)?, by_keys);
+            groups.extend(by_keys.into_iter().map(|(_, key)| key));
+        }
+        // Every group of the input was routed, nulls included
+        assert!(groups.len() > 1009, "{} groups", groups.len());
+        assert!(groups.iter().any(|key| key.starts_with("None/")));
+        assert!(groups.iter().any(|key| key.ends_with("/None")));
         Ok(())
     }
 

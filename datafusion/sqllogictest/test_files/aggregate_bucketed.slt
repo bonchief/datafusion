@@ -232,7 +232,7 @@ logical_plan
 physical_plan
 01)ProjectionExec: expr=[concat(Utf8("key-"),t.v % Int64(9973))@0 as k, count(Int64(1))@1 as c]
 02)--AggregateExec: mode=FinalPartitioned, gby=[concat(Utf8("key-"),t.v % Int64(9973))@0 as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
-03)----RepartitionExec: partitioning=Hash([concat(Utf8("key-"),t.v % Int64(9973))@0], 4), input_partitions=4
+03)----RepartitionExec: partitioning=Hash([concat(Utf8("key-"),t.v % Int64(9973))@0], 4), input_partitions=4, carried_group_hash=true
 04)------AggregateExec: mode=Partial, gby=[concat(key-, CAST(v@0 % 9973 AS Utf8View)) as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
 05)--------DataSourceExec: partitions=4, partition_sizes=[49, 49, 49, 49]
 
@@ -277,6 +277,58 @@ reset datafusion.execution.skip_partial_aggregation_probe_rows_threshold;
 
 statement ok
 reset datafusion.execution.skip_partial_aggregation_probe_ratio_threshold;
+
+# A partitioned join over a carried final: the final's partitions are the
+# exchange's, routed by the carried hash, and the join's other side is hashed
+# into the same partitions without one.
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold = 0;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold_rows = 0;
+
+query TT
+explain select count(*), sum(a.c) from (select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k) a join (select concat('key-', cast(v as varchar)) as k from t where v <= 9973) b on a.k = b.k;
+----
+logical_plan
+01)Projection: count(Int64(1)) AS count(*), sum(a.c)
+02)--Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), sum(a.c)]]
+03)----Projection: a.c
+04)------Inner Join: a.k = b.k
+05)--------SubqueryAlias: a
+06)----------Projection: concat(Utf8("key-"),t.v % Int64(9973)) AS k, count(Int64(1)) AS count(*) AS c
+07)------------Aggregate: groupBy=[[concat(Utf8View("key-"), CAST(t.v % Int64(9973) AS Utf8View)) AS concat(Utf8("key-"),t.v % Int64(9973))]], aggr=[[count(Int64(1))]]
+08)--------------TableScan: t projection=[v]
+09)--------SubqueryAlias: b
+10)----------Projection: concat(Utf8View("key-"), CAST(t.v AS Utf8View)) AS k
+11)------------Filter: t.v <= Int64(9973)
+12)--------------TableScan: t projection=[v]
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(a.c)@1 as sum(a.c)]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(a.c)]
+03)----CoalescePartitionsExec
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), sum(a.c)]
+05)--------HashJoinExec: mode=Partitioned, join_type=Inner, on=[(k@0, k@0)], projection=[c@1]
+06)----------ProjectionExec: expr=[concat(Utf8("key-"),t.v % Int64(9973))@0 as k, count(Int64(1))@1 as c]
+07)------------AggregateExec: mode=FinalPartitioned, gby=[concat(Utf8("key-"),t.v % Int64(9973))@0 as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
+08)--------------RepartitionExec: partitioning=Hash([concat(Utf8("key-"),t.v % Int64(9973))@0], 4), input_partitions=4, carried_group_hash=true
+09)----------------AggregateExec: mode=Partial, gby=[concat(key-, CAST(v@0 % 9973 AS Utf8View)) as concat(Utf8("key-"),t.v % Int64(9973))], aggr=[count(Int64(1))], group_hash
+10)------------------DataSourceExec: partitions=4, partition_sizes=[49, 49, 49, 49]
+11)----------RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=4
+12)------------ProjectionExec: expr=[concat(key-, CAST(v@0 AS Utf8View)) as k]
+13)--------------FilterExec: v@0 <= 9973
+14)----------------DataSourceExec: partitions=4, partition_sizes=[49, 49, 49, 49]
+
+query II
+select count(*), sum(a.c) from (select concat('key-', cast(v % 9973 as varchar)) as k, count(*) c from t group by k) a join (select concat('key-', cast(v as varchar)) as k from t where v <= 9973) b on a.k = b.k;
+----
+9972 199980
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold_rows;
 
 statement ok
 reset datafusion.execution.carry_group_hash;

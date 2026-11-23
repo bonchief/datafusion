@@ -20,7 +20,6 @@ use datafusion_execution::async_try_stream;
 use datafusion_physical_expr_common::group_hash::GroupHash;
 use futures::StreamExt;
 
-use super::aggregate_hash_table::carries_group_hash;
 use super::bucketed_aggregation::is_fixed_width;
 use crate::SendableRecordBatchStream;
 use crate::metrics;
@@ -133,7 +132,8 @@ pub(super) struct FinalBuckets {
     bits: u32,
     /// Number of leading columns of a batch that are the group keys
     num_group_columns: usize,
-    /// The rows carry their [`GroupHash`] in their last column
+    /// The rows' [`GroupHash`] is read from their last column, set by
+    /// [`Self::read_carried`]; otherwise it is computed from their keys
     carried: bool,
     /// Memory charged for the routed batches that pending slices share
     routed_bytes: usize,
@@ -175,7 +175,7 @@ impl FinalBuckets {
             offset,
             bits,
             num_group_columns,
-            carried: carries_group_hash(schema),
+            carried: false,
             routed_bytes: 0,
             buckets: (0..1 << bits).map(|_| bucket()).collect(),
             spill_manager,
@@ -185,6 +185,14 @@ impl FinalBuckets {
             starts: vec![],
             coalesced,
         }
+    }
+
+    /// Route rows by the [`GroupHash`] they carry in their last column, for
+    /// a final aggregation whose plan reads it
+    /// (`AggregateExec::with_read_group_hash`), instead of hashing their keys.
+    pub(super) fn read_carried(mut self) -> Self {
+        self.carried = true;
+        self
     }
 
     /// The bit offset and width of a split of one of these buckets, if
@@ -725,7 +733,9 @@ mod tests {
         BooleanArray, Int64Array, StringArray, StringViewArray, UInt64Array,
     };
     use arrow::datatypes::{Field, Int64Type, Schema};
-    use datafusion_physical_expr_common::group_hash::group_hash_field;
+    use datafusion_physical_expr_common::group_hash::{
+        group_hash_field, group_hash_keys,
+    };
     use std::collections::HashMap;
 
     fn schema(carried: bool) -> SchemaRef {
@@ -751,7 +761,11 @@ mod tests {
             Arc::new(names),
             Arc::new(values),
         ];
-        if carries_group_hash(schema) {
+        if schema
+            .fields()
+            .last()
+            .is_some_and(|field| group_hash_keys(field).is_some())
+        {
             // A hash that puts key k in bucket k % 64 of the first 6 bits
             let hashes: UInt64Array = keys
                 .map(|k| ((k as u64) % 64) << GroupHash::BUCKET_SHIFT)
@@ -918,7 +932,8 @@ mod tests {
     async fn routes_by_the_carried_hash() -> Result<()> {
         let schema = schema(true);
         let mut buckets =
-            FinalBuckets::new(&schema, 2, 1024, 0, 6, None, RouteMetrics::default());
+            FinalBuckets::new(&schema, 2, 1024, 0, 6, None, RouteMetrics::default())
+                .read_carried();
         buckets.route(&test_batch(&schema, 0..6_400))?;
         let (sources, _) = buckets.into_sources()?;
         assert_eq!(sources.len(), 64);

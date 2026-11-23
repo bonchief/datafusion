@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, Field, UInt64Type};
+use arrow::datatypes::{DataType, Field, Schema, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 
@@ -115,6 +115,23 @@ pub fn group_hash_keys(field: &Field) -> Option<Vec<usize>> {
     }
     let keys = field.metadata().get(GROUP_HASH_METADATA)?;
     keys.split(',').map(|key| key.parse().ok()).collect()
+}
+
+/// True if the last field of `schema` carries the [`GroupHash`] of exactly
+/// its first `num_keys` fields, in order, and is not one of them.
+///
+/// A plan decides whether an operator reads that column (see
+/// `AggregateExec::with_read_group_hash` and
+/// `RepartitionExec::with_carried_group_hash`): this only checks, when such a
+/// flag is set, that the column it names is the one it expects.
+pub fn carries_first_keys(schema: &Schema, num_keys: usize) -> bool {
+    let fields = schema.fields();
+    num_keys > 0
+        && fields.len() > num_keys
+        && fields
+            .last()
+            .and_then(|field| group_hash_keys(field))
+            .is_some_and(|keys| keys.iter().copied().eq(0..num_keys))
 }
 
 /// The [`GroupHash`] of every row of `batch`, if its last column carries

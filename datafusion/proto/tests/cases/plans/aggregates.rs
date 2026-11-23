@@ -350,3 +350,83 @@ fn roundtrip_aggregate_udaf() -> Result<()> {
         &ctx,
     )
 }
+
+/// A partial aggregation that carries its group hash, the exchange that routes
+/// by it and the final aggregation that reads it keep their flags across the
+/// wire, and the partial's schema keeps exactly one hash column.
+#[test]
+fn roundtrip_carried_group_hash() -> Result<()> {
+    use datafusion::physical_expr::Partitioning;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion_functions_aggregate::count::count_udaf;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]));
+    let group_by = PhysicalGroupBy::new_single(vec![
+        (col("name", &schema)?, "name".to_string()),
+        (col("n", &schema)?, "n".to_string()),
+    ]);
+    let count = Arc::new(
+        AggregateExprBuilder::new(count_udaf(), vec![col("n", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("count(n)")
+            .build()?,
+    );
+    let partial = Arc::new(
+        AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by.clone(),
+            vec![Arc::clone(&count)],
+            vec![None],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::clone(&schema),
+        )?
+        .with_group_hash()?,
+    );
+    let partial_fields = partial.schema().fields().len();
+    let on = vec![
+        col("name", &partial.schema())?,
+        col("n", &partial.schema())?,
+    ];
+    let exchange = Arc::new(
+        RepartitionExec::try_new(partial, Partitioning::Hash(on, 4))?
+            .with_carried_group_hash()?,
+    );
+    let final_agg = Arc::new(
+        AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by.as_final(),
+            vec![count],
+            vec![None],
+            exchange,
+            Arc::clone(&schema),
+        )?
+        .with_read_group_hash()?,
+    );
+
+    let ctx = SessionContext::new();
+    let decoded = super::roundtrip_test_and_return(
+        final_agg,
+        &ctx,
+        &DefaultPhysicalExtensionCodec {},
+        &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+    )?;
+    let final_agg = decoded
+        .downcast_ref::<AggregateExec>()
+        .expect("decoded final aggregation");
+    assert!(final_agg.carries_group_hash());
+    let exchange = final_agg
+        .input()
+        .downcast_ref::<RepartitionExec>()
+        .expect("decoded exchange");
+    assert!(exchange.carries_group_hash());
+    let partial = exchange
+        .input()
+        .downcast_ref::<AggregateExec>()
+        .expect("decoded partial aggregation");
+    assert!(partial.carries_group_hash());
+    assert_eq!(partial.schema().fields().len(), partial_fields);
+    Ok(())
+}

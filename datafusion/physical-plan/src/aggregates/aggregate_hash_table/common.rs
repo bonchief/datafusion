@@ -19,7 +19,9 @@ use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{AggregateMetrics, EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion_physical_expr_common::group_hash::{GroupHash, group_hash_keys};
+use datafusion_physical_expr_common::group_hash::{
+    GroupHash, carries_first_keys, group_hash_keys,
+};
 use log::debug;
 
 use crate::PhysicalExpr;
@@ -140,10 +142,11 @@ pub(in crate::aggregates) struct AggregateHashTable<AggrMode> {
 }
 
 /// Where a table takes the [`GroupHash`] of each input row from, decided by
-/// its schemas: a table whose input ends with a group hash column (see
-/// [`group_hash_keys`]) interns with those hashes; a table that emits such a
-/// column but does not read one hashes its group keys itself, once, and the
-/// hashes leave with the groups. See `AggregateExec::with_group_hash`.
+/// its aggregation's plan (`AggregateExec::carries_group_hash`), never by a
+/// schema: a table of a final aggregation that reads the hashes interns with
+/// its input's last column; a table of a partial aggregation that carries
+/// them hashes its group keys itself, once, and the hashes leave with the
+/// groups. Any other table neither reads nor emits them.
 #[derive(Debug)]
 pub(in crate::aggregates) enum RowHashes {
     /// The table neither reads nor emits group hashes.
@@ -156,17 +159,30 @@ pub(in crate::aggregates) enum RowHashes {
 }
 
 impl RowHashes {
-    pub(super) fn new(input_schema: &SchemaRef, output_schemas: &[&SchemaRef]) -> Self {
-        if carries_group_hash(input_schema) {
-            Self::Read
-        } else if output_schemas
-            .iter()
-            .any(|schema| carries_group_hash(schema))
-        {
-            Self::Compute(Vec::new())
-        } else {
-            Self::None
+    /// The hashes of a table of `agg` over batches of `input_schema`.
+    /// Fails if `agg` reads hashes that `input_schema` does not carry for
+    /// exactly its group keys.
+    pub(super) fn new(agg: &AggregateExec, input_schema: &SchemaRef) -> Result<Self> {
+        if !agg.carries_group_hash() {
+            return Ok(Self::None);
         }
+        match agg.mode {
+            AggregateMode::Partial => Ok(Self::Compute(Vec::new())),
+            AggregateMode::Final | AggregateMode::FinalPartitioned
+                if carries_first_keys(input_schema, agg.group_by().expr().len()) =>
+            {
+                Ok(Self::Read)
+            }
+            mode => internal_err!(
+                "A {mode:?} aggregation cannot carry group hashes over its input"
+            ),
+        }
+    }
+
+    /// True if the table's state, and a partial table's output, carry the
+    /// group hashes.
+    pub(super) fn carries(&self) -> bool {
+        !matches!(self, Self::None)
     }
 
     /// Interns `cols`, the group keys of the rows of `batch`, with their
@@ -213,20 +229,28 @@ fn carried_column(batch: &RecordBatch) -> Result<&[u64]> {
     }
 }
 
-/// Appends the group hash column to `columns` if `schema` ends with one.
+/// Appends the group hash column to `columns` if `schema`, the schema of
+/// what the table emits, ends with one, so that the batch matches it: the
+/// output of a partial aggregation built with `with_group_hash` does, and so
+/// does the state of a final aggregation whose input has such a column,
+/// whether it reads it or not. The output of a final aggregation never does.
+/// Writing the column never makes anything read it: only the plan does.
+///
 /// `columns` starts with the group keys that `group_values` just emitted,
-/// `num_keys` of them; their hashes come from `group_values` if it kept
-/// them, or are computed from the keys otherwise.
+/// `num_keys` of them; their hashes come from `group_values` if it kept them,
+/// or are computed from the keys otherwise. Hashes `group_values` kept for an
+/// emit without the column are dropped.
 pub(in crate::aggregates) fn push_group_hashes(
     schema: &SchemaRef,
     group_values: &mut dyn GroupValues,
     num_keys: usize,
     columns: &mut Vec<ArrayRef>,
 ) -> Result<()> {
+    let kept = group_values.emit_hashes();
     if !carries_group_hash(schema) {
         return Ok(());
     }
-    let hashes = match group_values.emit_hashes() {
+    let hashes = match kept {
         Some(hashes) => hashes,
         None => {
             let keys = &columns[..num_keys];
@@ -309,7 +333,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 
         let group_schema = agg.group_by().group_schema(&input_schema)?;
         let group_values = new_group_values(group_schema, &GroupClustering::None)?;
-        let row_hashes = RowHashes::new(&input_schema, &[&output_schema, &state_schema]);
+        let row_hashes = RowHashes::new(agg, &input_schema)?;
 
         Ok(Self {
             group_by_metrics: metrics.group_by,
