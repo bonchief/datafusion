@@ -70,6 +70,14 @@ pub(super) struct BucketedAggregation {
     bucket_aggregate_time: metrics::Time,
     /// Rows aggregated from finished buckets
     bucket_aggregated_rows: metrics::Count,
+    /// Time spent taking the state of a table that is split
+    bucket_state_time: metrics::Time,
+    /// Rows of state taken from tables that were split
+    bucket_state_rows: metrics::Count,
+    /// Time spent emitting the groups of finished buckets
+    bucket_emit_time: metrics::Time,
+    /// Time spent clearing the table between buckets
+    bucket_reset_time: metrics::Time,
 }
 
 /// What [`BucketedAggregation::output_stream`] works with while it runs.
@@ -145,6 +153,15 @@ impl BucketedAggregation {
         let bucket_aggregated_rows = MetricBuilder::new(&agg.metrics)
             .with_category(MetricCategory::Rows)
             .counter("bucket_aggregated_rows", partition);
+        let bucket_state_time =
+            MetricBuilder::new(&agg.metrics).subset_time("bucket_state_time", partition);
+        let bucket_state_rows = MetricBuilder::new(&agg.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("bucket_state_rows", partition);
+        let bucket_emit_time =
+            MetricBuilder::new(&agg.metrics).subset_time("bucket_emit_time", partition);
+        let bucket_reset_time =
+            MetricBuilder::new(&agg.metrics).subset_time("bucket_reset_time", partition);
         Self {
             trigger,
             agg,
@@ -162,6 +179,10 @@ impl BucketedAggregation {
             compacted_rows,
             bucket_aggregate_time,
             bucket_aggregated_rows,
+            bucket_state_time,
+            bucket_state_rows,
+            bucket_emit_time,
+            bucket_reset_time,
         }
     }
 
@@ -273,14 +294,18 @@ impl BucketedAggregation {
         }
     }
 
-    /// Starts buckets that read `bits` bucket bits from `offset` with `state`,
-    /// the state of the table that is split.
+    /// Starts buckets that read `bits` bucket bits from `offset` with the
+    /// state of `table`, which is split and left empty.
     pub(super) fn split(
         &self,
         offset: u32,
         bits: u32,
-        state: Option<RecordBatch>,
+        table: &mut AggregateHashTable<FinalMarker>,
     ) -> Result<FinalBuckets> {
+        let state = {
+            let _timer = self.bucket_state_time.timer();
+            table.take_state_batch()?
+        };
         let mut buckets = FinalBuckets::new(
             &self.state_schema,
             self.agg.group_by().num_group_exprs(),
@@ -292,6 +317,7 @@ impl BucketedAggregation {
         );
         self.bucket_splits.add(1);
         if let Some(state) = state {
+            self.bucket_state_rows.add(state.num_rows());
             buckets.route(&state)?;
         }
         Ok(buckets)
@@ -476,7 +502,7 @@ impl BucketedAggregation {
                     };
                     if let (true, Some((offset, bits))) = (split, next_split) {
                         let mut new_buckets =
-                            self.split(offset, bits, hash_table.take_state_batch()?)?;
+                            self.split(offset, bits, &mut hash_table)?;
                         self.reserve(
                             &output.reservation,
                             held_bytes + hash_table.memory_size(),
@@ -497,6 +523,7 @@ impl BucketedAggregation {
                     continue;
                 }
 
+                let mut emit_timer = self.bucket_emit_time.timer();
                 hash_table.start_output()?;
                 while let Some(batch) = hash_table.next_output_batch()? {
                     output
@@ -505,15 +532,20 @@ impl BucketedAggregation {
                     output.coalescer.push_batch(batch)?;
                     while let Some(batch) = output.coalescer.next_completed_batch() {
                         timer.done();
+                        emit_timer.done();
                         emitter
                             .emit(batch.record_output(&output.baseline_metrics))
                             .await;
                         timer = elapsed_compute.timer();
+                        emit_timer = self.bucket_emit_time.timer();
                     }
                 }
+                emit_timer.done();
+                let reset_timer = self.bucket_reset_time.timer();
                 if hash_table.restart() {
                     reusable_table = Some(hash_table);
                 }
+                reset_timer.done();
                 timer.done();
             }
 

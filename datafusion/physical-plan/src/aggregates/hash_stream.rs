@@ -917,8 +917,7 @@ impl FinalHashAggregateStream {
                 && bucketing.due(hash_table)
             {
                 let bits = bucketing.fanout_bits(hash_table.memory_size(), table_rows);
-                let mut new_buckets =
-                    bucketing.split(0, bits, hash_table.take_state_batch()?)?;
+                let mut new_buckets = bucketing.split(0, bits, hash_table)?;
                 bucketing.reserve(
                     &self.reservation,
                     hash_table.memory_size(),
