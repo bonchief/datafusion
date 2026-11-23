@@ -2,21 +2,18 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use super::key_map::KeyMap;
 use crate::aggregates::group_values::GroupValues;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray,
-    cast::AsArray,
+    Array, ArrayRef, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray, cast::AsArray,
 };
 use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
 use datafusion_common::float_semantics::normalize_float;
 use datafusion_common::hash_utils::RandomState;
-use datafusion_common::utils::split_vec_min_alloc;
-use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{EmitTo, GroupSelection};
 use half::f16;
-use hashbrown::hash_table::HashTable;
 #[cfg(not(feature = "force_hash_collisions"))]
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -83,39 +80,45 @@ hash_float!(f16, f32, f64);
 /// A [`GroupValues`] storing a single column of primitive values
 ///
 /// This specialization is significantly faster than using the more general
-/// purpose `Row`s format
-pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
+/// purpose `Row`s format. Group ids come from a [`KeyMap`], which keeps each
+/// key in its table entry and probes in stages once the table outgrows L2.
+pub struct GroupValuesPrimitive<T: ArrowPrimitiveType>
+where
+    T::Native: HashValue,
+{
     /// The data type of the output array
     data_type: DataType,
-    /// Stores `(group_index, value)` under the hash of the value.
-    ///
-    /// The value is kept in the entry so a probe compares against the
-    /// bucket it already loaded and never reads `values`: one cache miss
-    /// per row less than looking the group's value up by index. Rehashing
-    /// recomputes hashes from the stored values, which for primitives is
-    /// cheaper than the wider entry a stored hash would need (see
-    /// <https://github.com/apache/datafusion/issues/15961> for why the hash
-    /// used to be stored).
-    map: HashTable<(usize, T::Native)>,
-    /// The group index of the null value if any
-    null_group: Option<usize>,
-    /// The values for each group index
-    values: Vec<T::Native>,
-    /// The random state used to generate hashes
-    random_state: RandomState,
+    /// The group id of each value, and the value of each group id
+    keys: KeyMap<T::Native>,
 }
 
-impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
+impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T>
+where
+    T::Native: HashValue,
+{
     pub fn new(data_type: DataType) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
             data_type,
-            map: HashTable::with_capacity(128),
-            values: Vec::with_capacity(128),
-            null_group: None,
-            random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            keys: KeyMap::new(128, crate::aggregates::AGGREGATION_HASH_SEED),
         }
     }
+}
+
+/// The values of `keys` as an array, null at `null_idx`.
+fn build_primitive<T: ArrowPrimitiveType>(
+    values: Vec<T::Native>,
+    null_idx: Option<usize>,
+) -> PrimitiveArray<T> {
+    let nulls = null_idx.map(|null_idx| {
+        let mut buffer = NullBufferBuilder::new(values.len());
+        buffer.append_n_non_nulls(null_idx);
+        buffer.append_null();
+        buffer.append_n_non_nulls(values.len() - null_idx - 1);
+        // NOTE: The inner builder must be constructed as there is at least one null
+        buffer.finish().unwrap()
+    });
+    PrimitiveArray::<T>::new(values.into(), nulls)
 }
 
 impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
@@ -124,112 +127,30 @@ where
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
-        groups.clear();
-
-        for v in cols[0].as_primitive::<T>() {
-            let group_id = match v {
-                None => *self.null_group.get_or_insert_with(|| {
-                    let group_id = self.values.len();
-                    self.values.push(Default::default());
-                    group_id
-                }),
-                Some(key) => {
-                    // Fold equivalence-class duplicates (e.g. `-0.0` → `+0.0`)
-                    // so the bit-equal `is_eq` matches and the stored value is
-                    // the canonical representative.
-                    let key = key.normalize_key();
-                    let state = &self.random_state;
-                    let hash = key.hash(state);
-                    let insert = self.map.entry(
-                        hash,
-                        |&(_, k)| k.is_eq(key),
-                        |&(_, k)| k.hash(state),
-                    );
-
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, key));
-                            self.values.push(key);
-                            g
-                        }
-                    }
-                }
-            };
-            groups.push(group_id)
-        }
+        let array = cols[0].as_primitive::<T>();
+        self.keys.intern(array.values(), array.nulls(), groups);
         Ok(())
     }
 
     fn reserve_groups(&mut self, capacity: usize) {
-        self.map
-            .reserve(capacity.saturating_sub(self.map.len()), |&(_, k)| {
-                k.hash(&self.random_state)
-            });
-        self.values
-            .reserve_exact(capacity.saturating_sub(self.values.len()));
+        self.keys.reserve_groups(capacity);
     }
 
     fn size(&self) -> usize {
-        size_of::<Self>() + self.map.allocation_size() + self.values.allocated_size()
+        size_of::<Self>() + self.keys.size()
     }
 
     fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.keys.len() == 0
     }
 
     fn len(&self) -> usize {
-        self.values.len()
+        self.keys.len()
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        fn build_primitive<T: ArrowPrimitiveType>(
-            values: Vec<T::Native>,
-            null_idx: Option<usize>,
-        ) -> PrimitiveArray<T> {
-            let nulls = null_idx.map(|null_idx| {
-                let mut buffer = NullBufferBuilder::new(values.len());
-                buffer.append_n_non_nulls(null_idx);
-                buffer.append_null();
-                buffer.append_n_non_nulls(values.len() - null_idx - 1);
-                // NOTE: The inner builder must be constructed as there is at least one null
-                buffer.finish().unwrap()
-            });
-            PrimitiveArray::<T>::new(values.into(), nulls)
-        }
-
-        let array: PrimitiveArray<T> = match emit_to {
-            EmitTo::All => {
-                self.map.clear();
-                build_primitive(std::mem::take(&mut self.values), self.null_group.take())
-            }
-            EmitTo::First(n) => {
-                self.map.retain(|entry| {
-                    // Decrement group index by n
-                    let group_idx = entry.0;
-                    match group_idx.checked_sub(n) {
-                        // Group index was >= n, shift value down
-                        Some(sub) => {
-                            entry.0 = sub;
-                            true
-                        }
-                        // Group index was < n, so remove from table
-                        None => false,
-                    }
-                });
-                let null_group = match &mut self.null_group {
-                    Some(v) if *v >= n => {
-                        *v -= n;
-                        None
-                    }
-                    Some(_) => self.null_group.take(),
-                    None => None,
-                };
-                build_primitive(split_vec_min_alloc(&mut self.values, n), null_group)
-            }
-        };
-
+        let (values, null_group) = self.keys.emit(emit_to);
+        let array = build_primitive::<T>(values, null_group);
         Ok(vec![Arc::new(array.with_data_type(self.data_type.clone()))])
     }
 
@@ -237,10 +158,11 @@ where
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        selection.validate_num_groups(self.values.len())?;
+        let stored = self.keys.values();
+        selection.validate_num_groups(stored.len())?;
         let values: Vec<T::Native> =
-            selection.iter().map(|index| self.values[index]).collect();
-        let nulls = if let Some(null_group) = self.null_group {
+            selection.iter().map(|index| stored[index]).collect();
+        let nulls = if let Some(null_group) = self.keys.null_group() {
             let mut nulls = NullBufferBuilder::new(values.len());
             for index in selection.iter() {
                 if index == null_group {
@@ -263,19 +185,11 @@ where
     }
 
     fn shrink_to_fit(&mut self) {
-        let state = &self.random_state;
-        self.map.shrink_to_fit(|&(_, k)| k.hash(state));
-        self.values.shrink_to_fit();
+        self.keys.shrink_to_fit();
     }
 
     fn clear_shrink(&mut self, num_rows: usize) {
-        self.values.clear();
-        self.values.shrink_to(num_rows);
-        self.map.clear();
-        self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
-
-        // Reset the null group index
-        self.null_group = None;
+        self.keys.clear_shrink(num_rows);
     }
 }
 
@@ -285,6 +199,7 @@ mod tests {
     use arrow::array::types::Int32Type;
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
+    use datafusion_common::utils::proxy::VecAllocExt;
     use datafusion_expr::EmitTo;
     use std::mem::size_of;
     use std::sync::Arc;
@@ -307,7 +222,7 @@ mod tests {
         let arr: ArrayRef = Arc::new(Int32Array::from_iter_values(0..20i32));
         let mut groups = vec![];
         gv.intern(&[arr], &mut groups)?;
-        let capacity_before = gv.values.capacity(); // 128
+        let capacity_before = gv.keys.values.capacity(); // 128
 
         // n=4, n*2=8 <= len=20 -> drain branch
         let emitted = gv.emit(EmitTo::First(4))?;
@@ -317,10 +232,10 @@ mod tests {
         // `self.values` must retain its original large allocation.
         // Old split_off+swap left it with a fresh small allocation (~16).
         assert_eq!(
-            gv.values.capacity(),
+            gv.keys.values.capacity(),
             capacity_before,
             "self.values capacity {} should equal original {} after small First(n) emit",
-            gv.values.capacity(),
+            gv.keys.values.capacity(),
             capacity_before,
         );
 
@@ -335,12 +250,12 @@ mod tests {
         // 1. Initial state: the constructor calls HashTable::with_capacity(128),
         //    so the map already has a nonzero retained allocation. Capture it
         //    and verify that size() accounts for it correctly.
-        let initial_map_bytes = group_values.map.allocation_size();
-        assert!(group_values.map.capacity() >= 128);
+        let initial_map_bytes = group_values.keys.map.allocation_size();
+        assert!(group_values.keys.map.capacity() >= 128);
         assert!(initial_map_bytes > 0);
         assert_eq!(
             group_values.size(),
-            self_size + group_values.values.allocated_size() + initial_map_bytes,
+            self_size + group_values.keys.values.allocated_size() + initial_map_bytes,
         );
 
         // 2. Insert keys and observe table allocation growth
@@ -350,18 +265,19 @@ mod tests {
         group_values.intern(&[arr], &mut groups).unwrap();
         assert_eq!(groups.len(), num_distinct as usize);
 
-        let table_bytes = group_values.map.allocation_size();
-        assert!(group_values.map.capacity() >= num_distinct as usize);
+        let table_bytes = group_values.keys.map.allocation_size();
+        assert!(group_values.keys.map.capacity() >= num_distinct as usize);
         assert!(table_bytes > 0);
 
         // Hashbrown's layout contains entry slots, control bytes, and trailing group bytes.
         // It must strictly exceed the naive entry-only size
-        let entry_only_bytes = group_values.map.capacity() * size_of::<(usize, i32)>();
+        let entry_only_bytes =
+            group_values.keys.map.capacity() * size_of::<(usize, i32)>();
         assert!(table_bytes > entry_only_bytes);
 
         assert_eq!(
             group_values.size(),
-            self_size + group_values.values.allocated_size() + table_bytes,
+            self_size + group_values.keys.values.allocated_size() + table_bytes,
         );
 
         // 3. Partial emit (EmitTo::First)
@@ -371,10 +287,10 @@ mod tests {
         assert_eq!(group_values.len(), (num_distinct as usize) - emit_count);
 
         // Retained capacity is still charged until the table releases it
-        assert_eq!(group_values.map.allocation_size(), table_bytes);
+        assert_eq!(group_values.keys.map.allocation_size(), table_bytes);
         assert_eq!(
             group_values.size(),
-            self_size + group_values.values.allocated_size() + table_bytes,
+            self_size + group_values.keys.values.allocated_size() + table_bytes,
         );
 
         // 4. Emit all (EmitTo::All)
@@ -384,15 +300,15 @@ mod tests {
         assert_eq!(group_values.len(), 0);
 
         // Clear preserves table capacity
-        assert_eq!(group_values.map.allocation_size(), table_bytes);
+        assert_eq!(group_values.keys.map.allocation_size(), table_bytes);
 
         // 5. clear_shrink: releases/shrinks map capacity
         group_values.clear_shrink(16);
-        let shrunken_table_bytes = group_values.map.allocation_size();
+        let shrunken_table_bytes = group_values.keys.map.allocation_size();
         assert!(shrunken_table_bytes < table_bytes);
         assert_eq!(
             group_values.size(),
-            self_size + group_values.values.allocated_size() + shrunken_table_bytes,
+            self_size + group_values.keys.values.allocated_size() + shrunken_table_bytes,
         );
 
         // 6. Reinsert new distinct values into the shrunken table
@@ -401,12 +317,12 @@ mod tests {
         ));
         group_values.intern(&[new_arr], &mut groups).unwrap();
         assert_eq!(groups.len(), num_distinct as usize);
-        assert!(group_values.map.allocation_size() > shrunken_table_bytes);
+        assert!(group_values.keys.map.allocation_size() > shrunken_table_bytes);
         assert_eq!(
             group_values.size(),
             self_size
-                + group_values.values.allocated_size()
-                + group_values.map.allocation_size(),
+                + group_values.keys.values.allocated_size()
+                + group_values.keys.map.allocation_size(),
         );
     }
 

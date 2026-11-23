@@ -208,3 +208,7 @@ name = "unnest"
 [[bench]]
 harness = false
 name = "ordered_group_values"
+
+[[bench]]
+harness = false
+name = "group_values_probe"
