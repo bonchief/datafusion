@@ -43,6 +43,7 @@ use arrow::datatypes::{
 use arrow_schema::SortOptions;
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::instant::Instant;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::transpose;
@@ -87,6 +88,9 @@ pub struct FlushOnDemand;
 
 mod distributor_channels;
 mod range;
+mod scatter;
+
+use scatter::{Layout, Scatter};
 
 use range::RangeRouter;
 use std::hash::{Hash, Hasher};
@@ -820,6 +824,25 @@ impl RepartitionExecState {
             None
         };
 
+        // A bounded, unordered hash repartition to more than one output whose
+        // columns all have types a scatter copies has each producer copy its
+        // rows into its own builders ([`Scatter`]) instead of a take and the
+        // shared coalescers. A producer whose builders the pool refuses keeps
+        // the take and shared coalescers; both kinds of producer may feed one
+        // output.
+        let layout = (coalesce_batches
+            && matches!(partitioning, Partitioning::Hash(..))
+            && num_output_partitions > 1)
+            .then(|| {
+                Layout::try_new(
+                    input.schema(),
+                    coalescer_batch_size,
+                    num_output_partitions,
+                )
+            })
+            .flatten()
+            .map(Arc::new);
+
         // launch one async task per *input* partition
         let mut spawned_tasks = Vec::with_capacity(num_input_partitions);
         for (i, (stream, metrics)) in
@@ -850,12 +873,19 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
+            let scatter = layout.as_ref().and_then(|layout| {
+                let reservation = MemoryConsumer::new(format!("{name}[scatter {i}]"))
+                    .register(context.memory_pool());
+                Scatter::try_new(Arc::clone(layout), reservation)
+            });
+
             let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
                 stream,
                 txs,
                 partitioning.clone(),
                 range_router.clone(),
                 metrics,
+                scatter,
                 // preserve_order depends on partition index to start from 0
                 if preserve_order { 0 } else { i },
                 num_input_partitions,
@@ -903,6 +933,41 @@ enum BatchPartitionerState {
         /// Row indices grouped by output partition
         indices: Vec<Vec<u32>>,
     },
+}
+
+/// Fills `indices`, one vector per output, with `batch`'s rows that hash to
+/// that output, in input order. Timed in `timer`.
+fn hash_indices(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    partition_reducer: &StrengthReducedU64,
+    hash_buffer: &mut Vec<u64>,
+    indices: &mut [Vec<u32>],
+    batch: &RecordBatch,
+    timer: &metrics::Time,
+) -> Result<()> {
+    // Tracking time required for distributing indexes across output partitions
+    let timer = timer.timer();
+
+    let arrays = evaluate_expressions_to_arrays(exprs, batch)?;
+
+    hash_buffer.clear();
+    hash_buffer.resize(batch.num_rows(), 0);
+
+    create_hashes(
+        &arrays,
+        REPARTITION_RANDOM_STATE.random_state(),
+        hash_buffer,
+    )?;
+
+    for v in indices.iter_mut() {
+        v.clear();
+    }
+
+    partition_reducer.partition_indices(hash_buffer, indices);
+
+    // Finished building index-arrays for output partitions
+    timer.done();
+    Ok(())
 }
 
 /// Fixed RandomState used for hash repartitioning to ensure consistent behavior across
@@ -1501,30 +1566,14 @@ impl BatchPartitioner {
                     hash_buffer,
                     indices,
                 } => {
-                    // Tracking time required for distributing indexes across output partitions
-                    let timer = self.timer.timer();
-
-                    let arrays =
-                        evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
-
-                    hash_buffer.clear();
-                    hash_buffer.resize(batch.num_rows(), 0);
-
-                    create_hashes(
-                        &arrays,
-                        REPARTITION_RANDOM_STATE.random_state(),
+                    hash_indices(
+                        exprs,
+                        partition_reducer,
                         hash_buffer,
+                        indices,
+                        &batch,
+                        &self.timer,
                     )?;
-
-                    for v in indices.iter_mut() {
-                        v.clear();
-                    }
-
-                    partition_reducer.partition_indices(hash_buffer, indices);
-
-                    // Finished building index-arrays for output partitions
-                    timer.done();
-
                     let partitioned_batches =
                         Self::partition_grouped_take(&batch, indices, &self.timer)?;
 
@@ -1564,6 +1613,30 @@ impl BatchPartitioner {
             };
 
         Ok(it)
+    }
+
+    /// Fills one vector of `batch`'s row indices per output, in input order,
+    /// for a hash partitioner, without copying any row; `None` for any other
+    /// partitioning. Timed in the partitioner's timer.
+    fn route(&mut self, batch: &RecordBatch) -> Result<Option<&[Vec<u32>]>> {
+        let BatchPartitionerState::Hash {
+            exprs,
+            partition_reducer,
+            hash_buffer,
+            indices,
+        } = &mut self.state
+        else {
+            return Ok(None);
+        };
+        hash_indices(
+            exprs,
+            partition_reducer,
+            hash_buffer,
+            indices,
+            batch,
+            &self.timer,
+        )?;
+        Ok(Some(indices))
     }
 
     // return the number of output partitions
@@ -1811,6 +1884,16 @@ struct RepartitionMetrics {
     coalesce_pushes: metrics::Count,
     /// Pushes that found the output's coalescer locked by another producer.
     coalesce_contended: metrics::Count,
+    /// Rows a producer copied straight into its own builders ([`Scatter`]).
+    /// The copying is timed in `repartition_time`; `send_time` then times
+    /// the channel alone.
+    scattered_rows: metrics::Count,
+    /// Bytes of fixed-width values and views those rows wrote, booleans at a
+    /// byte per eight rows.
+    scattered_fixed_bytes: metrics::Count,
+    /// Bytes of string and binary values longer than a view holds inline
+    /// that those rows copied.
+    scattered_string_bytes: metrics::Count,
 }
 
 impl RepartitionMetrics {
@@ -1848,6 +1931,12 @@ impl RepartitionMetrics {
                 .counter("coalesce_pushes", input_partition),
             coalesce_contended: MetricBuilder::new(metrics)
                 .counter("coalesce_contended", input_partition),
+            scattered_rows: MetricBuilder::new(metrics)
+                .counter("scattered_rows", input_partition),
+            scattered_fixed_bytes: MetricBuilder::new(metrics)
+                .counter("scattered_fixed_bytes", input_partition),
+            scattered_string_bytes: MetricBuilder::new(metrics)
+                .counter("scattered_string_bytes", input_partition),
         }
     }
 }
@@ -2603,12 +2692,14 @@ impl RepartitionExec {
     /// output partitions based on the desired partitioning
     ///
     /// `output_channels` holds the output sending channels for each output partition
+    #[expect(clippy::too_many_arguments)]
     async fn pull_from_input(
         mut stream: SendableRecordBatchStream,
         mut output_channels: HashMap<usize, OutputChannel>,
         partitioning: Partitioning,
         range_router: Option<Arc<RangeRouter>>,
         metrics: RepartitionMetrics,
+        mut scatter: Option<Scatter>,
         input_partition: usize,
         num_input_partitions: usize,
     ) -> Result<()> {
@@ -2660,21 +2751,44 @@ impl RepartitionExec {
             .find_map(|channel| channel.shared_coalescer.as_ref()?.demand.clone());
         while !output_channels.is_empty() {
             // fetch the next batch
-            let timer = metrics.fetch_time.timer();
-            let result = if let Some(demand) = &demand {
-                loop {
-                    tokio::select! {
-                        biased;
-                        batch = stream.next() => break batch,
-                        _ = demand.notified() => {
-                            for channel in output_channels.values_mut() {
-                                channel.flush_requested().await?;
+            let mut timer = metrics.fetch_time.timer();
+            // A producer whose builders hold rows polls its input once first:
+            // if the input is not ready, it emits every builder before it
+            // waits, so no rows are held while it is parked, and a consumer
+            // that asks for rows on demand ([`FlushOnDemand`]) never waits on
+            // a parked producer's builders. That emission is timed as
+            // repartitioning and sending, not fetching.
+            let ready = match &scatter {
+                Some(scatter) if scatter.holds() => stream.next().now_or_never(),
+                _ => None,
+            };
+            let result = match ready {
+                Some(result) => result,
+                None => {
+                    if let Some(scatter) = &mut scatter
+                        && scatter.holds()
+                    {
+                        timer.stop();
+                        Self::emit_all(&mut output_channels, scatter, first, &metrics)
+                            .await?;
+                        timer.restart();
+                    }
+                    if let Some(demand) = &demand {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                batch = stream.next() => break batch,
+                                _ = demand.notified() => {
+                                    for channel in output_channels.values_mut() {
+                                        channel.flush_requested().await?;
+                                    }
+                                }
                             }
                         }
+                    } else {
+                        stream.next().await
                     }
                 }
-            } else {
-                stream.next().await
             };
             timer.done();
 
@@ -2689,29 +2803,28 @@ impl RepartitionExec {
                 continue;
             }
 
-            for res in partitioner.partition_iter(batch)? {
-                routed.push(res?);
-            }
-            let split = routed.partition_point(|(partition, _)| *partition < first);
-            routed.rotate_left(split);
-
-            for (partition, batch) in routed.drain(..) {
-                let timer = metrics.send_time[partition].timer();
-                // if there is still a receiver, send to it
-                if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    let coalesce = metrics.coalesce_time.timer();
-                    output_channel.coalesce(batch, &mut coalesced, &metrics)?;
-                    coalesce.done();
-                    for batch in coalesced.drain(..) {
-                        if output_channel.send(batch, true).await.is_err() {
-                            // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                            // so ignore this channel from now on.
-                            output_channels.remove(&partition);
-                            break;
-                        }
-                    }
-                }
-                timer.done();
+            if let Some(scatter) = &mut scatter {
+                Self::scatter_batch(
+                    &mut output_channels,
+                    &mut partitioner,
+                    scatter,
+                    &mut routed,
+                    &batch,
+                    first,
+                    &metrics,
+                )
+                .await?;
+            } else {
+                Self::send_batch(
+                    &mut output_channels,
+                    &mut partitioner,
+                    &mut routed,
+                    &mut coalesced,
+                    batch,
+                    first,
+                    &metrics,
+                )
+                .await?;
             }
 
             // If the input stream is endless, we may spin forever and
@@ -2738,6 +2851,10 @@ impl RepartitionExec {
             }
         }
 
+        if let Some(scatter) = &mut scatter {
+            Self::emit_all(&mut output_channels, scatter, first, &metrics).await?;
+        }
+
         // End of input for this task. For each output partition we still
         // have a channel to, decrement the active-senders counter; whoever
         // sees the count drop to zero is the last input task and must
@@ -2749,6 +2866,154 @@ impl RepartitionExec {
         // Spill writers will auto-finalize when dropped
         // No need for explicit flush
         Ok(())
+    }
+
+    /// Routes `batch` with a take and the outputs' shared coalescers.
+    async fn send_batch(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        partitioner: &mut BatchPartitioner,
+        routed: &mut Vec<(usize, RecordBatch)>,
+        coalesced: &mut Vec<RecordBatch>,
+        batch: RecordBatch,
+        first: usize,
+        metrics: &RepartitionMetrics,
+    ) -> Result<()> {
+        for res in partitioner.partition_iter(batch)? {
+            routed.push(res?);
+        }
+        let split = routed.partition_point(|(partition, _)| *partition < first);
+        routed.rotate_left(split);
+
+        for (partition, batch) in routed.drain(..) {
+            let timer = metrics.send_time[partition].timer();
+            // if there is still a receiver, send to it
+            if let Some(output_channel) = output_channels.get_mut(&partition) {
+                let coalesce = metrics.coalesce_time.timer();
+                output_channel.coalesce(batch, coalesced, metrics)?;
+                coalesce.done();
+                for batch in coalesced.drain(..) {
+                    if output_channel.send(batch, true).await.is_err() {
+                        // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
+                        // so ignore this channel from now on.
+                        output_channels.remove(&partition);
+                        break;
+                    }
+                }
+            }
+            timer.done();
+        }
+        Ok(())
+    }
+
+    /// Copies `batch`'s rows into `scatter`'s builders, one output at a time
+    /// in the producer's sweep from `first`, taking each builder that fills
+    /// and then every builder whose oldest row is [`scatter::AGE`] old; then
+    /// sends what it took, in that order. The copy is timed once per batch
+    /// as repartitioning; the sends as sending.
+    ///
+    /// Each output's rows are appended in input order, so what an output
+    /// receives from one producer, and in what order, is the same as with a
+    /// take: only where its batches are cut differs. The batches taken from
+    /// one input batch wait for their sends together, as the slices of a
+    /// take do.
+    async fn scatter_batch(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        partitioner: &mut BatchPartitioner,
+        scatter: &mut Scatter,
+        ready: &mut Vec<(usize, RecordBatch)>,
+        batch: &RecordBatch,
+        first: usize,
+        metrics: &RepartitionMetrics,
+    ) -> Result<()> {
+        let now = Instant::now();
+        let outputs = partitioner.num_partitions();
+        let Some(indices) = partitioner.route(batch)? else {
+            return internal_err!("a repartition scatters only by hash");
+        };
+        let timer = metrics.repartition_time.timer();
+        scatter.load(batch)?;
+        for partition in (0..outputs).map(|i| (first + i) % outputs) {
+            if !output_channels.contains_key(&partition) {
+                continue;
+            }
+            let mut rows = indices[partition].as_slice();
+            while !rows.is_empty() {
+                let (taken, full) = scatter.append(partition, rows, now);
+                rows = &rows[taken..];
+                if full && let Some(batch) = scatter.emit(partition)? {
+                    ready.push((partition, batch));
+                }
+            }
+        }
+        scatter.unload();
+        for partition in (0..outputs).map(|i| (first + i) % outputs) {
+            if scatter.stale(partition, now)
+                && let Some(batch) = scatter.emit(partition)?
+            {
+                ready.push((partition, batch));
+            }
+        }
+        timer.done();
+        scatter.record(
+            &metrics.scattered_rows,
+            &metrics.scattered_fixed_bytes,
+            &metrics.scattered_string_bytes,
+        );
+        for (partition, batch) in ready.drain(..) {
+            Self::send(output_channels, partition, batch, metrics).await;
+        }
+        Ok(())
+    }
+
+    /// Sends every builder of `scatter` that holds rows, in the producer's
+    /// sweep from `first`.
+    async fn emit_all(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        scatter: &mut Scatter,
+        first: usize,
+        metrics: &RepartitionMetrics,
+    ) -> Result<()> {
+        let outputs = metrics.send_time.len();
+        for partition in (0..outputs).map(|i| (first + i) % outputs) {
+            Self::emit(output_channels, scatter, partition, metrics).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends the batch `partition`'s builder holds, if any. Building the
+    /// batch is timed as repartitioning.
+    async fn emit(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        scatter: &mut Scatter,
+        partition: usize,
+        metrics: &RepartitionMetrics,
+    ) -> Result<()> {
+        let timer = metrics.repartition_time.timer();
+        let batch = scatter.emit(partition)?;
+        timer.done();
+        if let Some(batch) = batch {
+            Self::send(output_channels, partition, batch, metrics).await;
+        }
+        Ok(())
+    }
+
+    /// Sends `batch` to `partition` if its consumer is still there, timed as
+    /// sending; a consumer that hung up (an early shutdown such as a
+    /// `LIMIT`) closes the output.
+    async fn send(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        partition: usize,
+        batch: RecordBatch,
+        metrics: &RepartitionMetrics,
+    ) {
+        let Some(channel) = output_channels.get_mut(&partition) else {
+            return;
+        };
+        let timer = metrics.send_time[partition].timer();
+        if channel.send(batch, true).await.is_err() {
+            output_channels.remove(&partition);
+        }
+        timer.done();
     }
 
     /// Waits for `input_task` which is consuming one of the inputs to
@@ -4255,10 +4520,9 @@ mod tests {
         let partitions = vec![create_vec_batches(50), create_vec_batches(50)];
         let source =
             TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(
-            source,
-            Partitioning::Hash(vec![col("c0", &schema)?], 4),
-        )?;
+        // Round robin keeps the shared coalescers; a hash repartition of
+        // these columns scatters instead.
+        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(4))?;
         let task = Arc::new(TaskContext::default());
         for partition in 0..4 {
             let _: Vec<_> = exec
@@ -4267,6 +4531,7 @@ mod tests {
                 .await?;
         }
         let metrics = exec.metrics().unwrap();
+        assert_eq!(metrics.sum_by_name("scattered_rows").unwrap().as_usize(), 0);
         let pushes = metrics.sum_by_name("coalesce_pushes").unwrap().as_usize();
         let contended = metrics
             .sum_by_name("coalesce_contended")
@@ -4278,6 +4543,442 @@ mod tests {
             "{contended} contended of {pushes} pushes"
         );
         assert!(metrics.sum_by_name("coalesce_time").is_some());
+        Ok(())
+    }
+
+    /// The schema of [`scatter_rows`]: a spread key, a row number, and one
+    /// column of each type a scatter copies.
+    fn scatter_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("n", DataType::UInt32, false),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("date", DataType::Date32, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("d128", DataType::Decimal128(20, 3), true),
+            Field::new("d256", DataType::Decimal256(40, 2), true),
+            Field::new(
+                "interval",
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+                true,
+            ),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
+        ]))
+    }
+
+    /// The string column's value for row `n`: empty, short, null, long, and
+    /// one in fifty longer than a small builder's string block. The binary
+    /// column holds the value of another row, so the two cut builders at
+    /// different rows.
+    fn scatter_string(n: u32) -> Option<String> {
+        match n % 5 {
+            0 => Some(String::new()),
+            1 => Some(format!("s{n}")),
+            2 => None,
+            3 => Some(format!("row {n} has a long string")),
+            _ if n % 50 == 4 => Some(format!("{}{n}", "x".repeat(3000))),
+            _ => Some(format!("{n} is long enough to leave its view")),
+        }
+    }
+
+    /// The rows numbered `ns` of [`scatter_schema`]; every value derives from
+    /// its row number, and the fixed-width columns are null on every 7th row.
+    fn scatter_rows(ns: &[u32]) -> RecordBatch {
+        use arrow::array::{
+            BinaryViewArray, BooleanArray, Date32Array, Decimal256Array, Float32Array,
+            Float64Array, Int8Array, Int16Array, IntervalMonthDayNanoArray,
+            TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{IntervalMonthDayNano, i256};
+        let valid = |n: &u32| !n.is_multiple_of(7);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from_iter_values(
+                ns.iter().map(|n| n.wrapping_mul(2_654_435_761)),
+            )),
+            Arc::new(UInt32Array::from_iter_values(ns.iter().copied())),
+            Arc::new(Int8Array::from_iter(
+                ns.iter().map(|n| valid(n).then_some(*n as i8)),
+            )),
+            Arc::new(Int16Array::from_iter(
+                ns.iter().map(|n| valid(n).then_some(*n as i16)),
+            )),
+            Arc::new(Float32Array::from_iter(
+                ns.iter().map(|n| valid(n).then_some(*n as f32 / 4.0)),
+            )),
+            Arc::new(Float64Array::from_iter(
+                ns.iter().map(|n| valid(n).then_some(*n as f64 / 8.0)),
+            )),
+            Arc::new(Date32Array::from_iter(
+                ns.iter().map(|n| valid(n).then_some(*n as i32)),
+            )),
+            Arc::new(
+                TimestampMicrosecondArray::from_iter(
+                    ns.iter().map(|n| valid(n).then_some(*n as i64 * 1_000_003)),
+                )
+                .with_timezone("UTC"),
+            ),
+            Arc::new(
+                Decimal128Array::from_iter(
+                    ns.iter()
+                        .map(|n| valid(n).then_some(*n as i128 * 1_000_000_007)),
+                )
+                .with_precision_and_scale(20, 3)
+                .unwrap(),
+            ),
+            Arc::new(
+                Decimal256Array::from_iter(
+                    ns.iter()
+                        .map(|n| valid(n).then_some(i256::from_i128(-(*n as i128)))),
+                )
+                .with_precision_and_scale(40, 2)
+                .unwrap(),
+            ),
+            Arc::new(IntervalMonthDayNanoArray::from_iter(ns.iter().map(|n| {
+                valid(n).then_some(IntervalMonthDayNano::new(*n as i32, 1, *n as i64 * 3))
+            }))),
+            Arc::new(BooleanArray::from_iter(
+                ns.iter().map(|n| valid(n).then_some(n % 3 == 0)),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                ns.iter().map(|n| scatter_string(*n)),
+            )),
+            Arc::new(BinaryViewArray::from_iter(
+                ns.iter()
+                    .map(|n| scatter_string(n * 7 + 1).map(String::into_bytes)),
+            )),
+        ];
+        RecordBatch::try_new(scatter_schema(), columns).unwrap()
+    }
+
+    /// `producers` inputs of `batches` batches of `rows` rows of
+    /// [`scatter_rows`]; producer p numbers its rows from p × 1,000,000 in
+    /// input order. Each batch is a slice of a larger one, so its arrays
+    /// start at an offset.
+    fn scatter_input(producers: u32, batches: u32, rows: u32) -> Vec<Vec<RecordBatch>> {
+        (0..producers)
+            .map(|p| {
+                (0..batches)
+                    .map(|b| {
+                        let start = p * 1_000_000 + 10 + b * rows;
+                        let ns: Vec<u32> = (start - 3..start + rows).collect();
+                        scatter_rows(&ns).slice(3, rows as usize)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Asserts that `outputs` hold every row of `scatter_input(producers,
+    /// batches, rows)` exactly once with all its values, each producer's
+    /// rows in input order within every output, and no batch longer than
+    /// `limit` rows.
+    fn assert_scattered(
+        outputs: &[Vec<RecordBatch>],
+        producers: u32,
+        batches: u32,
+        rows: u32,
+        limit: usize,
+    ) {
+        let mut all = vec![];
+        for output in outputs {
+            let mut last = HashMap::new();
+            for batch in output {
+                assert!(batch.num_rows() <= limit, "{} rows", batch.num_rows());
+                // A builder's string block holds 64 bytes per row it can
+                // hold, or one value longer than that alone.
+                let long: Vec<usize> = batch
+                    .column(12)
+                    .as_string_view()
+                    .views()
+                    .iter()
+                    .map(|view| *view as u32 as usize)
+                    .filter(|len| *len > 12)
+                    .collect();
+                assert!(
+                    long.iter().sum::<usize>() <= limit * 64 || long.len() == 1,
+                    "{} bytes of long strings in {} values",
+                    long.iter().sum::<usize>(),
+                    long.len()
+                );
+                let ns = batch.column(1).as_primitive::<UInt32Type>().values();
+                let expected = scatter_rows(ns);
+                for (column, field) in batch.schema().fields().iter().enumerate() {
+                    assert_eq!(
+                        batch.column(column).to_data(),
+                        expected.column(column).to_data(),
+                        "column {}",
+                        field.name()
+                    );
+                }
+                for n in ns {
+                    if let Some(previous) = last.insert(n / 1_000_000, *n) {
+                        assert!(previous < *n, "{n} after {previous} in one output");
+                    }
+                    all.push(*n);
+                }
+            }
+        }
+        all.sort_unstable();
+        let expected: Vec<u32> = (0..producers)
+            .flat_map(|p| (0..batches * rows).map(move |r| p * 1_000_000 + 10 + r))
+            .collect();
+        assert_eq!(all, expected);
+    }
+
+    async fn collect_outputs(
+        exec: &RepartitionExec,
+        task: &Arc<TaskContext>,
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        let mut outputs = vec![];
+        for partition in 0..exec.partitioning().partition_count() {
+            outputs.push(
+                exec.execute(partition, Arc::clone(task))?
+                    .try_collect()
+                    .await?,
+            );
+        }
+        Ok(outputs)
+    }
+
+    fn metric(exec: &RepartitionExec, name: &str) -> usize {
+        exec.metrics()
+            .unwrap()
+            .sum_by_name(name)
+            .map_or(0, |value| value.as_usize())
+    }
+
+    #[tokio::test]
+    async fn scatter_copies_every_supported_type() -> Result<()> {
+        // A batch size of 64 makes builders of 16 rows and 1 KiB string
+        // blocks, so the 3,000-byte strings take a builder alone; 8,192 makes
+        // builders of 2,048 rows that only the end of input empties.
+        for batch_size in [64, 8192] {
+            let (producers, batches, rows) = (3, 20, 100);
+            let partitions = scatter_input(producers, batches, rows);
+            let source =
+                TestMemoryExec::try_new_exec(&partitions, scatter_schema(), None)?;
+            let exec = RepartitionExec::try_new(
+                source,
+                Partitioning::Hash(vec![col("key", &scatter_schema())?], 5),
+            )?;
+            let config = SessionConfig::new().with_batch_size(batch_size);
+            let task = Arc::new(TaskContext::default().with_session_config(config));
+            let outputs = collect_outputs(&exec, &task).await?;
+            assert_scattered(&outputs, producers, batches, rows, batch_size / 4);
+            let total = (producers * batches * rows) as usize;
+            assert_eq!(metric(&exec, "scattered_rows"), total);
+            assert_eq!(metric(&exec, "coalesce_pushes"), 0);
+            assert!(metric(&exec, "scattered_fixed_bytes") > total * 100);
+            assert!(metric(&exec, "scattered_string_bytes") > total * 20);
+            assert_eq!(task.memory_pool().reserved(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scatter_leaves_other_types_to_the_coalescers() -> Result<()> {
+        // A `Utf8` column keeps the take and the shared coalescers for the
+        // whole repartition.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter((0..100).map(|n| {
+                    (n % 3 != 0).then(|| format!("value {n} of a utf8 column"))
+                }))),
+            ],
+        )?;
+        let partitions = vec![vec![batch.clone(); 10], vec![batch; 10]];
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &schema)?], 4),
+        )?;
+        let task = Arc::new(TaskContext::default());
+        let outputs = collect_outputs(&exec, &task).await?;
+        let rows: usize = outputs.iter().flatten().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2000);
+        assert_eq!(metric(&exec, "scattered_rows"), 0);
+        assert!(metric(&exec, "coalesce_pushes") > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scatter_only_for_unordered_hash() -> Result<()> {
+        let schema = test_schema(false);
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(col("c0", &schema)?)].into();
+        let partitions = vec![create_vec_batches(10), create_vec_batches(10)];
+        let cases = [
+            (
+                Partitioning::Hash(vec![col("c0", &schema)?], 4),
+                false,
+                true,
+            ),
+            (
+                Partitioning::Hash(vec![col("c0", &schema)?], 4),
+                true,
+                false,
+            ),
+            (
+                Partitioning::Hash(vec![col("c0", &schema)?], 1),
+                false,
+                false,
+            ),
+            (Partitioning::RoundRobinBatch(4), false, false),
+        ];
+        for (partitioning, preserve_order, scatters) in cases {
+            let source = TestMemoryExec::try_new(&partitions, Arc::clone(&schema), None)?
+                .try_with_sort_information(vec![ordering.clone()])?;
+            let source = Arc::new(TestMemoryExec::update_cache(&Arc::new(source)));
+            let mut exec = RepartitionExec::try_new(source, partitioning.clone())?;
+            if preserve_order {
+                exec = exec.with_preserve_order();
+            }
+            assert_eq!(exec.preserve_order(), preserve_order);
+            let task = Arc::new(TaskContext::default());
+            let outputs = collect_outputs(&exec, &task).await?;
+            let rows: usize = outputs.iter().flatten().map(RecordBatch::num_rows).sum();
+            assert_eq!(rows, 2 * 10 * 8);
+            assert_eq!(
+                metric(&exec, "scattered_rows") > 0,
+                scatters,
+                "{partitioning} preserving order {preserve_order}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scatter_refused_keeps_the_coalescers() -> Result<()> {
+        // A pool smaller than one producer's builders: no producer scatters,
+        // and batches the outputs cannot hold spill.
+        let (producers, batches, rows) = (2, 10, 100);
+        let partitions = scatter_input(producers, batches, rows);
+        let source = TestMemoryExec::try_new_exec(&partitions, scatter_schema(), None)?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &scatter_schema())?], 5),
+        )?;
+        let runtime = RuntimeEnvBuilder::default()
+            .with_memory_limit(64 * 1024, 1.0)
+            .build_arc()?;
+        let config = SessionConfig::new().with_batch_size(8192);
+        let task = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime)
+                .with_session_config(config),
+        );
+        let outputs = collect_outputs(&exec, &task).await?;
+        assert_scattered(&outputs, producers, batches, rows, 8192);
+        assert_eq!(metric(&exec, "scattered_rows"), 0);
+        assert!(metric(&exec, "coalesce_pushes") > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scatter_emits_before_its_producer_parks() -> Result<()> {
+        // One batch, then an input that is never ready. The producer must
+        // send what its builders hold before it waits, with or without
+        // demand flushes, though no builder is full.
+        for demand in [false, true] {
+            let batch = scatter_input(1, 1, 100).remove(0).remove(0);
+            let source = Arc::new(StreamingTableExec::try_new(
+                scatter_schema(),
+                vec![Arc::new(UnboundedTestPartition {
+                    schema: scatter_schema(),
+                    batch,
+                })],
+                None,
+                vec![],
+                false,
+                None,
+            )?);
+            let exec = RepartitionExec::try_new(
+                source,
+                Partitioning::Hash(vec![col("key", &scatter_schema())?], 4),
+            )?;
+            let mut config = SessionConfig::new().with_batch_size(8192);
+            if demand {
+                config = config.with_extension(Arc::new(FlushOnDemand));
+            }
+            let task = Arc::new(TaskContext::default().with_session_config(config));
+            let mut stream = exec.execute(0, Arc::clone(&task))?;
+            let batch =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("a parked producer still holds rows")
+                    .expect("missing batch")?;
+            assert!(batch.num_rows() > 0 && batch.num_rows() < 100);
+            assert_eq!(metric(&exec, "scattered_rows"), 100);
+            drop(stream);
+        }
+        Ok(())
+    }
+
+    /// A partition whose input is always ready but slow: one single-row
+    /// batch per millisecond, the thread busy for that millisecond.
+    #[derive(Debug)]
+    struct BusyPartition;
+
+    impl PartitionStream for BusyPartition {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: std::sync::LazyLock<SchemaRef> =
+                std::sync::LazyLock::new(scatter_schema);
+            &SCHEMA
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let stream = futures::stream::iter(10u32..).map(move |n| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(scatter_rows(&[n]))
+            });
+            Box::pin(RecordBatchStreamAdapter::new(scatter_schema(), stream))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scatter_emits_a_builder_older_than_the_age_bound() -> Result<()> {
+        // The producer is busy and never parks; at one row per millisecond
+        // over two outputs its builders would take about four seconds to
+        // reach 2,048 rows. Its rows must reach a consumer after the age
+        // bound instead.
+        let source = Arc::new(StreamingTableExec::try_new(
+            scatter_schema(),
+            vec![Arc::new(BusyPartition)],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &scatter_schema())?], 2),
+        )?;
+        let config = SessionConfig::new().with_batch_size(8192);
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut stream = exec.execute(0, Arc::clone(&task))?;
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .expect("a consumer got no rows within the age bound")
+                .expect("missing batch")?;
+        assert!(batch.num_rows() > 0 && batch.num_rows() < 2048);
+        drop(stream);
         Ok(())
     }
 
