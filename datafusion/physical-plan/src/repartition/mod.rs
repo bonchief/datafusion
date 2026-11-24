@@ -6,6 +6,7 @@
 //! partitions to M output partitions based on a partitioning scheme, optionally
 //! maintaining the order of the input rows in the output.
 
+use std::collections::VecDeque;
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -53,7 +54,7 @@ use datafusion_common::{
 use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, RangePartitioning};
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
@@ -312,6 +313,14 @@ impl PartitionSpillWriters {
 }
 
 impl OutputChannel {
+    /// Whether this output's consumer is waiting with nothing to read
+    /// ([`FlushOnDemand`]).
+    fn requested(&self) -> bool {
+        self.shared_coalescer
+            .as_ref()
+            .is_some_and(SharedCoalescer::requested)
+    }
+
     async fn flush_requested(&mut self) -> Result<()> {
         let Some(shared) = &self.shared_coalescer else {
             return Ok(());
@@ -321,17 +330,19 @@ impl OutputChannel {
         }
         Ok(())
     }
-    /// Appends the batches that are ready to send to `out`.
+    /// Moves `batches`, in order, into this output: into its shared
+    /// coalescer under one lock acquisition, or straight to `out` when it
+    /// has none. Appends the batches that are ready to send to `out`.
     fn coalesce(
         &mut self,
-        batch: RecordBatch,
+        batches: &mut Vec<RecordBatch>,
         out: &mut Vec<RecordBatch>,
         metrics: &RepartitionMetrics,
     ) -> Result<()> {
         match &self.shared_coalescer {
-            Some(shared) => shared.push_and_drain(batch, out, metrics),
+            Some(shared) => shared.push_and_drain(batches, out, metrics),
             None => {
-                out.push(batch);
+                out.append(batches);
                 Ok(())
             }
         }
@@ -462,15 +473,23 @@ impl SharedCoalescer {
         }
     }
 
-    /// Push `batch` into the coalescer and drain any newly completed
-    /// batches into `out`. The mutex is held only briefly.
+    /// Push `batches`, in order, into the coalescer under one lock
+    /// acquisition and drain any newly completed batches into `out`. The
+    /// mutex is held only for the copies.
     ///
     /// Counts the push in `coalesce_pushes`, and in `coalesce_contended`
     /// when another producer held the lock: the lock is tried first, and
     /// only a failed try waits as a plain `lock` would.
+    ///
+    /// A push that completes a batch answers the consumer's request: that
+    /// batch is about to be sent, so the request is cleared, and a consumer
+    /// still waiting after it asks again ([`Self::request`]). Otherwise a
+    /// request made once, at the start, would stay set while dense input
+    /// keeps every producer busy, and producers would push each slice as it
+    /// is routed ([`Held`]).
     fn push_and_drain(
         &self,
-        batch: RecordBatch,
+        batches: &mut Vec<RecordBatch>,
         out: &mut Vec<RecordBatch>,
         metrics: &RepartitionMetrics,
     ) -> Result<()> {
@@ -482,16 +501,26 @@ impl SharedCoalescer {
                 self.inner.lock()
             }
         };
-        c.push_batch(batch)?;
+        let ready = out.len();
+        for batch in batches.drain(..) {
+            c.push_batch(batch)?;
+        }
         while let Some(b) = c.next_completed_batch() {
             out.push(b);
         }
         if self.requested.load(AtomicOrdering::Acquire) {
-            if let Some(notify) = &self.demand {
+            if out.len() > ready {
+                self.requested.store(false, AtomicOrdering::Release);
+            } else if let Some(notify) = &self.demand {
                 notify.notify_one();
             }
         }
         Ok(())
+    }
+
+    /// Whether this output's consumer is waiting with nothing to read.
+    fn requested(&self) -> bool {
+        self.requested.load(AtomicOrdering::Acquire)
     }
 
     fn request(&self) {
@@ -542,6 +571,190 @@ impl SharedCoalescer {
             acc.push(b);
         }
         Ok(acc)
+    }
+}
+
+/// The slices one producer has routed to the outputs of a hash or range
+/// repartition but not yet pushed into their shared coalescers
+/// ([`SharedCoalescer`]).
+///
+/// Pushing each slice as it is routed takes every output's coalescer lock
+/// once per input batch, so the lock and the coalescer's lines move between
+/// the producers' cores once per slice: N times per input batch, a few hundred
+/// rows a time at 26 outputs. A producer instead keeps an output's slices
+/// (references into the partitioned input batch, nothing copied) until they
+/// reach `threshold` rows, a quarter of the target batch, and then pushes them
+/// all under one lock acquisition. A coalesced batch then takes about four
+/// lock handoffs instead of one per producer.
+///
+/// # Invariants
+///
+/// - **Every row reaches its output exactly once, in this producer's input
+///   order.** A slice joins its output's group as it is routed, and leaves it
+///   only through [`Self::take`], which hands the whole group, in order, to
+///   that output's coalescer. A group is dropped only with its output's
+///   channel, after the consumer has hung up.
+/// - **Nothing is held while the producer is parked.** Before it waits for
+///   input that is not ready, `pull_from_input` pushes every group, so a
+///   demand flush ([`FlushOnDemand`]), which only a parked producer makes,
+///   finds the held rows already in the coalescer. A group whose consumer is
+///   waiting is pushed at the next slice routed to it, and every group is
+///   pushed at end of input and when this producer's memory grow is refused.
+///   A producer may still wait inside a send while holding other outputs'
+///   slices: the channels' gate waits only while every output holds data,
+///   and a repartition that waits for memory waits on one output whose
+///   consumer drains it independently ([`RepartitionExec::with_memory_wait`]),
+///   so those rows are late, never stuck.
+/// - **A producer holds fewer than `threshold` rows per output**, at most
+///   N × (`threshold` − 1) rows in all, and keeps alive partitioned input
+///   batches (the `take` outputs its slices point into, with the view buffers
+///   they reference) of at most `limit` rows plus the batch being routed.
+///   Past `limit` it pushes the groups that point into the oldest.
+///   `reservation` is charged for the batches kept alive, in [`HELD_STEP`]s.
+/// - **The rotated sweep still decides which output is served first**: groups
+///   are routed, and pushed together, in the producer's sweep order.
+struct Held {
+    threshold: usize,
+    limit: usize,
+    groups: Vec<Group>,
+    /// Rows held over all groups.
+    rows: usize,
+    /// The partitioned input batches some group still points into, oldest
+    /// first, by sequence number, rows and bytes.
+    takes: VecDeque<(u64, usize, usize)>,
+    /// Rows and bytes of `takes`.
+    alive: usize,
+    bytes: usize,
+    next: u64,
+    reservation: MemoryReservation,
+}
+
+/// The slices one producer holds for one output, oldest first.
+#[derive(Default)]
+struct Group {
+    slices: Vec<RecordBatch>,
+    rows: usize,
+    /// Sequence number of the partitioned input batch the oldest slice points into.
+    oldest: u64,
+}
+
+/// The step in which [`Held`] grows or shrinks its reservation, so that it
+/// changes when the bytes held cross a step, never per slice.
+const HELD_STEP: usize = 1024 * 1024;
+
+impl Held {
+    /// Groups for `outputs` outputs, pushed at a quarter of `target` rows.
+    ///
+    /// With rows spread evenly, an output reaches a quarter batch after about
+    /// `outputs / 4` batches' worth of input, so a producer keeps at most one
+    /// batch more than that alive, plus the batch being routed.
+    fn new(target: usize, outputs: usize, reservation: MemoryReservation) -> Self {
+        Self {
+            threshold: (target / 4).max(1),
+            limit: (outputs.div_ceil(4) + 1) * target,
+            groups: (0..outputs).map(|_| Group::default()).collect(),
+            rows: 0,
+            takes: VecDeque::new(),
+            alive: 0,
+            bytes: 0,
+            next: 0,
+            reservation,
+        }
+    }
+
+    /// Registers a partitioned input batch of `rows` and `bytes` whose
+    /// slices are about to be routed, and returns its sequence number.
+    fn admit(&mut self, rows: usize, bytes: usize) -> u64 {
+        let seq = self.next;
+        self.next += 1;
+        self.takes.push_back((seq, rows, bytes));
+        self.alive += rows;
+        self.bytes += bytes;
+        seq
+    }
+
+    /// Adds `slice`, from partitioned input batch `seq`, to `partition`'s
+    /// group. Returns whether the group should be pushed now: it holds a
+    /// quarter batch, or its consumer is waiting (`requested`).
+    fn hold(
+        &mut self,
+        partition: usize,
+        slice: RecordBatch,
+        seq: u64,
+        requested: bool,
+    ) -> bool {
+        let group = &mut self.groups[partition];
+        if group.slices.is_empty() {
+            group.oldest = seq;
+        }
+        group.rows += slice.num_rows();
+        self.rows += slice.num_rows();
+        group.slices.push(slice);
+        requested || group.rows >= self.threshold
+    }
+
+    /// Moves `partition`'s group, in order, to the end of `into`.
+    fn take(&mut self, partition: usize, into: &mut Vec<RecordBatch>) {
+        let group = &mut self.groups[partition];
+        self.rows -= group.rows;
+        group.rows = 0;
+        into.append(&mut group.slices);
+    }
+
+    /// The outputs that hold anything, in the sweep order that starts at `first`.
+    fn held(&self, first: usize) -> Vec<usize> {
+        let outputs = self.groups.len();
+        (0..outputs)
+            .map(|i| (first + i) % outputs)
+            .filter(|partition| !self.groups[*partition].slices.is_empty())
+            .collect()
+    }
+
+    /// When the partitioned input batches kept alive hold more than `limit`
+    /// rows, the outputs whose groups point into the oldest, in the sweep
+    /// order that starts at `first`.
+    fn overdue(&self, first: usize) -> Option<Vec<usize>> {
+        if self.alive <= self.limit {
+            return None;
+        }
+        let (oldest, ..) = *self.takes.front()?;
+        Some(
+            self.held(first)
+                .into_iter()
+                .filter(|partition| self.groups[*partition].oldest == oldest)
+                .collect(),
+        )
+    }
+
+    /// Forgets the partitioned input batches no group points into any more.
+    fn release(&mut self) {
+        let oldest = self
+            .groups
+            .iter()
+            .filter(|group| !group.slices.is_empty())
+            .map(|group| group.oldest)
+            .min()
+            .unwrap_or(self.next);
+        while let Some((seq, rows, bytes)) = self.takes.front().copied()
+            && seq < oldest
+        {
+            self.takes.pop_front();
+            self.alive -= rows;
+            self.bytes -= bytes;
+        }
+    }
+
+    /// Charges the reservation for the bytes kept alive, rounded up to a
+    /// [`HELD_STEP`]. Returns `false` when the pool refuses the grow: the
+    /// caller then pushes every group rather than fail the query.
+    fn charge(&mut self) -> bool {
+        let target = self.bytes.next_multiple_of(HELD_STEP);
+        let size = self.reservation.size();
+        if target > size {
+            return self.reservation.try_grow(target - size).is_ok();
+        }
+        self.reservation.shrink(size - target);
+        true
     }
 }
 
@@ -850,12 +1063,32 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
+            // A hash or range partitioner splits each input batch over the
+            // outputs, so its producers group their slices before pushing
+            // them into the shared coalescers ([`Held`]). Round robin sends
+            // whole batches, one output per input batch, so it already pushes
+            // once per batch; without a shared coalescer there is no lock to
+            // spare.
+            let splits = matches!(
+                partitioning,
+                Partitioning::Hash(..) | Partitioning::Range(_)
+            );
+            let held = (coalesce_batches && splits).then(|| {
+                Held::new(
+                    coalescer_batch_size,
+                    num_output_partitions,
+                    MemoryConsumer::new(format!("{name}[held {i}]"))
+                        .register(context.memory_pool()),
+                )
+            });
+
             let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
                 stream,
                 txs,
                 partitioning.clone(),
                 range_router.clone(),
                 metrics,
+                held,
                 // preserve_order depends on partition index to start from 0
                 if preserve_order { 0 } else { i },
                 num_input_partitions,
@@ -2602,13 +2835,16 @@ impl RepartitionExec {
     /// Pulls data from the specified input plan, feeding it to the
     /// output partitions based on the desired partitioning
     ///
-    /// `output_channels` holds the output sending channels for each output partition
+    /// `output_channels` holds the output sending channels for each output partition;
+    /// `held` is set when this producer groups its slices ([`Held`]).
+    #[expect(clippy::too_many_arguments)]
     async fn pull_from_input(
         mut stream: SendableRecordBatchStream,
         mut output_channels: HashMap<usize, OutputChannel>,
         partitioning: Partitioning,
         range_router: Option<Arc<RangeRouter>>,
         metrics: RepartitionMetrics,
+        mut held: Option<Held>,
         input_partition: usize,
         num_input_partitions: usize,
     ) -> Result<()> {
@@ -2634,6 +2870,7 @@ impl RepartitionExec {
         // While there are still outputs to send to, keep pulling inputs
         let mut batches_until_yield = partitioner.num_partitions();
         let mut coalesced = Vec::new();
+        let mut slices = Vec::new();
         // **Each producer starts its sweep over the outputs at its own input
         // partition (modulo the output count) and wraps around.** A batch's
         // slices come from the partitioner in ascending output order; this
@@ -2649,7 +2886,8 @@ impl RepartitionExec {
         // batch to one output, so it is unaffected. `preserve_order` passes
         // input partition 0 to every producer (see
         // `ensure_input_streams_initialized`), so it keeps the sweep from 0;
-        // it has no shared coalescer to contend on.
+        // it has no shared coalescer to contend on. Grouped pushes ([`Held`])
+        // keep this order: groups are pushed in the same sweep.
         let first = input_partition
             .checked_rem(partitioner.num_partitions())
             .unwrap_or(0);
@@ -2660,21 +2898,49 @@ impl RepartitionExec {
             .find_map(|channel| channel.shared_coalescer.as_ref()?.demand.clone());
         while !output_channels.is_empty() {
             // fetch the next batch
-            let timer = metrics.fetch_time.timer();
-            let result = if let Some(demand) = &demand {
-                loop {
-                    tokio::select! {
-                        biased;
-                        batch = stream.next() => break batch,
-                        _ = demand.notified() => {
-                            for channel in output_channels.values_mut() {
-                                channel.flush_requested().await?;
+            let mut timer = metrics.fetch_time.timer();
+            // A producer that holds slices polls its input once first: if the
+            // input is not ready, it pushes everything it holds before it
+            // waits, so no rows are held while it is parked. That push is
+            // timed as sending, not fetching.
+            let ready = match &held {
+                Some(held) if held.rows > 0 => stream.next().now_or_never(),
+                _ => None,
+            };
+            let result = match ready {
+                Some(result) => result,
+                None => {
+                    if let Some(held) = &mut held
+                        && held.rows > 0
+                    {
+                        timer.stop();
+                        Self::push_held(
+                            &mut output_channels,
+                            held,
+                            first,
+                            &metrics,
+                            &mut slices,
+                            &mut coalesced,
+                        )
+                        .await?;
+                        timer.restart();
+                    }
+                    if let Some(demand) = &demand {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                batch = stream.next() => break batch,
+                                _ = demand.notified() => {
+                                    for channel in output_channels.values_mut() {
+                                        channel.flush_requested().await?;
+                                    }
+                                }
                             }
                         }
+                    } else {
+                        stream.next().await
                     }
                 }
-            } else {
-                stream.next().await
             };
             timer.done();
 
@@ -2695,23 +2961,73 @@ impl RepartitionExec {
             let split = routed.partition_point(|(partition, _)| *partition < first);
             routed.rotate_left(split);
 
-            for (partition, batch) in routed.drain(..) {
-                let timer = metrics.send_time[partition].timer();
-                // if there is still a receiver, send to it
-                if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    let coalesce = metrics.coalesce_time.timer();
-                    output_channel.coalesce(batch, &mut coalesced, &metrics)?;
-                    coalesce.done();
-                    for batch in coalesced.drain(..) {
-                        if output_channel.send(batch, true).await.is_err() {
-                            // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                            // so ignore this channel from now on.
-                            output_channels.remove(&partition);
-                            break;
+            match &mut held {
+                Some(held) => {
+                    // Every slice of a partitioned batch shares its buffers,
+                    // so any one of them reports the bytes they keep alive.
+                    let Some((_, slice)) = routed.first() else {
+                        continue;
+                    };
+                    let rows = routed.iter().map(|(_, slice)| slice.num_rows()).sum();
+                    let seq = held.admit(rows, slice.get_array_memory_size());
+                    for (partition, slice) in routed.drain(..) {
+                        let Some(channel) = output_channels.get(&partition) else {
+                            continue;
+                        };
+                        if held.hold(partition, slice, seq, channel.requested()) {
+                            held.take(partition, &mut slices);
+                            Self::push(
+                                &mut output_channels,
+                                partition,
+                                &metrics,
+                                &mut slices,
+                                &mut coalesced,
+                            )
+                            .await?;
                         }
                     }
+                    held.release();
+                    while let Some(overdue) = held.overdue(first) {
+                        for partition in overdue {
+                            held.take(partition, &mut slices);
+                            Self::push(
+                                &mut output_channels,
+                                partition,
+                                &metrics,
+                                &mut slices,
+                                &mut coalesced,
+                            )
+                            .await?;
+                        }
+                        held.release();
+                    }
+                    if !held.charge() {
+                        // The pool refused what the held slices keep alive:
+                        // push them all and carry on with nothing held.
+                        Self::push_held(
+                            &mut output_channels,
+                            held,
+                            first,
+                            &metrics,
+                            &mut slices,
+                            &mut coalesced,
+                        )
+                        .await?;
+                    }
                 }
-                timer.done();
+                None => {
+                    for (partition, batch) in routed.drain(..) {
+                        slices.push(batch);
+                        Self::push(
+                            &mut output_channels,
+                            partition,
+                            &metrics,
+                            &mut slices,
+                            &mut coalesced,
+                        )
+                        .await?;
+                    }
+                }
             }
 
             // If the input stream is endless, we may spin forever and
@@ -2738,6 +3054,20 @@ impl RepartitionExec {
             }
         }
 
+        // End of input: push what this producer still holds, so the last
+        // producer's finalize below ships every row.
+        if let Some(held) = &mut held {
+            Self::push_held(
+                &mut output_channels,
+                held,
+                first,
+                &metrics,
+                &mut slices,
+                &mut coalesced,
+            )
+            .await?;
+        }
+
         // End of input for this task. For each output partition we still
         // have a channel to, decrement the active-senders counter; whoever
         // sees the count drop to zero is the last input task and must
@@ -2748,6 +3078,54 @@ impl RepartitionExec {
 
         // Spill writers will auto-finalize when dropped
         // No need for explicit flush
+        Ok(())
+    }
+
+    /// Moves `slices`, in order, into `partition`'s output (its shared
+    /// coalescer under one lock acquisition, when it has one) and sends the
+    /// batches that completes. Forgets the output when its consumer has hung
+    /// up, as an early shutdown (for example a `LIMIT`) does.
+    async fn push(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        partition: usize,
+        metrics: &RepartitionMetrics,
+        slices: &mut Vec<RecordBatch>,
+        coalesced: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        let timer = metrics.send_time[partition].timer();
+        let Some(output_channel) = output_channels.get_mut(&partition) else {
+            slices.clear();
+            return Ok(());
+        };
+        let coalesce = metrics.coalesce_time.timer();
+        output_channel.coalesce(slices, coalesced, metrics)?;
+        coalesce.done();
+        for batch in coalesced.drain(..) {
+            if output_channel.send(batch, true).await.is_err() {
+                output_channels.remove(&partition);
+                break;
+            }
+        }
+        timer.done();
+        Ok(())
+    }
+
+    /// Pushes every group `held` holds, in the sweep order that starts at
+    /// `first`, and releases what they kept alive.
+    async fn push_held(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        held: &mut Held,
+        first: usize,
+        metrics: &RepartitionMetrics,
+        slices: &mut Vec<RecordBatch>,
+        coalesced: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        for partition in held.held(first) {
+            held.take(partition, slices);
+            Self::push(output_channels, partition, metrics, slices, coalesced).await?;
+        }
+        held.release();
+        held.charge();
         Ok(())
     }
 
@@ -4247,6 +4625,297 @@ mod tests {
                 inner: Arc::new(self.clone()),
             })
         }
+    }
+
+    /// `producers` input partitions of `batches` batches of `rows` rows: a
+    /// spread key, a row number unique over all inputs (producer p numbers
+    /// its rows from p × 1,000,000 in input order) and a view column too
+    /// long to inline, derived from the row number.
+    fn grouped_input(
+        producers: u32,
+        batches: u32,
+        rows: u32,
+    ) -> (SchemaRef, Vec<Vec<RecordBatch>>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("n", DataType::UInt32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let partitions = (0..producers)
+            .map(|p| {
+                (0..batches)
+                    .map(|b| {
+                        let n = (0..rows).map(|r| p * 1_000_000 + b * rows + r);
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(UInt32Array::from_iter_values(
+                                    n.clone().map(|n| n.wrapping_mul(2_654_435_761)),
+                                )),
+                                Arc::new(UInt32Array::from_iter_values(n.clone())),
+                                Arc::new(StringViewArray::from_iter_values(
+                                    n.map(|n| format!("row {n} has a long string")),
+                                )),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        (schema, partitions)
+    }
+
+    /// Asserts that `outputs` hold every row of `grouped_input(producers,
+    /// batches, rows)` exactly once, with its own string, and each
+    /// producer's rows in input order within every output.
+    fn assert_each_row_once_in_order(
+        outputs: &[Vec<RecordBatch>],
+        producers: u32,
+        batches: u32,
+        rows: u32,
+    ) {
+        let mut all = vec![];
+        for output in outputs {
+            let mut last = HashMap::new();
+            for batch in output {
+                let n = batch.column(1).as_primitive::<UInt32Type>();
+                let s = batch.column(2).as_string_view();
+                for (n, s) in n.values().iter().zip(s.iter()) {
+                    assert_eq!(s, Some(format!("row {n} has a long string").as_str()));
+                    if let Some(previous) = last.insert(n / 1_000_000, *n) {
+                        assert!(previous < *n, "{n} after {previous} in one output");
+                    }
+                    all.push(*n);
+                }
+            }
+        }
+        all.sort_unstable();
+        let expected: Vec<u32> = (0..producers)
+            .flat_map(|p| (0..batches * rows).map(move |r| p * 1_000_000 + r))
+            .collect();
+        assert_eq!(all, expected);
+    }
+
+    async fn collect_outputs(
+        exec: &RepartitionExec,
+        task: &Arc<TaskContext>,
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        let mut outputs = vec![];
+        for partition in 0..exec.partitioning().partition_count() {
+            outputs.push(
+                exec.execute(partition, Arc::clone(task))?
+                    .try_collect()
+                    .await?,
+            );
+        }
+        Ok(outputs)
+    }
+
+    #[tokio::test]
+    async fn grouped_pushes_deliver_each_row_once_in_order() -> Result<()> {
+        // 3 batches end with every row still held (fewer than a quarter
+        // batch per output); 50 batches push groups as they fill.
+        for batches in [3, 50] {
+            let (schema, partitions) = grouped_input(3, batches, 100);
+            let source =
+                TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+            let exec = RepartitionExec::try_new(
+                source,
+                Partitioning::Hash(vec![col("key", &schema)?], 5),
+            )?;
+            let config = SessionConfig::new().with_batch_size(1024);
+            let task = Arc::new(TaskContext::default().with_session_config(config));
+            let outputs = collect_outputs(&exec, &task).await?;
+            assert_each_row_once_in_order(&outputs, 3, batches, 100);
+            // Each producer routes one slice per output and input batch,
+            // about 20 rows. A group of a quarter batch (256 rows) takes
+            // about 13 of them; with 3 batches each producer pushes each
+            // output once, at end of input.
+            let pushes = exec
+                .metrics()
+                .unwrap()
+                .sum_by_name("coalesce_pushes")
+                .unwrap()
+                .as_usize();
+            let slices = 3 * batches as usize * 5;
+            match batches {
+                3 => assert_eq!(pushes, 3 * 5),
+                _ => assert!(
+                    pushes * 4 <= slices,
+                    "{pushes} pushes for {slices} slices of {batches} batches"
+                ),
+            }
+            assert_eq!(task.memory_pool().reserved(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grouped_pushes_bound_the_batches_kept_alive() -> Result<()> {
+        // About one row in a hundred goes to output 0, so its group would
+        // keep every input batch alive until the end; past the limit the
+        // producer pushes it with the oldest batches' other groups.
+        let (schema, partitions) = grouped_input(1, 50, 100);
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let partitioning = Partitioning::Range(RangePartitioning::try_new(
+            [PhysicalSortExpr::new(
+                col("key", &schema)?,
+                SortOptions::default(),
+            )]
+            .into(),
+            vec![SplitPoint::new(vec![ScalarValue::UInt32(Some(
+                u32::MAX / 100,
+            ))])],
+        )?);
+        let exec = RepartitionExec::try_new(source, partitioning)?;
+        let config = SessionConfig::new().with_batch_size(1024);
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let outputs = collect_outputs(&exec, &task).await?;
+        assert_each_row_once_in_order(&outputs, 1, 50, 100);
+        assert_eq!(task.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grouped_pushes_survive_a_refused_charge() -> Result<()> {
+        // A pool too small for one step of held slices: every charge is
+        // refused, so producers push what they hold and carry on; batches
+        // the outputs cannot hold spill.
+        let (schema, partitions) = grouped_input(3, 50, 100);
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &schema)?], 5),
+        )?;
+        let runtime = RuntimeEnvBuilder::default()
+            .with_memory_limit(256 * 1024, 1.0)
+            .build_arc()?;
+        let config = SessionConfig::new().with_batch_size(1024);
+        let task = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime)
+                .with_session_config(config),
+        );
+        let outputs = collect_outputs(&exec, &task).await?;
+        assert_each_row_once_in_order(&outputs, 3, 50, 100);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grouped_pushes_hold_nothing_while_parked() -> Result<()> {
+        // One batch, then an input that is never ready. Without demand
+        // flushes nothing reaches a consumer, but the producer must push its
+        // held slices into the coalescers before it waits, and drop their
+        // charge.
+        let (schema, partitions) = grouped_input(1, 1, 100);
+        let source = Arc::new(StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UnboundedTestPartition {
+                schema: Arc::clone(&schema),
+                batch: partitions[0][0].clone(),
+            })],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &schema)?], 4),
+        )?;
+        let config = SessionConfig::new().with_batch_size(1024);
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut stream = exec.execute(0, Arc::clone(&task))?;
+        // Start the producer; its first batch fills no output.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+        let pushes = || {
+            exec.metrics()
+                .unwrap()
+                .sum_by_name("coalesce_pushes")
+                .map_or(0, |pushes| pushes.as_usize())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pushes() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a parked producer still holds slices");
+        assert_eq!(pushes(), 4);
+        assert_eq!(task.memory_pool().reserved(), 0);
+        drop(stream);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grouped_pushes_reach_a_waiting_consumer() -> Result<()> {
+        // One batch, then an input that is never ready: a consumer waiting
+        // on demand gets its rows from the producer that holds them.
+        let (schema, partitions) = grouped_input(1, 1, 100);
+        let batch = partitions[0][0].clone();
+        let source = Arc::new(StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UnboundedTestPartition {
+                schema: Arc::clone(&schema),
+                batch: batch.clone(),
+            })],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &schema)?], 2),
+        )?;
+        let config = SessionConfig::new()
+            .with_batch_size(1024)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut rows = 0;
+        let mut streams = vec![];
+        for partition in 0..2 {
+            let mut stream = exec.execute(partition, Arc::clone(&task))?;
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("demand flush deadlocked")
+                    .expect("missing batch")?;
+            rows += result.num_rows();
+            streams.push(stream);
+        }
+        assert_eq!(rows, batch.num_rows());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn round_robin_pushes_each_batch_once() -> Result<()> {
+        // Round robin sends whole batches: one push per input batch, as
+        // before grouped pushes.
+        let schema = test_schema(false);
+        let partitions = vec![create_vec_batches(50), create_vec_batches(50)];
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(4))?;
+        let task = Arc::new(TaskContext::default());
+        let outputs = collect_outputs(&exec, &task).await?;
+        let rows: usize = outputs.iter().flatten().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2 * 50 * 8);
+        let pushes = exec
+            .metrics()
+            .unwrap()
+            .sum_by_name("coalesce_pushes")
+            .unwrap()
+            .as_usize();
+        assert_eq!(pushes, 100);
+        Ok(())
     }
 
     #[tokio::test]
