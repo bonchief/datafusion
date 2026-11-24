@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
+use arrow::datatypes::DataType;
 use datafusion_common::{
     DFSchema, DataFusionError, HashSet, Result, assert_or_internal_err,
     tree_node::Transformed,
@@ -67,7 +68,32 @@ use datafusion_expr::{
 /// The `CASE` restores the 0 that `count` reports over an empty input, where a
 /// `sum` of no rows is NULL.
 ///
-/// See `rewrite_pays_for_count` for when the `count` is allowed.
+/// A non-distinct `avg` over a `Float64` argument, which is what type coercion
+/// makes of an `avg` over any integer or float column, may appear as well. The
+/// inner group-by keeps its sum and its count of non-null values, and the
+/// outer phase divides the sum of the sums by the sum of the counts:
+///
+///  ```text
+///    Before:
+///    SELECT a, avg(c), count(DISTINCT b)
+///    FROM t
+///    GROUP BY a
+///
+///    After:
+///    SELECT a, sum(alias2) / CAST(sum(alias3) AS Float64), count(alias1)
+///    FROM (
+///      SELECT a, b as alias1, sum(c) as alias2, count(c) as alias3
+///      FROM t
+///      GROUP BY a, b
+///    )
+///    GROUP BY a
+///  ```
+///
+/// A group whose values are all NULL has a NULL sum, so the quotient is NULL,
+/// as `avg` reports. A decimal or duration `avg` is left alone: its result
+/// type is not the quotient's.
+///
+/// See `rewrite_pays` for when a `count` or an `avg` is allowed.
 #[derive(Default, Debug)]
 pub struct SingleDistinctToGroupBy {}
 
@@ -80,23 +106,26 @@ impl SingleDistinctToGroupBy {
     }
 }
 
-/// The pair of functions used to compute a non-distinct `count` in two phases:
-/// `count` identifies the aggregates that need the treatment, `sum` combines
-/// the partial counts the inner group-by produces.
+/// The functions used to compute a non-distinct `count` or `avg` in two
+/// phases: `count` and `avg` identify the aggregates that need the treatment,
+/// `sum` combines the partial sums and counts the inner group-by produces.
 ///
-/// Both are resolved from the session's function registry, so a plan built
-/// without one keeps the previous behaviour of bailing out on `count`.
-struct CountRollup {
+/// They are resolved from the session's function registry, so a plan built
+/// without one keeps the previous behaviour of bailing out on `count` and
+/// `avg`, and a registry without `avg` bails out on `avg` alone.
+struct Rollup {
     count: Arc<AggregateUDF>,
     sum: Arc<AggregateUDF>,
+    avg: Option<Arc<AggregateUDF>>,
 }
 
-impl CountRollup {
+impl Rollup {
     fn try_new(config: &dyn OptimizerConfig) -> Option<Self> {
         let registry = config.function_registry()?;
         Some(Self {
             count: registry.udaf("count").ok()?,
             sum: registry.udaf("sum").ok()?,
+            avg: registry.udaf("avg").ok(),
         })
     }
 
@@ -105,18 +134,32 @@ impl CountRollup {
     fn is_count(&self, func: &AggregateUDF) -> bool {
         self.count.as_ref() == func
     }
+
+    /// Whether `func` is the registry's `avg`, and so decomposes into the
+    /// sum of partial sums over the sum of partial counts.
+    fn is_avg(&self, func: &AggregateUDF) -> bool {
+        self.avg.as_deref().is_some_and(|avg| avg == func)
+    }
+}
+
+/// Whether `args` are the single `Float64` argument an `avg` decomposes over.
+fn is_float_avg_arg(args: &[Expr], input_schema: &DFSchema) -> Result<bool> {
+    Ok(match args {
+        [arg] => arg.get_type(input_schema)? == DataType::Float64,
+        _ => false,
+    })
 }
 
 /// Check whether all aggregate exprs are distinct on a single field.
 fn is_single_distinct_agg(
     aggr_expr: &[Expr],
     input_schema: &DFSchema,
-    count_rollup: Option<&CountRollup>,
+    rollup: Option<&Rollup>,
 ) -> Result<bool> {
     let mut fields_set = HashSet::new();
     let mut aggregate_count = 0;
     let mut distinct_aggs = vec![];
-    let mut has_count_rollup = false;
+    let mut has_rollup = false;
     for expr in aggr_expr {
         if let Expr::AggregateFunction(AggregateFunction {
             func,
@@ -139,8 +182,13 @@ fn is_single_distinct_agg(
                     fields_set.insert(e);
                 }
                 distinct_aggs.push((func, args.as_slice()));
-            } else if count_rollup.is_some_and(|rollup| rollup.is_count(func)) {
-                has_count_rollup = true;
+            } else if rollup.is_some_and(|rollup| rollup.is_count(func)) {
+                has_rollup = true;
+            } else if rollup.is_some_and(|rollup| rollup.is_avg(func)) {
+                if !is_float_avg_arg(args, input_schema)? {
+                    return Ok(false);
+                }
+                has_rollup = true;
             } else if func.name() != "sum"
                 && func.name().to_lowercase() != "min"
                 && func.name().to_lowercase() != "max"
@@ -154,14 +202,14 @@ fn is_single_distinct_agg(
     if aggregate_count != aggr_expr.len() || fields_set.len() != 1 {
         return Ok(false);
     }
-    if has_count_rollup && !rewrite_pays_for_count(&distinct_aggs, input_schema)? {
+    if has_rollup && !rewrite_pays(&distinct_aggs, input_schema)? {
         return Ok(false);
     }
     Ok(true)
 }
 
 /// Whether the rewrite is worth extending to a plan that only qualifies because
-/// of the non-distinct `count`.
+/// of a non-distinct `count` or `avg`.
 ///
 /// The rewrite is not free: every other aggregate moves down to the inner group
 /// by, which has a row per `(group, distinct value)` pair rather than per group,
@@ -181,7 +229,7 @@ fn is_single_distinct_agg(
 /// narrowing it would change plans that have always been rewritten.
 ///
 /// Measured in <https://github.com/apache/datafusion/pull/24859>.
-fn rewrite_pays_for_count(
+fn rewrite_pays(
     distinct_aggs: &[(&Arc<AggregateUDF>, &[Expr])],
     input_schema: &DFSchema,
 ) -> Result<bool> {
@@ -219,7 +267,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
         if !matches!(plan, LogicalPlan::Aggregate(_)) {
             return Ok(Transformed::no(plan));
         }
-        let count_rollup = CountRollup::try_new(config);
+        let rollup = Rollup::try_new(config);
         match plan {
             LogicalPlan::Aggregate(Aggregate {
                 input,
@@ -230,7 +278,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
             }) if is_single_distinct_agg(
                 &aggr_expr,
                 input.schema(),
-                count_rollup.as_ref(),
+                rollup.as_ref(),
             )? && !contains_grouping_set(&group_expr) =>
             {
                 let group_size = group_expr.len();
@@ -278,11 +326,12 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                 let mut index = 1;
                 let mut group_fields_set = HashSet::new();
                 let mut inner_aggr_exprs = vec![];
-                // Each aggregate yields the expression the outer `Aggregate`
+                // Each aggregate yields the expressions the outer `Aggregate`
                 // computes and the expression the projection above it selects.
-                // They differ only for `count`, whose projection restores the
-                // zero that `sum` reports as NULL over an empty input.
-                let (outer_aggr_exprs, outer_proj_exprs): (Vec<Expr>, Vec<Expr>) = aggr_expr
+                // They differ for `count`, whose projection restores the zero
+                // that `sum` reports as NULL over an empty input, and for
+                // `avg`, whose projection divides its two outer sums.
+                let outer: Vec<(Vec<Expr>, Expr)> = aggr_expr
                     .into_iter()
                     .map(|aggr_expr| match aggr_expr {
                         Expr::AggregateFunction(AggregateFunction {
@@ -325,57 +374,75 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                                         order_by,
                                         null_treatment,
                                     ));
-                                Ok((outer.clone(), outer))
-                                // if the aggregate function is not distinct, we need to rewrite it like two phase aggregation
-                            } else {
+                                return Ok((vec![outer.clone()], outer));
+                            }
+                            // if the aggregate function is not distinct, we need to rewrite it like two phase aggregation
+                            let mut phase = |inner: Arc<AggregateUDF>,
+                                             args: Vec<Expr>,
+                                             outer: Arc<AggregateUDF>| {
                                 index += 1;
-                                let alias_str = format!("alias{index}");
-                                // `count`'s outer phase is `sum`, over the
-                                // partial counts the inner group-by produced.
-                                let rollup = count_rollup
-                                    .as_ref()
-                                    .filter(|rollup| rollup.is_count(&func));
-                                let outer_func = match rollup {
-                                    Some(rollup) => Arc::clone(&rollup.sum),
-                                    None => Arc::clone(&func),
-                                };
+                                let alias = format!("alias{index}");
                                 inner_aggr_exprs.push(
                                     Expr::AggregateFunction(AggregateFunction::new_udf(
-                                        Arc::clone(&func),
+                                        inner,
                                         args,
                                         false,
-                                        filter,
-                                        order_by,
+                                        filter.clone(),
+                                        order_by.clone(),
                                         null_treatment,
                                     ))
-                                    .alias(&alias_str),
+                                    .alias(&alias),
                                 );
-                                let outer =
-                                    Expr::AggregateFunction(AggregateFunction::new_udf(
-                                        outer_func,
-                                        vec![col(&alias_str)],
-                                        false,
-                                        None,
-                                        vec![],
-                                        None,
-                                    ));
-                                if rollup.is_none() {
-                                    return Ok((outer.clone(), outer));
+                                Expr::AggregateFunction(AggregateFunction::new_udf(
+                                    outer,
+                                    vec![col(alias)],
+                                    false,
+                                    None,
+                                    vec![],
+                                    None,
+                                ))
+                            };
+                            match rollup.as_ref() {
+                                // `count`'s outer phase is `sum`, over the
+                                // partial counts the inner group-by produced.
+                                Some(rollup) if rollup.is_count(&func) => {
+                                    let outer =
+                                        phase(func, args, Arc::clone(&rollup.sum));
+                                    // `sum` of no rows is NULL where `count` is 0.
+                                    // Restoring the 0 also keeps the column
+                                    // non-nullable, as `count` had it.
+                                    let proj =
+                                        when(outer.clone().is_not_null(), outer.clone())
+                                            .otherwise(lit(0_i64))?;
+                                    Ok((vec![outer], proj))
                                 }
-                                // `sum` of no rows is NULL where `count` is 0.
-                                // Restoring the 0 also keeps the column
-                                // non-nullable, as `count` had it.
-                                let proj =
-                                    when(outer.clone().is_not_null(), outer.clone())
-                                        .otherwise(lit(0_i64))?;
-                                Ok((outer, proj))
+                                // `avg` is the sum of the partial sums over the
+                                // sum of the partial counts of non-null values.
+                                Some(rollup) if rollup.is_avg(&func) => {
+                                    let sum = Arc::clone(&rollup.sum);
+                                    let total = phase(
+                                        Arc::clone(&sum),
+                                        args.clone(),
+                                        Arc::clone(&sum),
+                                    );
+                                    let count =
+                                        phase(Arc::clone(&rollup.count), args, sum);
+                                    let proj = total.clone()
+                                        / cast(count.clone(), DataType::Float64);
+                                    Ok((vec![total, count], proj))
+                                }
+                                _ => {
+                                    let outer = phase(Arc::clone(&func), args, func);
+                                    Ok((vec![outer.clone()], outer))
+                                }
                             }
                         }
-                        _ => Ok((aggr_expr.clone(), aggr_expr)),
+                        _ => Ok((vec![aggr_expr.clone()], aggr_expr)),
                     })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .unzip();
+                    .collect::<Result<_>>()?;
+                let (outer_aggr_exprs, outer_proj_exprs): (Vec<Vec<Expr>>, Vec<Expr>) =
+                    outer.into_iter().unzip();
+                let outer_aggr_exprs = outer_aggr_exprs.into_iter().flatten().collect();
 
                 // construct the inner AggrPlan
                 let inner_agg = LogicalPlan::Aggregate(Aggregate::try_new(
@@ -399,25 +466,35 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                 // this optimizer has two kinds of alias:
                 // - group_by aggr
                 // - aggr expr
-                let alias_expr: Vec<_> = out_group_expr_with_alias
-                    .into_iter()
-                    .map(|(group_expr, original_name)| match original_name {
+                let group_exprs = out_group_expr_with_alias.into_iter().map(
+                    |(group_expr, original_name)| match original_name {
                         Some((qualifier, name)) => {
                             group_expr.alias_qualified(qualifier.cloned(), name)
                         }
                         None => group_expr,
-                    })
-                    .chain(outer_proj_exprs.into_iter().enumerate().map(|(idx, expr)| {
-                        let idx = idx + group_size;
-                        let (qualifier, field) = schema.qualified_field(idx);
-                        let current_type = outer_aggr.schema().field(idx).data_type();
-                        let expr = if current_type != field.data_type() {
-                            cast(expr, field.data_type().clone())
-                        } else {
-                            expr
-                        };
-                        expr.alias_qualified(qualifier.cloned(), field.name())
-                    }))
+                    },
+                );
+                // The type each projected expression has over the outer
+                // aggregate, which reads its aggregates as columns by name.
+                let types = project(outer_aggr.clone(), outer_proj_exprs.clone())?
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.data_type().clone())
+                    .collect::<Vec<_>>();
+                let alias_expr: Vec<Expr> = group_exprs
+                    .chain(outer_proj_exprs.into_iter().zip(types).enumerate().map(
+                        |(idx, (expr, current_type))| {
+                            let (qualifier, field) =
+                                schema.qualified_field(idx + group_size);
+                            let expr = if &current_type != field.data_type() {
+                                cast(expr, field.data_type().clone())
+                            } else {
+                                expr
+                            };
+                            expr.alias_qualified(qualifier.cloned(), field.name())
+                        },
+                    ))
                     .collect();
 
                 Ok(Transformed::yes(project(outer_aggr, alias_expr)?))
@@ -446,9 +523,12 @@ mod tests {
         lit,
         logical_plan::builder::{LogicalPlanBuilder, table_scan},
     };
+    use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::correlation::corr_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
-    use datafusion_functions_aggregate::expr_fn::{count, count_distinct, max, min, sum};
+    use datafusion_functions_aggregate::expr_fn::{
+        avg, count, count_distinct, max, min, sum,
+    };
     use datafusion_functions_aggregate::min_max::max_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
 
@@ -572,6 +652,7 @@ mod tests {
             let mut registry = MemoryFunctionRegistry::new();
             registry.register_udaf(count_udaf()).unwrap();
             registry.register_udaf(sum_udaf()).unwrap();
+            registry.register_udaf(avg_udaf()).unwrap();
             Self {
                 inner: OptimizerContext::new(),
                 registry,
@@ -1302,6 +1383,140 @@ mod tests {
         Aggregate: groupBy=[[test.a]], aggr=[[count(Int64(1)), count(DISTINCT test.b)]] [a:UInt32, count(Int64(1)):Int64, count(DISTINCT test.b):Int64]
           TableScan: test [a:UInt32, b:UInt32, c:UInt32]
         ",
+        )
+    }
+
+    /// `test` with the `distinct` column `b` of the given type, a `Float64`
+    /// `c`, the type coercion gives an `avg` over any integer or float, and a
+    /// decimal `d`.
+    fn test_table_scan_avg(b: DataType) -> Result<LogicalPlan> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", b, true),
+            Field::new("c", DataType::Float64, true),
+            Field::new("d", DataType::Decimal128(10, 2), true),
+        ]);
+        table_scan(Some("test"), &schema, None)?.build()
+    }
+
+    #[test]
+    fn avg_count_star_and_distinct_with_groupby() -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Utf8)?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![
+                    sum(col("a")),
+                    count_star(),
+                    avg(col("c")),
+                    count_distinct(col("b")),
+                ],
+            )?
+            .build()?;
+
+        // Should work: the `avg` becomes the sum of the partial sums over the
+        // sum of the partial counts the inner group-by produces per
+        // (test.a, test.b) pair
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, sum(alias2) AS sum(test.a), CASE WHEN sum(alias3) IS NOT NULL THEN sum(alias3) ELSE Int64(0) END AS count(Int64(1)), sum(alias4) / CAST(sum(alias5) AS Float64) AS avg(test.c), count(alias1) AS count(DISTINCT test.b) [a:UInt32, sum(test.a):UInt64;N, count(Int64(1)):Int64, avg(test.c):Float64;N, count(DISTINCT test.b):Int64]
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(alias2), sum(alias3), sum(alias4), sum(alias5), count(alias1)]] [a:UInt32, sum(alias2):UInt64;N, sum(alias3):Int64;N, sum(alias4):Float64;N, sum(alias5):Int64;N, count(alias1):Int64]
+            Aggregate: groupBy=[[test.a, test.b AS alias1]], aggr=[[sum(test.a) AS alias2, count(Int64(1)) AS alias3, sum(test.c) AS alias4, count(test.c) AS alias5]] [a:UInt32, alias1:Utf8;N, alias2:UInt64;N, alias3:Int64, alias4:Float64;N, alias5:Int64]
+              TableScan: test [a:UInt32, b:Utf8;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn avg_and_distinct_without_groupby() -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Utf8)?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![avg(col("c")), count_distinct(col("b"))],
+            )?
+            .build()?;
+
+        // Should work. Over an empty input both outer sums are NULL, and so is
+        // their quotient, as `avg` reports
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: sum(alias2) / CAST(sum(alias3) AS Float64) AS avg(test.c), count(alias1) AS count(DISTINCT test.b) [avg(test.c):Float64;N, count(DISTINCT test.b):Int64]
+          Aggregate: groupBy=[[]], aggr=[[sum(alias2), sum(alias3), count(alias1)]] [sum(alias2):Float64;N, sum(alias3):Int64;N, count(alias1):Int64]
+            Aggregate: groupBy=[[test.b AS alias1]], aggr=[[sum(test.c) AS alias2, count(test.c) AS alias3]] [alias1:Utf8;N, alias2:Float64;N, alias3:Int64]
+              TableScan: test [a:UInt32, b:Utf8;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn avg_decimal_is_not_rewritten() -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Utf8)?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![avg(col("d")), count_distinct(col("b"))],
+            )?
+            .build()?;
+
+        // Do nothing: a decimal `avg` scales its result past the quotient of
+        // its sum and count
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[avg(test.d), count(DISTINCT test.b)]] [a:UInt32, avg(test.d):Decimal128(14, 6);N, count(DISTINCT test.b):Int64]
+          TableScan: test [a:UInt32, b:Utf8;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn avg_with_filter_is_not_rewritten() -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Utf8)?;
+
+        // avg(c) FILTER (WHERE a > 5)
+        let expr = avg_udaf()
+            .call(vec![col("c")])
+            .filter(col("a").gt(lit(5)))
+            .build()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("a")], vec![expr, count_distinct(col("b"))])?
+            .build()?;
+
+        // Do nothing
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[avg(test.c) FILTER (WHERE test.a > Int32(5)), count(DISTINCT test.b)]] [a:UInt32, avg(test.c) FILTER (WHERE test.a > Int32(5)):Float64;N, count(DISTINCT test.b):Int64]
+          TableScan: test [a:UInt32, b:Utf8;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn avg_and_distinct_over_a_natively_supported_type() -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Int64)?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![avg(col("c")), count_distinct(col("b"))],
+            )?
+            .build()?;
+
+        // Should not work: like a `count`, an `avg` joins the rewrite only when
+        // the distinct aggregate lacks its own `GroupsAccumulator`
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[avg(test.c), count(DISTINCT test.b)]] [a:UInt32, avg(test.c):Float64;N, count(DISTINCT test.b):Int64]
+          TableScan: test [a:UInt32, b:Int64;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
         )
     }
 
