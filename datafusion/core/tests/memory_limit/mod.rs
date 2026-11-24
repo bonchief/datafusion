@@ -1550,11 +1550,12 @@ impl Scenario {
                 single_row_batches,
             } => {
                 use datafusion::physical_expr::expressions::col;
-                let batches: Vec<Vec<_>> = std::iter::repeat_n(
-                    maybe_split_batches(dict_batches(), *single_row_batches),
-                    *partitions,
-                )
-                .collect();
+                // Each partition owns its buffers: a merge charges a buffer
+                // that several of its inputs share once, so partitions of
+                // the same batches would hold one partition's memory.
+                let batches: Vec<Vec<_>> = (0..*partitions)
+                    .map(|_| maybe_split_batches(make_dict_batches(), *single_row_batches))
+                    .collect();
 
                 let schema = batches[0][0].schema();
                 let options = SortOptions {
