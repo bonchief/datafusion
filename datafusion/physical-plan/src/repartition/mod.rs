@@ -1461,6 +1461,9 @@ impl BatchPartitioner {
     /// ```
     ///
     /// The sync [`partition`](Self::partition) method is implemented on top of this.
+    ///
+    /// Hash and range partitioning yield at most one batch per partition, in
+    /// ascending partition order; round robin yields one batch.
     pub fn partition_iter(
         &mut self,
         batch: RecordBatch,
@@ -2601,6 +2604,27 @@ impl RepartitionExec {
         // While there are still outputs to send to, keep pulling inputs
         let mut batches_until_yield = partitioner.num_partitions();
         let mut coalesced = Vec::new();
+        // **Each producer starts its sweep over the outputs at its own input
+        // partition (modulo the output count) and wraps around.** A batch's
+        // slices come from the partitioner in ascending output order; this
+        // producer serves the first output at or after `first`, then the rest
+        // in ascending order, then the outputs below `first`. Producers that
+        // start together therefore take different outputs' coalescer locks
+        // first instead of all queueing on output 0, then output 1, and so on.
+        //
+        // Only which output is served first changes. Every output still gets
+        // at most one slice per input batch from this producer, in input
+        // order, so what each output receives from one producer, and in what
+        // order, is the same as with a sweep from 0. Round robin routes a
+        // batch to one output, so it is unaffected. `preserve_order` passes
+        // input partition 0 to every producer (see
+        // `ensure_input_streams_initialized`), so it keeps the sweep from 0;
+        // it has no shared coalescer to contend on.
+        let first = input_partition
+            .checked_rem(partitioner.num_partitions())
+            .unwrap_or(0);
+        let mut routed: Vec<(usize, RecordBatch)> =
+            Vec::with_capacity(partitioner.num_partitions());
         let demand = output_channels
             .values()
             .find_map(|channel| channel.shared_coalescer.as_ref()?.demand.clone());
@@ -2636,8 +2660,12 @@ impl RepartitionExec {
             }
 
             for res in partitioner.partition_iter(batch)? {
-                let (partition, batch) = res?;
+                routed.push(res?);
+            }
+            let split = routed.partition_point(|(partition, _)| *partition < first);
+            routed.rotate_left(split);
 
+            for (partition, batch) in routed.drain(..) {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
