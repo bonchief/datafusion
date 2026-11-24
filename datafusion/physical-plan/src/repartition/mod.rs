@@ -44,6 +44,7 @@ use arrow::datatypes::{
 use arrow_schema::SortOptions;
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::instant::Instant;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::transpose;
@@ -313,14 +314,6 @@ impl PartitionSpillWriters {
 }
 
 impl OutputChannel {
-    /// Whether this output's consumer is waiting with nothing to read
-    /// ([`FlushOnDemand`]).
-    fn requested(&self) -> bool {
-        self.shared_coalescer
-            .as_ref()
-            .is_some_and(SharedCoalescer::requested)
-    }
-
     async fn flush_requested(&mut self) -> Result<()> {
         let Some(shared) = &self.shared_coalescer else {
             return Ok(());
@@ -485,8 +478,8 @@ impl SharedCoalescer {
     /// batch is about to be sent, so the request is cleared, and a consumer
     /// still waiting after it asks again ([`Self::request`]). Otherwise a
     /// request made once, at the start, would stay set while dense input
-    /// keeps every producer busy, and producers would push each slice as it
-    /// is routed ([`Held`]).
+    /// keeps every producer busy, and parked producers would be woken to
+    /// flush partial batches the busy ones are about to complete.
     fn push_and_drain(
         &self,
         batches: &mut Vec<RecordBatch>,
@@ -516,11 +509,6 @@ impl SharedCoalescer {
             }
         }
         Ok(())
-    }
-
-    /// Whether this output's consumer is waiting with nothing to read.
-    fn requested(&self) -> bool {
-        self.requested.load(AtomicOrdering::Acquire)
     }
 
     fn request(&self) {
@@ -597,10 +585,15 @@ impl SharedCoalescer {
 /// - **Nothing is held while the producer is parked.** Before it waits for
 ///   input that is not ready, `pull_from_input` pushes every group, so a
 ///   demand flush ([`FlushOnDemand`]), which only a parked producer makes,
-///   finds the held rows already in the coalescer. A group whose consumer is
-///   waiting is pushed at the next slice routed to it, and every group is
+///   finds the held rows already in the coalescer. Every group is also
 ///   pushed at end of input and when this producer's memory grow is refused.
-///   A producer may still wait inside a send while holding other outputs'
+/// - **A row waits in a producer at most [`HELD_AGE`] plus the time to route
+///   one input batch, unless the producer is inside a send.** A group whose
+///   oldest slice is older than [`HELD_AGE`] is pushed when the producer
+///   routes its next batch. At full speed a producer reaches a quarter batch
+///   per output well inside that age, so the age cuts no group short; a slow
+///   producer pushes each batch's slices as it routes them, as it did before
+///   grouping. A producer may wait inside a send while holding other outputs'
 ///   slices: the channels' gate waits only while every output holds data,
 ///   and a repartition that waits for memory waits on one output whose
 ///   consumer drains it independently ([`RepartitionExec::with_memory_wait`]),
@@ -611,6 +604,9 @@ impl SharedCoalescer {
 ///   they reference) of at most `limit` rows plus the batch being routed.
 ///   Past `limit` it pushes the groups that point into the oldest.
 ///   `reservation` is charged for the batches kept alive, in [`HELD_STEP`]s.
+///   `bytes` over-counts them: a view column's `take` output reports every
+///   upstream block it points into, so batches that share a block count it
+///   once each.
 /// - **The rotated sweep still decides which output is served first**: groups
 ///   are routed, and pushed together, in the producer's sweep order.
 struct Held {
@@ -636,11 +632,20 @@ struct Group {
     rows: usize,
     /// Sequence number of the partitioned input batch the oldest slice points into.
     oldest: u64,
+    /// When the oldest slice was routed.
+    since: Option<Instant>,
 }
 
 /// The step in which [`Held`] grows or shrinks its reservation, so that it
 /// changes when the bytes held cross a step, never per slice.
 const HELD_STEP: usize = 1024 * 1024;
+
+/// How long a producer keeps a group ([`Held`]) before it pushes it at its
+/// next input batch. A producer at full speed routes a batch in 0.3–1 ms and
+/// reaches a quarter batch per output in 2–7 ms at 26 outputs, so this never
+/// cuts a group short at speed; a producer slower than that pushes every
+/// batch's slices as it routes them.
+const HELD_AGE: std::time::Duration = std::time::Duration::from_millis(10);
 
 impl Held {
     /// Groups for `outputs` outputs, pushed at a quarter of `target` rows.
@@ -673,24 +678,39 @@ impl Held {
         seq
     }
 
-    /// Adds `slice`, from partitioned input batch `seq`, to `partition`'s
-    /// group. Returns whether the group should be pushed now: it holds a
-    /// quarter batch, or its consumer is waiting (`requested`).
+    /// Adds `slice`, from partitioned input batch `seq` routed at `now`, to
+    /// `partition`'s group. Returns whether the group holds a quarter batch
+    /// and should be pushed now.
+    ///
+    /// A consumer that is waiting does not make a group push early: a push
+    /// feeds a consumer only when it completes a batch or a parked producer
+    /// flushes, and a consumer asks again as soon as it has taken a batch, so
+    /// pushing for it would push nearly every slice as it is routed.
     fn hold(
         &mut self,
         partition: usize,
         slice: RecordBatch,
         seq: u64,
-        requested: bool,
+        now: Instant,
     ) -> bool {
         let group = &mut self.groups[partition];
         if group.slices.is_empty() {
             group.oldest = seq;
+            group.since = Some(now);
         }
         group.rows += slice.num_rows();
         self.rows += slice.num_rows();
         group.slices.push(slice);
-        requested || group.rows >= self.threshold
+        group.rows >= self.threshold
+    }
+
+    /// Whether `partition`'s group is older than [`HELD_AGE`] at `now`.
+    fn stale(&self, partition: usize, now: Instant) -> bool {
+        let group = &self.groups[partition];
+        !group.slices.is_empty()
+            && group
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) > HELD_AGE)
     }
 
     /// Moves `partition`'s group, in order, to the end of `into`.
@@ -744,16 +764,24 @@ impl Held {
         }
     }
 
-    /// Charges the reservation for the bytes kept alive, rounded up to a
-    /// [`HELD_STEP`]. Returns `false` when the pool refuses the grow: the
-    /// caller then pushes every group rather than fail the query.
+    /// Charges the reservation for the bytes kept alive: grows it to the
+    /// next [`HELD_STEP`] when they exceed it, and shrinks it only when it
+    /// exceeds them by two steps or more, or to zero when nothing is kept, so
+    /// bytes that move across one step from batch to batch do not take the
+    /// pool's lock every batch. Returns `false` when the pool refuses the
+    /// grow: the caller then pushes every group rather than fail the query.
     fn charge(&mut self) -> bool {
-        let target = self.bytes.next_multiple_of(HELD_STEP);
         let size = self.reservation.size();
-        if target > size {
+        if self.bytes > size {
+            let target = self.bytes.next_multiple_of(HELD_STEP);
             return self.reservation.try_grow(target - size).is_ok();
         }
-        self.reservation.shrink(size - target);
+        if self.bytes == 0 {
+            self.reservation.free();
+        } else if size - self.bytes >= 2 * HELD_STEP {
+            self.reservation
+                .shrink(size - self.bytes.next_multiple_of(HELD_STEP));
+        }
         true
     }
 }
@@ -2970,11 +2998,27 @@ impl RepartitionExec {
                     };
                     let rows = routed.iter().map(|(_, slice)| slice.num_rows()).sum();
                     let seq = held.admit(rows, slice.get_array_memory_size());
+                    let now = Instant::now();
                     for (partition, slice) in routed.drain(..) {
-                        let Some(channel) = output_channels.get(&partition) else {
+                        if !output_channels.contains_key(&partition) {
                             continue;
-                        };
-                        if held.hold(partition, slice, seq, channel.requested()) {
+                        }
+                        if held.hold(partition, slice, seq, now) {
+                            held.take(partition, &mut slices);
+                            Self::push(
+                                &mut output_channels,
+                                partition,
+                                &metrics,
+                                &mut slices,
+                                &mut coalesced,
+                            )
+                            .await?;
+                        }
+                    }
+                    // Groups older than the age bound go now, in sweep order.
+                    let outputs = partitioner.num_partitions();
+                    for partition in (0..outputs).map(|i| (first + i) % outputs) {
+                        if held.stale(partition, now) {
                             held.take(partition, &mut slices);
                             Self::push(
                                 &mut output_channels,
@@ -4854,18 +4898,78 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn grouped_pushes_reach_a_waiting_consumer() -> Result<()> {
-        // One batch, then an input that is never ready: a consumer waiting
-        // on demand gets its rows from the producer that holds them.
-        let (schema, partitions) = grouped_input(1, 1, 100);
-        let batch = partitions[0][0].clone();
+    /// A partition whose input is always ready but slow: one single-row
+    /// batch per millisecond, the thread busy for that millisecond.
+    #[derive(Debug)]
+    struct BusyPartition {
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for BusyPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let schema = Arc::clone(&self.schema);
+            let stream = futures::stream::iter(0u32..).map(move |n| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![n.wrapping_mul(2_654_435_761)])),
+                        Arc::new(UInt32Array::from(vec![n])),
+                        Arc::new(StringViewArray::from_iter_values([format!(
+                            "row {n} has a long string"
+                        )])),
+                    ],
+                )?)
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            ))
+        }
+    }
+
+    /// A partition whose input is never ready.
+    #[derive(Debug)]
+    struct IdlePartition {
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for IdlePartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::pending(),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn grouped_pushes_reach_a_waiting_consumer_within_the_age_bound() -> Result<()>
+    {
+        // One producer is busy and never parks; at one row per millisecond
+        // over two outputs its groups would take about four seconds to reach
+        // a quarter batch. The other producer is parked, so it flushes on
+        // demand what reaches the coalescer: the busy producer's rows must
+        // reach it after the age bound, not the threshold.
+        let (schema, _) = grouped_input(1, 1, 1);
         let source = Arc::new(StreamingTableExec::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(UnboundedTestPartition {
-                schema: Arc::clone(&schema),
-                batch: batch.clone(),
-            })],
+            vec![
+                Arc::new(BusyPartition {
+                    schema: Arc::clone(&schema),
+                }),
+                Arc::new(IdlePartition {
+                    schema: Arc::clone(&schema),
+                }),
+            ],
             None,
             vec![],
             false,
@@ -4876,22 +4980,59 @@ mod tests {
             Partitioning::Hash(vec![col("key", &schema)?], 2),
         )?;
         let config = SessionConfig::new()
-            .with_batch_size(1024)
+            .with_batch_size(8192)
             .with_extension(Arc::new(FlushOnDemand));
         let task = Arc::new(TaskContext::default().with_session_config(config));
-        let mut rows = 0;
-        let mut streams = vec![];
-        for partition in 0..2 {
-            let mut stream = exec.execute(partition, Arc::clone(&task))?;
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
-                    .await
-                    .expect("demand flush deadlocked")
-                    .expect("missing batch")?;
-            rows += result.num_rows();
-            streams.push(stream);
+        let mut stream = exec.execute(0, Arc::clone(&task))?;
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .expect("a waiting consumer got no rows within the age bound")
+                .expect("missing batch")?;
+        assert!(batch.num_rows() > 0 && batch.num_rows() < 2048);
+        drop(stream);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_pushes_keep_grouping_while_consumers_wait() -> Result<()> {
+        // Every consumer is reading, so each one is waiting whenever its
+        // channel is empty. Dense input must still push about one group per
+        // quarter batch (1,024 rows here), not one push per routed slice.
+        let (producers, batches, rows) = (3, 40, 200);
+        let (schema, partitions) = grouped_input(producers, batches, rows);
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = Arc::new(RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("key", &schema)?], 5),
+        )?);
+        let config = SessionConfig::new()
+            .with_batch_size(4096)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let readers = (0..5)
+            .map(|partition| {
+                let stream = exec.execute(partition, Arc::clone(&task));
+                SpawnedTask::spawn(async move { stream?.try_collect::<Vec<_>>().await })
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = vec![];
+        for reader in readers {
+            outputs.push(reader.join().await.unwrap()?);
         }
-        assert_eq!(rows, batch.num_rows());
+        assert_each_row_once_in_order(&outputs, producers, batches, rows);
+        let pushes = exec
+            .metrics()
+            .unwrap()
+            .sum_by_name("coalesce_pushes")
+            .unwrap()
+            .as_usize();
+        let slices = (producers * batches) as usize * 5;
+        assert!(
+            pushes * 4 <= slices,
+            "{pushes} pushes for {slices} slices while consumers wait"
+        );
         Ok(())
     }
 
