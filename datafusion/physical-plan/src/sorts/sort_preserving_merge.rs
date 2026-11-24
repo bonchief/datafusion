@@ -912,8 +912,7 @@ mod tests {
         // memory with the tie breaker disabled than with it enabled.
         let rb = || {
             let a: ArrayRef = Arc::new(Int32Array::from(vec![1; row_size]));
-            let b: ArrayRef =
-                Arc::new(StringArray::from_iter(vec![Some("a"); row_size]));
+            let b: ArrayRef = Arc::new(StringArray::from_iter(vec![Some("a"); row_size]));
             let c: ArrayRef = Arc::new(Int64Array::from_iter(vec![0; row_size]));
             RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)])
         };
