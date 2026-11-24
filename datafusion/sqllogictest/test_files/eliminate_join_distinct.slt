@@ -163,11 +163,13 @@ query TT
 EXPLAIN SELECT COUNT(DISTINCT l.x), COUNT(l.g) FROM l JOIN r ON l.id = r.id;
 ----
 logical_plan
-01)Aggregate: groupBy=[[]], aggr=[[count(DISTINCT l.x), count(l.g)]]
-02)--Projection: l.g, l.x
-03)----Inner Join: l.id = r.id
-04)------TableScan: l projection=[id, g, x]
-05)------TableScan: r projection=[id]
+01)Projection: count(alias1) AS count(DISTINCT l.x), CASE WHEN sum(alias2) IS NOT NULL THEN sum(alias2) ELSE Int64(0) END AS count(l.g)
+02)--Aggregate: groupBy=[[]], aggr=[[count(alias1), sum(alias2)]]
+03)----Aggregate: groupBy=[[l.x AS alias1]], aggr=[[count(l.g) AS alias2]]
+04)------Projection: l.g, l.x
+05)--------Inner Join: l.id = r.id
+06)----------TableScan: l projection=[id, g, x]
+07)----------TableScan: r projection=[id]
 
 query II
 SELECT COUNT(DISTINCT l.x), COUNT(l.g) FROM l JOIN r ON l.id = r.id;

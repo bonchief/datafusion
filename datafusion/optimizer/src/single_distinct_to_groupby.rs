@@ -93,7 +93,8 @@ use datafusion_expr::{
 /// as `avg` reports. A decimal or duration `avg` is left alone: its result
 /// type is not the quotient's.
 ///
-/// See `rewrite_pays` for when a `count` or an `avg` is allowed.
+/// A `count` or an `avg` is allowed when the plan runs in several partitions,
+/// and in one partition only when `rewrite_pays`.
 #[derive(Default, Debug)]
 pub struct SingleDistinctToGroupBy {}
 
@@ -155,6 +156,7 @@ fn is_single_distinct_agg(
     aggr_expr: &[Expr],
     input_schema: &DFSchema,
     rollup: Option<&Rollup>,
+    parallel: bool,
 ) -> Result<bool> {
     let mut fields_set = HashSet::new();
     let mut aggregate_count = 0;
@@ -202,14 +204,28 @@ fn is_single_distinct_agg(
     if aggregate_count != aggr_expr.len() || fields_set.len() != 1 {
         return Ok(false);
     }
-    if has_rollup && !rewrite_pays(&distinct_aggs, input_schema)? {
+    if has_rollup && !parallel && !rewrite_pays(&distinct_aggs, input_schema)? {
         return Ok(false);
     }
     Ok(true)
 }
 
-/// Whether the rewrite is worth extending to a plan that only qualifies because
-/// of a non-distinct `count` or `avg`.
+/// Whether the rewrite is worth extending to a plan that runs in one partition
+/// and only qualifies because of a non-distinct `count` or `avg`.
+///
+/// A plan that runs in several partitions always takes the rewrite. There
+/// the distinct aggregate's own `GroupsAccumulator` splits into a partial and
+/// a final phase too, but its partial state is a list of distinct values per
+/// group, and the final phase merges every group's lists in the partition the
+/// group hashes to. A group that holds a large share of the distinct values
+/// then serializes most of the merge in one partition. The rewrite's inner
+/// group-by is partitioned on the group keys and the distinct value together,
+/// so it spreads that work over every partition whatever the skew, and its
+/// state spills where a distinct set cannot. Over 100,000,000 ClickBench rows
+/// in 26 partitions, `SELECT "RegionID", SUM("AdvEngineID"), COUNT(*),
+/// AVG("ResolutionWidth"), COUNT(DISTINCT "UserID") .. GROUP BY "RegionID"`
+/// ran in 0.77x the time rewritten. In one partition there is neither a
+/// merge nor its skew, and the rewrite only adds the inner group-by.
 ///
 /// The rewrite is not free: every other aggregate moves down to the inner group
 /// by, which has a row per `(group, distinct value)` pair rather than per group,
@@ -268,6 +284,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
             return Ok(Transformed::no(plan));
         }
         let rollup = Rollup::try_new(config);
+        let parallel = config.options().execution.target_partitions > 1;
         match plan {
             LogicalPlan::Aggregate(Aggregate {
                 input,
@@ -279,6 +296,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                 &aggr_expr,
                 input.schema(),
                 rollup.as_ref(),
+                parallel,
             )? && !contains_grouping_set(&group_expr) =>
             {
                 let group_size = group_expr.len();
@@ -648,13 +666,21 @@ mod tests {
     }
 
     impl RegistryOptimizerContext {
+        /// A context planning for one partition, where the rewrite of a
+        /// `count` or an `avg` is gated on the distinct aggregate.
         fn new() -> Self {
+            Self::with_target_partitions(1)
+        }
+
+        fn with_target_partitions(target_partitions: usize) -> Self {
+            let mut options = ConfigOptions::new();
+            options.execution.target_partitions = target_partitions;
             let mut registry = MemoryFunctionRegistry::new();
             registry.register_udaf(count_udaf()).unwrap();
             registry.register_udaf(sum_udaf()).unwrap();
             registry.register_udaf(avg_udaf()).unwrap();
             Self {
-                inner: OptimizerContext::new(),
+                inner: OptimizerContext::new_with_config_options(Arc::new(options)),
                 registry,
             }
         }
@@ -682,12 +708,20 @@ mod tests {
         (
             $plan:expr,
             @ $expected:literal $(,)?
+        ) => {
+            assert_optimized_plan_equal!($plan, partitions = 1, @ $expected)
+        };
+        (
+            $plan:expr,
+            partitions = $partitions:expr,
+            @ $expected:literal $(,)?
         ) => {{
             let rule: Arc<dyn crate::OptimizerRule + Send + Sync> =
                 Arc::new(SingleDistinctToGroupBy::new());
             let optimizer = Optimizer::with_rules(vec![rule]);
+            let context = RegistryOptimizerContext::with_target_partitions($partitions);
             let optimized_plan = optimizer
-                .optimize($plan, &RegistryOptimizerContext::new(), |_, _| {})
+                .optimize($plan, &context, |_, _| {})
                 .expect("failed to optimize plan");
             insta::assert_snapshot!(optimized_plan.display_indent_schema(), @ $expected);
 
@@ -1516,6 +1550,107 @@ mod tests {
             @r"
         Aggregate: groupBy=[[test.a]], aggr=[[avg(test.c), count(DISTINCT test.b)]] [a:UInt32, avg(test.c):Float64;N, count(DISTINCT test.b):Int64]
           TableScan: test [a:UInt32, b:Int64;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn distinct_and_common_over_a_natively_supported_type_in_parallel() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![count_distinct(col("b")), count(col("c"))],
+            )?
+            .build()?;
+
+        // Should work: in several partitions the native accumulator would
+        // merge each group's distinct values in the one partition the group
+        // hashes to, where the inner group-by spreads them over all of them
+        assert_optimized_plan_equal!(
+            plan,
+            partitions = 4,
+            @r"
+        Projection: test.a, count(alias1) AS count(DISTINCT test.b), CASE WHEN sum(alias2) IS NOT NULL THEN sum(alias2) ELSE Int64(0) END AS count(test.c) [a:UInt32, count(DISTINCT test.b):Int64, count(test.c):Int64]
+          Aggregate: groupBy=[[test.a]], aggr=[[count(alias1), sum(alias2)]] [a:UInt32, count(alias1):Int64, sum(alias2):Int64;N]
+            Aggregate: groupBy=[[test.a, test.b AS alias1]], aggr=[[count(test.c) AS alias2]] [a:UInt32, alias1:UInt32, alias2:Int64]
+              TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    #[test]
+    fn avg_count_star_and_distinct_over_a_natively_supported_type_in_parallel()
+    -> Result<()> {
+        let table_scan = test_table_scan_avg(DataType::Int64)?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![count_star(), avg(col("c")), count_distinct(col("b"))],
+            )?
+            .build()?;
+
+        // Should work: the shape of ClickBench Q9
+        assert_optimized_plan_equal!(
+            plan,
+            partitions = 4,
+            @r"
+        Projection: test.a, CASE WHEN sum(alias2) IS NOT NULL THEN sum(alias2) ELSE Int64(0) END AS count(Int64(1)), sum(alias3) / CAST(sum(alias4) AS Float64) AS avg(test.c), count(alias1) AS count(DISTINCT test.b) [a:UInt32, count(Int64(1)):Int64, avg(test.c):Float64;N, count(DISTINCT test.b):Int64]
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(alias2), sum(alias3), sum(alias4), count(alias1)]] [a:UInt32, sum(alias2):Int64;N, sum(alias3):Float64;N, sum(alias4):Int64;N, count(alias1):Int64]
+            Aggregate: groupBy=[[test.a, test.b AS alias1]], aggr=[[count(Int64(1)) AS alias2, sum(test.c) AS alias3, count(test.c) AS alias4]] [a:UInt32, alias1:Int64;N, alias2:Int64, alias3:Float64;N, alias4:Int64]
+              TableScan: test [a:UInt32, b:Int64;N, c:Float64;N, d:Decimal128(10, 2);N]
+        "
+        )
+    }
+
+    #[test]
+    fn distinct_with_filter_in_parallel_is_not_rewritten() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        // count(a) FILTER (WHERE a > 5)
+        let expr = count_udaf()
+            .call(vec![col("a")])
+            .filter(col("a").gt(lit(5)))
+            .build()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("c")], vec![expr, count_distinct(col("b"))])?
+            .build()?;
+
+        // Do nothing: running in parallel lifts only the gate on the distinct
+        // aggregate, not the refusal of a FILTER
+        assert_optimized_plan_equal!(
+            plan,
+            partitions = 4,
+            @r"
+        Aggregate: groupBy=[[test.c]], aggr=[[count(test.a) FILTER (WHERE test.a > Int32(5)), count(DISTINCT test.b)]] [c:UInt32, count(test.a) FILTER (WHERE test.a > Int32(5)):Int64, count(DISTINCT test.b):Int64]
+          TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    #[test]
+    fn distinct_sum_and_count_in_parallel() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![sum_distinct(col("b")), count(col("c"))],
+            )?
+            .build()?;
+
+        // Should work: in parallel the gate does not ask the distinct
+        // aggregate at all
+        assert_optimized_plan_equal!(
+            plan,
+            partitions = 4,
+            @r"
+        Projection: test.a, sum(alias1) AS sum(DISTINCT test.b), CASE WHEN sum(alias2) IS NOT NULL THEN sum(alias2) ELSE Int64(0) END AS count(test.c) [a:UInt32, sum(DISTINCT test.b):UInt64;N, count(test.c):Int64]
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(alias1), sum(alias2)]] [a:UInt32, sum(alias1):UInt64;N, sum(alias2):Int64;N]
+            Aggregate: groupBy=[[test.a, test.b AS alias1]], aggr=[[count(test.c) AS alias2]] [a:UInt32, alias1:UInt32, alias2:Int64]
+              TableScan: test [a:UInt32, b:UInt32, c:UInt32]
         "
         )
     }

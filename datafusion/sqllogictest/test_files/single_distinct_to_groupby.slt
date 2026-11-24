@@ -8,12 +8,13 @@
 # (`datafusion.optimizer.max_passes = 0`, so the aggregate runs as written) and
 # once with it enabled. The two must agree.
 #
-# A non-distinct `count` may only join the distinct aggregate when that
-# aggregate reports that it has no specialized `GroupsAccumulator` for its
-# argument types. `x` is the `VARCHAR` that qualifies, `xi` the `INT` that does
-# not; both hold the same values so the two sides can be compared directly.
-# An aggregate that reports nothing, which is every aggregate but `count`, also
-# does not qualify.
+# A non-distinct `count` or `avg` always joins the distinct aggregate when the
+# plan runs in several partitions, as it does here (4). In one partition it
+# joins only when that aggregate reports that it has no specialized
+# `GroupsAccumulator` for its argument types. `x` is the `VARCHAR` that
+# qualifies, `xi` the `INT` that does not; both hold the same values so the two
+# sides can be compared directly. An aggregate that reports nothing, which is
+# every aggregate but `count`, also does not qualify.
 
 statement ok
 CREATE TABLE t(g INT, x VARCHAR, xi INT, v INT);
@@ -123,9 +124,12 @@ logical_plan
 03)----TableScan: t projection=[g, x, v]
 
 ########
-# The other side of the gate: a distinct argument that has its own
-# `GroupsAccumulator` keeps the count out
+# The other side of the gate, in one partition: a distinct argument that has
+# its own `GroupsAccumulator` keeps the count out
 ########
+
+statement ok
+set datafusion.execution.target_partitions = 1;
 
 # `count(DISTINCT xi)` over an INT is served by
 # `PrimitiveDistinctCountGroupsAccumulator`, so the rewrite would add an inner
@@ -137,6 +141,15 @@ logical_plan
 01)Projection: t.g, count(Int64(1)) AS count(*) AS records, count(DISTINCT t.xi) AS distinct_xi
 02)--Aggregate: groupBy=[[t.g]], aggr=[[count(Int64(1)), count(DISTINCT t.xi)]]
 03)----TableScan: t projection=[g, xi]
+
+# The same holds for an avg
+query TT
+EXPLAIN SELECT g, avg(v) AS avg_v, count(DISTINCT xi) AS distinct_xi FROM t GROUP BY g;
+----
+logical_plan
+01)Projection: t.g, avg(t.v) AS avg_v, count(DISTINCT t.xi) AS distinct_xi
+02)--Aggregate: groupBy=[[t.g]], aggr=[[avg(CAST(t.v AS Float64)), count(DISTINCT t.xi)]]
+03)----TableScan: t projection=[g, xi, v]
 
 # `sum` reports nothing about `GroupsAccumulator` support from the argument
 # types, and neither does any aggregate but `count`. Silence is not evidence
@@ -150,6 +163,35 @@ logical_plan
 01)Projection: t.g, count(Int64(1)) AS count(*) AS records, sum(DISTINCT t.v) AS distinct_v
 02)--Aggregate: groupBy=[[t.g]], aggr=[[count(Int64(1)), sum(DISTINCT CAST(t.v AS Int64))]]
 03)----TableScan: t projection=[g, v]
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+########
+# In several partitions the gate is lifted: the distinct aggregate's own
+# accumulator would merge each group's distinct values in the one partition
+# the group hashes to, where the inner group by spreads them over all of them
+########
+
+# The shape of ClickBench Q9, over the INT distinct the one-partition gate excludes
+query TT
+EXPLAIN SELECT g, sum(v) AS sum_v, count(*) AS records, avg(v) AS avg_v, count(DISTINCT xi) AS distinct_xi FROM t GROUP BY g;
+----
+logical_plan
+01)Projection: t.g, sum(alias2) AS sum_v, CASE WHEN sum(alias3) IS NOT NULL THEN sum(alias3) ELSE Int64(0) END AS records, sum(alias4) / CAST(sum(alias5) AS Float64) AS avg_v, count(alias1) AS distinct_xi
+02)--Aggregate: groupBy=[[t.g]], aggr=[[sum(alias2), sum(alias3), sum(alias4), sum(alias5), count(alias1)]]
+03)----Aggregate: groupBy=[[t.g, t.xi AS alias1]], aggr=[[sum(CAST(t.v AS Int64)) AS alias2, count(Int64(1)) AS alias3, sum(__common_expr_1) AS alias4, count(__common_expr_1) AS alias5]]
+04)------Projection: CAST(t.v AS Float64) AS __common_expr_1, t.g, t.xi, t.v
+05)--------TableScan: t projection=[g, xi, v]
+
+query TT
+EXPLAIN SELECT g, count(*) AS records, sum(DISTINCT v) AS distinct_v FROM t GROUP BY g;
+----
+logical_plan
+01)Projection: t.g, CASE WHEN sum(alias2) IS NOT NULL THEN sum(alias2) ELSE Int64(0) END AS records, sum(alias1) AS distinct_v
+02)--Aggregate: groupBy=[[t.g]], aggr=[[sum(alias2), sum(alias1)]]
+03)----Aggregate: groupBy=[[t.g, CAST(t.v AS Int64) AS alias1]], aggr=[[count(Int64(1)) AS alias2]]
+04)------TableScan: t projection=[g, v]
 
 # `min(DISTINCT v)` is the same value as `min(v)`. EliminateAggregateDistinct
 # drops the flag before this rule runs, so there is no distinct aggregate left
@@ -387,7 +429,7 @@ GROUP BY t.g ORDER BY t.g;
 statement ok
 set datafusion.optimizer.max_passes = 0;
 
-# gated: the count keeps the INT distinct unrewritten
+# the count beside the INT distinct
 query IIIII
 SELECT g, count(*) AS records, count(DISTINCT xi) AS distinct_xi, sum(v) AS sum_v, max(v) AS max_v
 FROM t GROUP BY g ORDER BY g;
@@ -419,7 +461,7 @@ SELECT count(*) AS records, count(DISTINCT xi) AS distinct_xi FROM empty_t;
 ----
 0 0
 
-# gated: the count keeps a distinct aggregate that reports nothing unrewritten
+# the count beside a distinct aggregate that reports nothing
 query III
 SELECT g, count(*) AS records, sum(DISTINCT v) AS distinct_v
 FROM t GROUP BY g ORDER BY g;
@@ -431,7 +473,7 @@ FROM t GROUP BY g ORDER BY g;
 statement ok
 set datafusion.optimizer.max_passes = 3;
 
-# gated: the count keeps the INT distinct unrewritten
+# rewritten in four partitions: the count beside the INT distinct
 query IIIII
 SELECT g, count(*) AS records, count(DISTINCT xi) AS distinct_xi, sum(v) AS sum_v, max(v) AS max_v
 FROM t GROUP BY g ORDER BY g;
@@ -463,7 +505,8 @@ SELECT count(*) AS records, count(DISTINCT xi) AS distinct_xi FROM empty_t;
 ----
 0 0
 
-# gated: the count keeps a distinct aggregate that reports nothing unrewritten
+# rewritten in four partitions: the count beside a distinct aggregate that
+# reports nothing
 query III
 SELECT g, count(*) AS records, sum(DISTINCT v) AS distinct_v
 FROM t GROUP BY g ORDER BY g;
@@ -471,6 +514,62 @@ FROM t GROUP BY g ORDER BY g;
 1 4 112
 2 2 3
 3 1 1
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+# gated in one partition: the count keeps the INT distinct unrewritten
+query IIIII
+SELECT g, count(*) AS records, count(DISTINCT xi) AS distinct_xi, sum(v) AS sum_v, max(v) AS max_v
+FROM t GROUP BY g ORDER BY g;
+----
+1 4 2 112 100
+2 2 0 3 3
+3 1 1 1 1
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+########
+# The shape of ClickBench Q9 over the INT distinct, in one partition (not
+# rewritten) and in four (rewritten), against the unoptimized plan
+########
+
+statement ok
+set datafusion.optimizer.max_passes = 0;
+
+query IIIRI
+SELECT g, sum(v) AS sum_v, count(*) AS records, avg(v) AS avg_v, count(DISTINCT xi) AS distinct_xi
+FROM t GROUP BY g ORDER BY g;
+----
+1 112 4 37.333333333333 2
+2 3 2 3 0
+3 1 1 1 1
+
+statement ok
+set datafusion.optimizer.max_passes = 3;
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+query IIIRI
+SELECT g, sum(v) AS sum_v, count(*) AS records, avg(v) AS avg_v, count(DISTINCT xi) AS distinct_xi
+FROM t GROUP BY g ORDER BY g;
+----
+1 112 4 37.333333333333 2
+2 3 2 3 0
+3 1 1 1 1
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+query IIIRI
+SELECT g, sum(v) AS sum_v, count(*) AS records, avg(v) AS avg_v, count(DISTINCT xi) AS distinct_xi
+FROM t GROUP BY g ORDER BY g;
+----
+1 112 4 37.333333333333 2
+2 3 2 3 0
+3 1 1 1 1
 
 ########
 # avg beside the distinct aggregate: groups with a NULL v, a group whose v

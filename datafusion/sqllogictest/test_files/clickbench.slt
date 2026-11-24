@@ -255,18 +255,23 @@ EXPLAIN SELECT "RegionID", SUM("AdvEngineID"), COUNT(*) AS c, AVG("ResolutionWid
 ----
 logical_plan
 01)Sort: c DESC NULLS FIRST, fetch=10
-02)--Projection: hits.RegionID, sum(hits.AdvEngineID), count(Int64(1)) AS count(*) AS c, avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)
-03)----Aggregate: groupBy=[[hits.RegionID]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)), count(Int64(1)), avg(CAST(hits.ResolutionWidth AS Float64)), count(DISTINCT hits.UserID)]]
-04)------SubqueryAlias: hits
-05)--------TableScan: hits_raw projection=[RegionID, UserID, ResolutionWidth, AdvEngineID]
+02)--Projection: hits.RegionID, sum(alias2) AS sum(hits.AdvEngineID), CASE WHEN sum(alias3) IS NOT NULL THEN sum(alias3) ELSE Int64(0) END AS c, sum(alias4) / CAST(sum(alias5) AS Float64) AS avg(hits.ResolutionWidth), count(alias1) AS count(DISTINCT hits.UserID)
+03)----Aggregate: groupBy=[[hits.RegionID]], aggr=[[sum(alias2), sum(alias3), sum(alias4), sum(alias5), count(alias1)]]
+04)------Aggregate: groupBy=[[hits.RegionID, hits.UserID AS alias1]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)) AS alias2, count(Int64(1)) AS alias3, sum(__common_expr_1) AS alias4, count(__common_expr_1) AS alias5]]
+05)--------Projection: CAST(hits.ResolutionWidth AS Float64) AS __common_expr_1, hits.RegionID, hits.UserID, hits.AdvEngineID
+06)----------SubqueryAlias: hits
+07)------------TableScan: hits_raw projection=[RegionID, UserID, ResolutionWidth, AdvEngineID]
 physical_plan
 01)SortPreservingMergeExec: [c@2 DESC], fetch=10
-02)--ProjectionExec: expr=[RegionID@0 as RegionID, sum(hits.AdvEngineID)@1 as sum(hits.AdvEngineID), count(Int64(1))@2 as c, avg(hits.ResolutionWidth)@3 as avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)@4 as count(DISTINCT hits.UserID)]
-03)----SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]
-04)------AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)]
-05)--------RepartitionExec: partitioning=Hash([RegionID@0], 4), input_partitions=1
-06)----------AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth), count(DISTINCT hits.UserID)]
-07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/clickbench_hits_10.parquet]]}, projection=[RegionID, UserID, ResolutionWidth, AdvEngineID], file_type=parquet
+02)--SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]
+03)----ProjectionExec: expr=[RegionID@0 as RegionID, sum(alias2)@1 as sum(hits.AdvEngineID), CASE WHEN sum(alias3)@2 IS NOT NULL THEN sum(alias3)@2 ELSE 0 END as c, sum(alias4)@3 / CAST(sum(alias5)@4 AS Float64) as avg(hits.ResolutionWidth), count(alias1)@5 as count(DISTINCT hits.UserID)]
+04)------AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[sum(alias2), sum(alias3), sum(alias4), sum(alias5), count(alias1)]
+05)--------RepartitionExec: partitioning=Hash([RegionID@0], 4), input_partitions=4
+06)----------AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID], aggr=[sum(alias2), sum(alias3), sum(alias4), sum(alias5), count(alias1)]
+07)------------AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID, alias1@1 as alias1], aggr=[sum(hits.AdvEngineID) as alias2, count(1) as alias3, sum(__common_expr_1) as alias4, count(__common_expr_1) as alias5]
+08)--------------RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 4), input_partitions=1
+09)----------------AggregateExec: mode=Partial, gby=[RegionID@1 as RegionID, UserID@2 as alias1], aggr=[sum(hits.AdvEngineID) as alias2, count(1) as alias3, sum(__common_expr_1) as alias4, count(__common_expr_1) as alias5]
+10)------------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/clickbench_hits_10.parquet]]}, projection=[CAST(ResolutionWidth@20 AS Float64) as __common_expr_1, RegionID, UserID, AdvEngineID], file_type=parquet
 
 query IIIRI rowsort
 SELECT "RegionID", SUM("AdvEngineID"), COUNT(*) AS c, AVG("ResolutionWidth"), COUNT(DISTINCT "UserID") FROM hits GROUP BY "RegionID" ORDER BY c DESC LIMIT 10;
@@ -608,21 +613,25 @@ EXPLAIN SELECT "SearchPhrase", MIN("URL"), MIN("Title"), COUNT(*) AS c, COUNT(DI
 ----
 logical_plan
 01)Sort: c DESC NULLS FIRST, fetch=10
-02)--Projection: hits.SearchPhrase, min(hits.URL), min(hits.Title), count(Int64(1)) AS count(*) AS c, count(DISTINCT hits.UserID)
-03)----Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), min(hits.Title), count(Int64(1)), count(DISTINCT hits.UserID)]]
-04)------SubqueryAlias: hits
-05)--------Filter: hits_raw.SearchPhrase != Utf8View("") AND hits_raw.Title LIKE Utf8View("%Google%") AND hits_raw.URL NOT LIKE Utf8View("%.google.%")
-06)----------TableScan: hits_raw projection=[Title, UserID, URL, SearchPhrase], partial_filters=[hits_raw.SearchPhrase != Utf8View(""), hits_raw.Title LIKE Utf8View("%Google%"), hits_raw.URL NOT LIKE Utf8View("%.google.%")]
+02)--Projection: hits.SearchPhrase, min(alias2) AS min(hits.URL), min(alias3) AS min(hits.Title), CASE WHEN sum(alias4) IS NOT NULL THEN sum(alias4) ELSE Int64(0) END AS c, count(alias1) AS count(DISTINCT hits.UserID)
+03)----Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(alias2), min(alias3), sum(alias4), count(alias1)]]
+04)------Aggregate: groupBy=[[hits.SearchPhrase, hits.UserID AS alias1]], aggr=[[min(hits.URL) AS alias2, min(hits.Title) AS alias3, count(Int64(1)) AS alias4]]
+05)--------SubqueryAlias: hits
+06)----------Filter: hits_raw.SearchPhrase != Utf8View("") AND hits_raw.Title LIKE Utf8View("%Google%") AND hits_raw.URL NOT LIKE Utf8View("%.google.%")
+07)------------TableScan: hits_raw projection=[Title, UserID, URL, SearchPhrase], partial_filters=[hits_raw.SearchPhrase != Utf8View(""), hits_raw.Title LIKE Utf8View("%Google%"), hits_raw.URL NOT LIKE Utf8View("%.google.%")]
 physical_plan
 01)SortPreservingMergeExec: [c@3 DESC], fetch=10
-02)--ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), min(hits.Title)@2 as min(hits.Title), count(Int64(1))@3 as c, count(DISTINCT hits.UserID)@4 as count(DISTINCT hits.UserID)]
-03)----SortExec: TopK(fetch=10), expr=[count(Int64(1))@3 DESC], preserve_partitioning=[true]
-04)------AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(hits.URL), min(hits.Title), count(Int64(1)), count(DISTINCT hits.UserID)]
+02)--SortExec: TopK(fetch=10), expr=[c@3 DESC], preserve_partitioning=[true]
+03)----ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(alias2)@1 as min(hits.URL), min(alias3)@2 as min(hits.Title), CASE WHEN sum(alias4)@3 IS NOT NULL THEN sum(alias4)@3 ELSE 0 END as c, count(alias1)@4 as count(DISTINCT hits.UserID)]
+04)------AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(alias2), min(alias3), sum(alias4), count(alias1)]
 05)--------RepartitionExec: partitioning=Hash([SearchPhrase@0], 4), input_partitions=4
-06)----------AggregateExec: mode=Partial, gby=[SearchPhrase@3 as SearchPhrase], aggr=[min(hits.URL), min(hits.Title), count(Int64(1)), count(DISTINCT hits.UserID)]
-07)------------FilterExec: SearchPhrase@3 !=  AND Title@0 LIKE %Google% AND URL@2 NOT LIKE %.google.%
-08)--------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-09)----------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/clickbench_hits_10.parquet]]}, projection=[Title, UserID, URL, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND Title@2 LIKE %Google% AND URL@13 NOT LIKE %.google.%, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
+06)----------AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(alias2), min(alias3), sum(alias4), count(alias1)]
+07)------------AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase, alias1@1 as alias1], aggr=[min(hits.URL) as alias2, min(hits.Title) as alias3, count(1) as alias4]
+08)--------------RepartitionExec: partitioning=Hash([SearchPhrase@0, alias1@1], 4), input_partitions=4
+09)----------------AggregateExec: mode=Partial, gby=[SearchPhrase@3 as SearchPhrase, UserID@1 as alias1], aggr=[min(hits.URL) as alias2, min(hits.Title) as alias3, count(1) as alias4]
+10)------------------FilterExec: SearchPhrase@3 !=  AND Title@0 LIKE %Google% AND URL@2 NOT LIKE %.google.%
+11)--------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+12)----------------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/clickbench_hits_10.parquet]]}, projection=[Title, UserID, URL, SearchPhrase], file_type=parquet, predicate=SearchPhrase@39 !=  AND Title@2 LIKE %Google% AND URL@13 NOT LIKE %.google.%, pruning_predicate=SearchPhrase_null_count@2 != row_count@3 AND (SearchPhrase_min@0 !=  OR  != SearchPhrase_max@1), required_guarantees=[SearchPhrase not in ()]
 
 query TTTII
 SELECT "SearchPhrase", MIN("URL"), MIN("Title"), COUNT(*) AS c, COUNT(DISTINCT "UserID") FROM hits WHERE "Title" LIKE '%Google%' AND "URL" NOT LIKE '%.google.%' AND "SearchPhrase" <> '' GROUP BY "SearchPhrase" ORDER BY c DESC LIMIT 10;
