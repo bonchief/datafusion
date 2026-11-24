@@ -26166,6 +26166,9 @@ impl serde::Serialize for RepartitionExecNode {
         if self.carried_group_hash {
             len += 1;
         }
+        if self.forward_views {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.RepartitionExecNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
@@ -26178,6 +26181,9 @@ impl serde::Serialize for RepartitionExecNode {
         }
         if self.carried_group_hash {
             struct_ser.serialize_field("carriedGroupHash", &self.carried_group_hash)?;
+        }
+        if self.forward_views {
+            struct_ser.serialize_field("forwardViews", &self.forward_views)?;
         }
         struct_ser.end()
     }
@@ -26195,6 +26201,8 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
             "preserveOrder",
             "carried_group_hash",
             "carriedGroupHash",
+            "forward_views",
+            "forwardViews",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -26203,6 +26211,7 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
             Partitioning,
             PreserveOrder,
             CarriedGroupHash,
+            ForwardViews,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -26228,6 +26237,7 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
                             "partitioning" => Ok(GeneratedField::Partitioning),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
                             "carriedGroupHash" | "carried_group_hash" => Ok(GeneratedField::CarriedGroupHash),
+                            "forwardViews" | "forward_views" => Ok(GeneratedField::ForwardViews),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -26251,6 +26261,7 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
                 let mut partitioning__ = None;
                 let mut preserve_order__ = None;
                 let mut carried_group_hash__ = None;
+                let mut forward_views__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -26277,6 +26288,12 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
                             }
                             carried_group_hash__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ForwardViews => {
+                            if forward_views__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("forwardViews"));
+                            }
+                            forward_views__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(RepartitionExecNode {
@@ -26284,6 +26301,7 @@ impl<'de> serde::Deserialize<'de> for RepartitionExecNode {
                     partitioning: partitioning__,
                     preserve_order: preserve_order__.unwrap_or_default(),
                     carried_group_hash: carried_group_hash__.unwrap_or_default(),
+                    forward_views: forward_views__.unwrap_or_default(),
                 })
             }
         }

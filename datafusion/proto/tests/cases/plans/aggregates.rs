@@ -392,7 +392,8 @@ fn roundtrip_carried_group_hash() -> Result<()> {
     ];
     let exchange = Arc::new(
         RepartitionExec::try_new(partial, Partitioning::Hash(on, 4))?
-            .with_carried_group_hash()?,
+            .with_carried_group_hash()?
+            .with_forward_views(),
     );
     let final_agg = Arc::new(
         AggregateExec::try_new(
@@ -422,6 +423,7 @@ fn roundtrip_carried_group_hash() -> Result<()> {
         .downcast_ref::<RepartitionExec>()
         .expect("decoded exchange");
     assert!(exchange.carries_group_hash());
+    assert!(exchange.forwards_views());
     let partial = exchange
         .input()
         .downcast_ref::<AggregateExec>()

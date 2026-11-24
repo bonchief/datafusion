@@ -469,9 +469,16 @@ where
         // Ensure lengths are equivalent
         assert_eq!(values.len(), self.hashes_buffer.len());
 
+        // With carried hashes nothing has read the input's bytes yet: the
+        // probe's compare and the insert's copy are the first to, and the
+        // bytes of forwarded views lie scattered over the producer's buffers.
+        let ahead = carried.is_some() && values.len() > DISTANCE;
         for i in 0..values.len() {
             let view_u128 = input_views[i];
             let hash = self.hashes_buffer[i];
+            if ahead && let Some(&view) = input_views.get(i + DISTANCE) {
+                prefetch_input(values, view);
+            }
 
             // handle null value via validity bitmap check
             if values.is_null(i) {
@@ -606,6 +613,9 @@ where
                 }
                 if let Some(&ahead) = hashes.get(i + DISTANCE) {
                     self.prefetch_key(&table, ahead, views[i + DISTANCE]);
+                    if carried.is_some() {
+                        prefetch_input(values, views[i + DISTANCE]);
+                    }
                 }
                 self.insert_row(
                     &mut table,
@@ -1009,6 +1019,23 @@ where
 
     /// value stored by the entry
     payload: V,
+}
+
+/// Prefetches the first and the last cache line of the bytes of an input
+/// value longer than 12 bytes whose view is `view`. An inline value is in
+/// the view itself.
+#[inline(always)]
+fn prefetch_input<B: ByteViewType>(values: &GenericByteViewArray<B>, view: u128) {
+    let len = view as u32;
+    if len <= 12 {
+        return;
+    }
+    let byte_view = ByteView::from(view);
+    if let Some(buffer) = values.data_buffers().get(byte_view.buffer_index as usize) {
+        let start = buffer.as_ptr().wrapping_add(byte_view.offset as usize);
+        prefetch(start);
+        prefetch(start.wrapping_add(len as usize - 1));
+    }
 }
 
 /// A SwissTable-style hash table whose memory a probe can prefetch.

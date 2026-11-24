@@ -2574,6 +2574,10 @@ pub struct RepartitionExecNode {
     /// `RepartitionExec::with_carried_group_hash`.
     #[prost(bool, tag = "7")]
     pub carried_group_hash: bool,
+    /// Output batches reference the input's string view buffers; only for a
+    /// consumer in the same process. See `RepartitionExec::with_forward_views`.
+    #[prost(bool, tag = "8")]
+    pub forward_views: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Partitioning {

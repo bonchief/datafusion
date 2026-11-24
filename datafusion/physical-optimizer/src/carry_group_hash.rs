@@ -36,6 +36,11 @@ use crate::PhysicalOptimizerRule;
 /// [`AggregateExec::with_read_group_hash`]); without those flags no operator
 /// reads the column, whatever a schema's metadata says.
 ///
+/// With `datafusion.execution.carry_group_hash_forward_views` the exchange
+/// also forwards the partial's string view buffers
+/// ([`RepartitionExec::with_forward_views`]); only for plans that keep the
+/// exchange in one process.
+///
 /// Only aggregations with a variable-width key are changed: hashing a
 /// fixed-width key costs less than moving 8 more bytes per row between the
 /// stages. The exchange must hash exactly the partial's group keys, in order.
@@ -62,7 +67,9 @@ impl PhysicalOptimizerRule for CarryGroupHash {
         {
             return Ok(plan);
         }
-        plan.transform_down(carry).data()
+        let forward_views = config.execution.carry_group_hash_forward_views;
+        plan.transform_down(|plan| carry(plan, forward_views))
+            .data()
     }
 
     fn name(&self) -> &str {
@@ -74,7 +81,10 @@ impl PhysicalOptimizerRule for CarryGroupHash {
     }
 }
 
-fn carry(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+fn carry(
+    plan: Arc<dyn ExecutionPlan>,
+    forward_views: bool,
+) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let Some(final_agg) = plan.downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
     };
@@ -119,8 +129,12 @@ fn carry(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPl
     let Some(exchange) = exchange.downcast_ref::<RepartitionExec>() else {
         return Ok(Transformed::no(plan));
     };
-    let exchange: Arc<dyn ExecutionPlan> =
-        Arc::new(exchange.clone().with_carried_group_hash()?);
+    let exchange = exchange.clone().with_carried_group_hash()?;
+    let exchange: Arc<dyn ExecutionPlan> = Arc::new(if forward_views {
+        exchange.with_forward_views()
+    } else {
+        exchange
+    });
     let carried = Arc::clone(&plan).replace_children(vec![exchange], recompute())?;
     let Some(carried) = carried.downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
@@ -238,6 +252,23 @@ mod tests {
             flags(two_stage(empty(), group_by(&["name", "n"])?, &[0, 1])?)?,
             [true; 3]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn forwards_views_only_when_asked() -> Result<()> {
+        let exchange_of = |forward: bool| -> Result<bool> {
+            let mut config = ConfigOptions::new();
+            config.execution.carry_group_hash = true;
+            config.execution.carry_group_hash_forward_views = forward;
+            let plan = two_stage(empty(), group_by(&["name"])?, &[0])?;
+            let plan = CarryGroupHash::new().optimize(plan, &config)?;
+            Ok(plan.children()[0]
+                .downcast_ref::<RepartitionExec>()
+                .is_some_and(RepartitionExec::forwards_views))
+        };
+        assert!(!exchange_of(false)?);
+        assert!(exchange_of(true)?);
         Ok(())
     }
 

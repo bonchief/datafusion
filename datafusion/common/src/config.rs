@@ -1192,6 +1192,15 @@ config_namespace! {
         /// of the plan runs a version that has it.
         pub carry_group_hash: bool, default = false
 
+        /// (experimental) With `carry_group_hash`, let the exchange that
+        /// carries the hash forward the partial stage's string view buffers to
+        /// the final stage instead of copying the bytes each output uses (see
+        /// `RepartitionExec::with_forward_views`). Only for plans whose
+        /// exchanges stay in one process: a planner that turns such an
+        /// exchange into the producer of a network boundary must clear the
+        /// flag on it, or each output would ship the shared buffers whole.
+        pub carry_group_hash_forward_views: bool, default = false
+
         /// (experimental) Allocated-byte threshold for flushing unordered partial
         /// hash aggregation tables. Checked after each input batch; the table can
         /// exceed this size by one batch. Flushed groups count toward the existing

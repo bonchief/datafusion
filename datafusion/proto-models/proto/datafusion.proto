@@ -1724,6 +1724,9 @@ message RepartitionExecNode{
   // Route by the group hash the input carries in its last column. See
   // `RepartitionExec::with_carried_group_hash`.
   bool carried_group_hash = 7;
+  // Output batches reference the input's string view buffers; only for a
+  // consumer in the same process. See `RepartitionExec::with_forward_views`.
+  bool forward_views = 8;
 }
 
 message Partitioning {

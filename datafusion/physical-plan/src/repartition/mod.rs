@@ -90,8 +90,10 @@ use tokio::sync::Notify;
 pub struct FlushOnDemand;
 
 mod distributor_channels;
+mod forward;
 mod range;
 
+use forward::{BufferLedger, ForwardedBytes, ViewForwarder};
 use range::RangeRouter;
 use std::hash::{Hash, Hasher};
 
@@ -169,6 +171,11 @@ enum RepartitionBatch {
     /// count against the output's memory reservation until a consumer takes
     /// it or a closed channel drops it.
     Queued(RecordBatch, QueuedBytes),
+    /// Batch held in memory by a repartition that forwards string views
+    /// ([`RepartitionExec::with_forward_views`]): its own bytes count against
+    /// the output's reservation and its view buffers against the shared
+    /// [`BufferLedger`] until a consumer takes it or a closed channel drops it.
+    Forwarded(RecordBatch, ForwardedBytes),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
     /// This variant contains no data itself - it's just a signal to the reader
@@ -283,6 +290,9 @@ struct OutputChannel {
     /// Set when the repartition waits for memory instead of spilling
     /// ([`RepartitionExec::with_memory_wait`]); shared by all its outputs.
     memory_wait: Option<Arc<MemoryWait>>,
+    /// Set when the repartition forwards string views
+    /// ([`RepartitionExec::with_forward_views`]); shared by all its outputs.
+    ledger: Option<Arc<BufferLedger>>,
 }
 
 /// The set of spill-pool writers for a single output partition, before they are handed to the
@@ -366,10 +376,26 @@ impl OutputChannel {
         // Decide the payload outside of any await: never hold a MutexGuard
         // across an await point. A repartition that waits for memory has
         // already tried to reserve above, so here it only spills.
+        // A forwarded batch's view buffers are shared with the other outputs'
+        // batches and charged once (see `BufferLedger`). A repartition that
+        // waits for memory charges each batch whole, as before.
+        let forwarded = match (&self.ledger, &self.memory_wait) {
+            (Some(ledger), None) => {
+                ForwardedBytes::charge(&batch, &self.reservation, ledger)
+            }
+            _ => None,
+        };
+
         let (payload, is_memory_batch) = if let Some(queued) = queued {
             // A queued batch returns its bytes itself when a failed send drops it
             (Ok(RepartitionBatch::Queued(batch, queued)), false)
-        } else if self.memory_wait.is_none() && self.reservation.try_grow(size).is_ok() {
+        } else if let Some(forwarded) = forwarded {
+            // So does a forwarded batch
+            (Ok(RepartitionBatch::Forwarded(batch, forwarded)), false)
+        } else if self.memory_wait.is_none()
+            && self.ledger.is_none()
+            && self.reservation.try_grow(size).is_ok()
+        {
             (Ok(RepartitionBatch::Memory(batch)), true)
         } else {
             match self.spill_writer.push_batch(&batch) {
@@ -447,7 +473,11 @@ fn copied_bytes(batch: &RecordBatch) -> usize {
         let array = array.as_byte_view_opt::<T>()?;
         let used = array.total_buffer_bytes_used();
         let held: usize = array.data_buffers().iter().map(|b| b.capacity()).sum();
-        Some(if held > used.saturating_mul(2) { used } else { 0 })
+        Some(if held > used.saturating_mul(2) {
+            used
+        } else {
+            0
+        })
     }
     batch
         .columns()
@@ -469,7 +499,7 @@ fn copied_bytes(batch: &RecordBatch) -> usize {
 /// Cheap to [`Clone`]: its fields are [`Arc`]s and a number.
 #[derive(Clone)]
 struct SharedCoalescer {
-    inner: Arc<Mutex<LimitedBatchCoalescer>>,
+    inner: Arc<Mutex<OutputCoalescer>>,
     active_senders: Arc<AtomicUsize>,
     demand: Option<Arc<Notify>>,
     requested: Arc<AtomicBool>,
@@ -477,14 +507,24 @@ struct SharedCoalescer {
 }
 
 impl SharedCoalescer {
-    fn new(schema: SchemaRef, target_batch_size: usize, num_senders: usize) -> Self {
-        Self {
-            target_batch_size,
-            inner: Arc::new(Mutex::new(LimitedBatchCoalescer::new(
+    fn new(
+        schema: SchemaRef,
+        target_batch_size: usize,
+        num_senders: usize,
+        forward_views: bool,
+    ) -> Self {
+        let inner = if forward_views {
+            OutputCoalescer::Forward(ViewForwarder::new(schema, target_batch_size))
+        } else {
+            OutputCoalescer::Compact(LimitedBatchCoalescer::new(
                 schema,
                 target_batch_size,
                 None,
-            ))),
+            ))
+        };
+        Self {
+            target_batch_size,
+            inner: Arc::new(Mutex::new(inner)),
             active_senders: Arc::new(AtomicUsize::new(num_senders)),
             demand: None,
             requested: Arc::new(AtomicBool::new(false)),
@@ -536,11 +576,16 @@ impl SharedCoalescer {
             return Ok(vec![]);
         }
         c.flush()?;
+        // A forwarded batch is charged for the buffers it shares once
+        // (`BufferLedger`), however small it is
+        let forwards = matches!(*c, OutputCoalescer::Forward(_));
         std::iter::from_fn(|| c.next_completed_batch())
-            .map(|batch| match batch.num_rows() < self.target_batch_size {
-                true => compact(&batch),
-                false => Ok(batch),
-            })
+            .map(
+                |batch| match !forwards && batch.num_rows() < self.target_batch_size {
+                    true => compact(&batch),
+                    false => Ok(batch),
+                },
+            )
             .collect()
     }
 
@@ -559,6 +604,52 @@ impl SharedCoalescer {
             acc.push(b);
         }
         Ok(acc)
+    }
+}
+
+/// The coalescer of one output: arrow's, which copies the bytes of a view
+/// column whose buffers hold more than twice the bytes it references, or one
+/// that forwards the views ([`RepartitionExec::with_forward_views`]).
+#[derive(Debug)]
+enum OutputCoalescer {
+    Compact(LimitedBatchCoalescer),
+    Forward(ViewForwarder),
+}
+
+impl OutputCoalescer {
+    fn push_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self {
+            Self::Compact(c) => c.push_batch(batch).map(|_| ()),
+            Self::Forward(f) => f.push_batch(batch),
+        }
+    }
+
+    fn next_completed_batch(&mut self) -> Option<RecordBatch> {
+        match self {
+            Self::Compact(c) => c.next_completed_batch(),
+            Self::Forward(f) => f.next_completed_batch(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Compact(c) => c.is_empty(),
+            Self::Forward(f) => f.is_empty(),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::Compact(c) => c.flush(),
+            Self::Forward(f) => f.flush(),
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            Self::Compact(c) => c.finish(),
+            Self::Forward(f) => f.flush(),
+        }
     }
 }
 
@@ -687,6 +778,7 @@ impl RepartitionExecState {
         metrics: &ExecutionPlanMetricsSet,
         partitioning: &Partitioning,
         carried_group_hash: bool,
+        forward_views: bool,
         preserve_order: bool,
         memory_wait: bool,
         name: &str,
@@ -728,6 +820,13 @@ impl RepartitionExecState {
             (memory_wait && !preserve_order).then(|| Arc::new(MemoryWait::default()));
 
         let spill_manager = Arc::new(spill_manager);
+        // Views are forwarded only through the output coalescers.
+        let ledger = (forward_views && coalesce_batches).then(|| {
+            Arc::new(BufferLedger::new(
+                MemoryConsumer::new(format!("{name} forwarded views"))
+                    .register(context.memory_pool()),
+            ))
+        });
 
         let (txs, rxs) = if preserve_order {
             // Create partition-aware channels with one channel per (input, output) pair
@@ -802,6 +901,7 @@ impl RepartitionExecState {
                     input.schema(),
                     coalescer_batch_size,
                     num_input_partitions,
+                    ledger.is_some(),
                 );
                 coalescer.demand = demand.clone();
                 coalescer
@@ -857,6 +957,7 @@ impl RepartitionExecState {
                             spill_writer: channels.spill_writers.take_for_input(i)?,
                             shared_coalescer: channels.shared_coalescer.clone(),
                             memory_wait: memory_wait.clone(),
+                            ledger: ledger.clone(),
                         },
                     ))
                 })
@@ -1852,6 +1953,9 @@ pub struct RepartitionExec {
     /// Whether rows are routed by the group hash the input carries. See
     /// [`Self::with_carried_group_hash`].
     carried_group_hash: bool,
+    /// Whether output batches forward the input's string view buffers. See
+    /// [`Self::with_forward_views`].
+    forward_views: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1936,6 +2040,12 @@ impl RepartitionExec {
         self.carried_group_hash
     }
 
+    /// Whether output batches forward the input's string view buffers. See
+    /// [`Self::with_forward_views`].
+    pub fn forwards_views(&self) -> bool {
+        self.forward_views
+    }
+
     /// Get name used to display this Exec
     pub fn name(&self) -> &str {
         "RepartitionExec"
@@ -1971,6 +2081,10 @@ impl DisplayAs for RepartitionExec {
 
                 if self.carried_group_hash {
                     write!(f, ", carried_group_hash=true")?;
+                }
+
+                if self.forward_views {
+                    write!(f, ", forward_views=true")?;
                 }
             }
             DisplayFormatType::TreeRender => {
@@ -2047,6 +2161,7 @@ impl ExecutionPlan for RepartitionExec {
                 // to the same partitions.
                 repartition.carried_group_hash =
                     self.carried_group_hash && repartition.can_carry_group_hash();
+                repartition.forward_views = self.forward_views;
                 Ok(Arc::new(repartition))
             }
         }
@@ -2099,6 +2214,7 @@ impl ExecutionPlan for RepartitionExec {
         let preserve_order = self.sort_exprs().is_some();
         let memory_wait = self.memory_wait;
         let carried_group_hash = self.carried_group_hash;
+        let forward_views = self.forward_views;
         let name = self.name().to_owned();
         let schema = self.schema();
         let schema_captured = Arc::clone(&schema);
@@ -2138,6 +2254,7 @@ impl ExecutionPlan for RepartitionExec {
                     &metrics,
                     &partitioning,
                     carried_group_hash,
+                    forward_views,
                     preserve_order,
                     memory_wait,
                     &name,
@@ -2424,6 +2541,7 @@ impl ExecutionPlan for RepartitionExec {
                 }
                 repartition.batch_size = self.batch_size;
                 repartition.memory_wait = self.memory_wait;
+                repartition.forward_views = self.forward_views;
                 return Ok(Some(Arc::new(repartition)));
             }
             UnknownPartitioning(_) => UnknownPartitioning(target_partitions),
@@ -2437,6 +2555,7 @@ impl ExecutionPlan for RepartitionExec {
             batch_size: self.batch_size,
             memory_wait: self.memory_wait,
             carried_group_hash: self.carried_group_hash,
+            forward_views: self.forward_views,
         })))
     }
 
@@ -2462,6 +2581,7 @@ impl ExecutionPlan for RepartitionExec {
             // has its own reader; not part of the wire format.
             memory_wait: _,
             carried_group_hash,
+            forward_views,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -2476,6 +2596,7 @@ impl ExecutionPlan for RepartitionExec {
                         partitioning: Some(partitioning),
                         preserve_order: *preserve_order,
                         carried_group_hash: *carried_group_hash,
+                        forward_views: *forward_views,
                     },
                 )),
             ),
@@ -2500,6 +2621,7 @@ impl RepartitionExec {
             partitioning,
             preserve_order,
             carried_group_hash,
+            forward_views,
         } = &**repart;
         let input =
             ctx.decode_required_child(input.as_deref(), "RepartitionExec", "input")?;
@@ -2528,6 +2650,9 @@ impl RepartitionExec {
         if *carried_group_hash {
             repart_exec = repart_exec.with_carried_group_hash()?;
         }
+        if *forward_views {
+            repart_exec = repart_exec.with_forward_views();
+        }
         Ok(Arc::new(repart_exec))
     }
 }
@@ -2551,6 +2676,7 @@ impl RepartitionExec {
             batch_size: None,
             memory_wait: false,
             carried_group_hash: false,
+            forward_views: false,
         })
     }
 
@@ -2698,6 +2824,46 @@ impl RepartitionExec {
         Ok(self)
     }
 
+    /// Let output batches reference the string view buffers of the batches
+    /// the input produced instead of copies of the bytes they reference.
+    ///
+    /// A hash repartition splits each input batch into a slice per output,
+    /// and each slice of a view column references all of the input batch's
+    /// buffers while it uses a fraction of their bytes. By default the output
+    /// coalescer copies such a column's bytes into compact buffers. With this
+    /// set it concatenates the slices over the input's buffers and copies
+    /// nothing, and a buffer the outputs share is charged to the memory pool
+    /// once, while a batch that references it is queued, not once per output.
+    ///
+    /// # Invariant
+    ///
+    /// **Only a consumer in the same process may receive forwarded views.**
+    /// A forwarded batch's view buffers hold the bytes of rows that went to
+    /// other outputs too, and Arrow IPC writes a view column's buffers whole,
+    /// so a forwarded batch sent over a network or written by a writer that
+    /// does not compact it would carry each shared buffer once per output.
+    /// The flag is therefore off by default, which keeps the compact buffers,
+    /// and a planner that makes this repartition the producer of a network
+    /// boundary must leave it off or clear it ([`Self::with_compact_views`]).
+    /// It is enforced here: the output coalescers forward views only when the
+    /// flag is set. Spilled batches are compacted when written, as before.
+    ///
+    /// Has no effect when the repartition preserves order or its input is
+    /// unbounded (it does not coalesce then), and a repartition that waits
+    /// for memory ([`Self::with_memory_wait`]) charges each forwarded batch
+    /// whole.
+    pub fn with_forward_views(mut self) -> Self {
+        self.forward_views = true;
+        self
+    }
+
+    /// Output batches with compact view buffers, the default: see
+    /// [`Self::with_forward_views`].
+    pub fn with_compact_views(mut self) -> Self {
+        self.forward_views = false;
+        self
+    }
+
     /// Whether this is a hash partitioning on the columns `0..n` of an input
     /// that carries their group hash.
     fn can_carry_group_hash(&self) -> bool {
@@ -2805,7 +2971,9 @@ impl RepartitionExec {
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
                     if output_channel.shared_coalescer.is_some() {
                         metrics.coalesce_rows.add(batch.num_rows());
-                        metrics.coalesce_copied_bytes.add(copied_bytes(&batch));
+                        if output_channel.ledger.is_none() {
+                            metrics.coalesce_copied_bytes.add(copied_bytes(&batch));
+                        }
                     }
                     let coalesce_timer = metrics.coalesce_time.timer();
                     output_channel.coalesce(batch, &mut coalesced)?;
@@ -3048,6 +3216,12 @@ impl PerPartitionStream {
                                 // Release memory, wake the producers waiting
                                 // for it, and return batch
                                 drop(queued);
+                                return Poll::Ready(Some(Ok(batch)));
+                            }
+                            Ok(RepartitionBatch::Forwarded(batch, forwarded)) => {
+                                // Release its bytes and its share of the
+                                // view buffers, and return batch
+                                drop(forwarded);
                                 return Poll::Ready(Some(Ok(batch)));
                             }
                             Ok(RepartitionBatch::Spilled) => {
@@ -4547,6 +4721,173 @@ mod tests {
                 .expect("missing batch")?;
         assert_eq!(result, batch);
         drop(stream);
+        Ok(())
+    }
+
+    /// Long strings in four input partitions of a few batches each, the
+    /// way a partial aggregation emits its keys.
+    fn view_inputs() -> Result<(SchemaRef, Vec<Vec<RecordBatch>>)> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("n", DataType::UInt32, false),
+        ]));
+        let inputs = (0..4u32)
+            .map(|input| {
+                (0..3u32)
+                    .map(|batch| {
+                        let rows =
+                            (0..4000u32).map(|row| (input * 3 + batch) * 4000 + row);
+                        let strings: StringViewArray = rows
+                            .clone()
+                            .map(|n| {
+                                (n % 97 != 0).then(|| {
+                                    format!("a string longer than twelve bytes {n}")
+                                })
+                            })
+                            .collect();
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(strings),
+                                Arc::new(UInt32Array::from_iter_values(rows)),
+                            ],
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((schema, inputs))
+    }
+
+    /// The batches of every output of a hash repartition of [`view_inputs`]
+    /// into 8 partitions, forwarding views or not, under `memory_limit`, and
+    /// the repartition's metrics.
+    async fn repartition_views(
+        forward: bool,
+        memory_limit: Option<usize>,
+    ) -> Result<(Vec<RecordBatch>, MetricsSet, Vec<RecordBatch>)> {
+        let (schema, inputs) = view_inputs()?;
+        let source = TestMemoryExec::try_new_exec(&inputs, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("n", &schema)?], 8),
+        )?;
+        let exec = Arc::new(if forward {
+            exec.with_forward_views()
+        } else {
+            exec
+        });
+        let mut runtime = RuntimeEnvBuilder::default();
+        if let Some(memory_limit) = memory_limit {
+            runtime = runtime.with_memory_limit(memory_limit, 1.0);
+        }
+        let task = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime.build_arc()?)
+                .with_session_config(SessionConfig::new().with_batch_size(2048)),
+        );
+        // Every output is read at once, as a final aggregation's partitions are
+        let outputs = (0..8)
+            .map(|partition| exec.execute(partition, Arc::clone(&task)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut batches = vec![];
+        for output in futures::future::try_join_all(
+            outputs
+                .into_iter()
+                .map(|stream| stream.try_collect::<Vec<_>>()),
+        )
+        .await?
+        {
+            batches.extend(output);
+        }
+        let metrics = exec.metrics().expect("repartition has metrics");
+        Ok((batches, metrics, inputs.into_iter().flatten().collect()))
+    }
+
+    fn sorted_rows(batches: &[RecordBatch]) -> Result<String> {
+        Ok(batches_to_sort_string(batches))
+    }
+
+    #[tokio::test]
+    async fn forwarded_views_give_the_same_rows_without_copying() -> Result<()> {
+        let (compact, compact_metrics, _) = repartition_views(false, None).await?;
+        let (forwarded, metrics, inputs) = repartition_views(true, None).await?;
+        assert_eq!(sorted_rows(&forwarded)?, sorted_rows(&compact)?);
+
+        // Every buffer a forwarded batch references is one of the input's
+        let input_buffers: HashSet<usize> = inputs
+            .iter()
+            .flat_map(|batch| batch.column(0).as_string_view().data_buffers().to_vec())
+            .map(|buffer| buffer.as_ptr() as usize)
+            .collect();
+        for batch in &forwarded {
+            forward::check_views(batch)?;
+            let views = batch.column(0).as_string_view();
+            assert!(
+                views.data_buffers().iter().all(|buffer| {
+                    input_buffers.contains(&(buffer.as_ptr() as usize))
+                })
+            );
+        }
+        let copied = |metrics: &MetricsSet| {
+            metrics
+                .sum_by_name("coalesce_copied_bytes")
+                .map_or(0, |value| value.as_usize())
+        };
+        assert_eq!(copied(&metrics), 0);
+        assert!(copied(&compact_metrics) > 0);
+        Ok(())
+    }
+
+    /// Without `with_forward_views`, as for the producer of a network
+    /// boundary, every output batch holds compact buffers.
+    #[tokio::test]
+    async fn a_repartition_that_does_not_forward_emits_compact_views() -> Result<()> {
+        let (batches, _, inputs) = repartition_views(false, None).await?;
+        let input_buffers: HashSet<usize> = inputs
+            .iter()
+            .flat_map(|batch| batch.column(0).as_string_view().data_buffers().to_vec())
+            .map(|buffer| buffer.as_ptr() as usize)
+            .collect();
+        // The coalescer copied each batch's bytes into buffers of its own
+        for batch in &batches {
+            let views = batch.column(0).as_string_view();
+            assert!(
+                views.data_buffers().iter().all(|buffer| {
+                    !input_buffers.contains(&(buffer.as_ptr() as usize))
+                })
+            );
+        }
+        Ok(())
+    }
+
+    /// A pool that holds each input buffer once, but not once per output,
+    /// takes every forwarded batch without spilling.
+    #[tokio::test]
+    async fn forwarded_views_charge_a_shared_buffer_once() -> Result<()> {
+        let (_, inputs) = view_inputs()?;
+        let held: usize = inputs
+            .iter()
+            .flatten()
+            .map(|batch| batch.get_array_memory_size())
+            .sum();
+        // Each output's slices reference all of an input batch's buffers, so
+        // charging them per output would take 8 times the inputs' bytes
+        let limit = 2 * held;
+        let (batches, metrics, _) = repartition_views(true, Some(limit)).await?;
+        assert_eq!(metrics.spill_count(), Some(0));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 48_000);
+        Ok(())
+    }
+
+    /// Under a pool too small for the forwarded batches they spill, compacted
+    /// when written, and give the same rows.
+    #[tokio::test]
+    async fn forwarded_views_spill() -> Result<()> {
+        let (expected, _, _) = repartition_views(false, None).await?;
+        let (batches, metrics, _) = repartition_views(true, Some(64 * 1024)).await?;
+        assert!(metrics.spill_count().unwrap_or(0) > 0, "spilled");
+        assert_eq!(sorted_rows(&batches)?, sorted_rows(&expected)?);
         Ok(())
     }
 
