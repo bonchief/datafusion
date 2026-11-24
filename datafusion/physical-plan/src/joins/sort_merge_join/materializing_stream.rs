@@ -300,7 +300,7 @@ impl BufferedBatch {
         // only for a column holding more than twice that, so it copies less
         // than it lets go.
         let batch = compact(&batch)?;
-        let join_arrays = join_arrays(&batch, on_column)?;
+        let join_arrays = own(join_arrays(&batch, on_column)?)?;
         let join_arrays_mem = held(None, &join_arrays)?;
         let size_estimation = held(Some(&batch), &join_arrays)? + overhead(&batch);
 
@@ -341,6 +341,29 @@ pub(super) fn held(batch: Option<&RecordBatch>, keys: &[ArrayRef]) -> Result<usi
     )?;
     counter.count_batch_with_array_overhead(&keys);
     Ok(counter.memory_usage())
+}
+
+/// `keys`, each copied into buffers of its own when the buffers it points
+/// into hold more than twice its bytes. A key array outlives its batch when
+/// the batch spills, and a key cut from a batch whose columns share one
+/// allocation (as a batch read from a spill file does) would keep all of it
+/// alive.
+fn own(keys: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+    keys.into_iter()
+        .map(|key| {
+            let held = RecordBatchMemoryCounter::new().count_array(key.as_ref());
+            let bytes = key.to_data().get_slice_memory_size()?;
+            Ok(match held > bytes.saturating_mul(2) {
+                // `take` writes new buffers; `concat` of one array returns it.
+                true => compute::take(
+                    key.as_ref(),
+                    &UInt32Array::from_iter_values(0..key.len() as u32),
+                    None,
+                )?,
+                false => key,
+            })
+        })
+        .collect()
 }
 
 /// Bookkeeping a buffered batch adds beside its arrays: worst case

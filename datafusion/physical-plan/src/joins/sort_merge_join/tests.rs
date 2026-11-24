@@ -7397,7 +7397,7 @@ fn shared_text_side(
     rows: usize,
     key: impl Fn(usize) -> i32,
 ) -> (Arc<dyn ExecutionPlan>, usize) {
-    use arrow::array::{Array, StringViewArray};
+    use arrow::array::StringViewArray;
 
     const RUN_ROWS: usize = 4096;
     let text = StringViewArray::from_iter_values(

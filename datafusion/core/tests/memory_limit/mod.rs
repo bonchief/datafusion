@@ -594,7 +594,10 @@ async fn sort_merge_join_spill() {
         .with_query(
             "select t1.* from t t1 JOIN t t2 ON t1.pod = t2.pod AND t1.time = t2.time",
         )
-        .with_memory_limit(1_000)
+        // Holds the key arrays the spilled batches of a key group keep in
+        // memory (their dictionaries included), which the join charges
+        // within the pool rather than past it.
+        .with_memory_limit(16_000)
         .with_config(config)
         .with_disk_manager_builder(DiskManagerBuilder::default())
         .with_scenario(Scenario::AccessLogStreamingByPodTime)
