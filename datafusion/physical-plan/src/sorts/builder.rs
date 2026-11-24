@@ -56,7 +56,12 @@ impl BatchCursor {
 ///   held input. The admission is released once the batch is built; its
 ///   consumer charges the batch on receipt, as it does any input batch.
 ///   When the pool cannot admit the output, the builder emits half as many
-///   rows, down to one, before it fails.
+///   rows, down to one, before it fails. It halves first against the room
+///   the pool reports ([`MemoryReservation::room`]), so it asks the pool only
+///   for an output it can see fits, or for one row when none does: a pool
+///   may record a refused ask (as the ask its next attempt needs) even when
+///   the caller recovers, so a refusal the builder could foresee is never
+///   made.
 #[derive(Debug)]
 pub struct BatchBuilder {
     /// The schema of the RecordBatches yielded by this stream
@@ -292,6 +297,18 @@ impl BatchBuilder {
         }
     }
 
+    /// Bytes the reservation must hold to emit the first `rows` rows: the
+    /// held input plus the output interleaving them allocates.
+    fn needed(&self, rows: usize) -> Result<usize> {
+        let estimate = self.indices[..rows]
+            .iter()
+            .try_fold(0usize, |bytes, (batch_idx, _)| {
+                bytes.checked_add(self.batches[*batch_idx].2)
+            })
+            .ok_or_else(|| internal_datafusion_err!("merge output size overflow"))?;
+        Ok(self.held_bytes().saturating_add(estimate))
+    }
+
     /// Drains the in_progress row indexes, and builds a new RecordBatch from them
     ///
     /// Will then drop any batches for which all rows have been yielded to the output.
@@ -307,16 +324,19 @@ impl BatchBuilder {
         // Interleaving allocates the output before any consumer can charge
         // it. Admit it first, from the per-row bytes of each source batch,
         // so a pool that cannot hold it refuses instead of being exceeded.
-        // A refused admission retries with half the rows, down to one.
+        // An output the pool's room cannot hold is halved before it is
+        // asked for, and a refused admission (another consumer took the
+        // room meanwhile) retries with half the rows, down to one.
         let mut rows = self.indices.len();
+        if let Some(room) = self.reservation.room() {
+            while rows > 1
+                && self.needed(rows)?.saturating_sub(self.reservation.size()) > room
+            {
+                rows /= 2;
+            }
+        }
         loop {
-            let estimate = self.indices[..rows]
-                .iter()
-                .try_fold(0usize, |bytes, (batch_idx, _)| {
-                    bytes.checked_add(self.batches[*batch_idx].2)
-                })
-                .ok_or_else(|| internal_datafusion_err!("merge output size overflow"))?;
-            let needed = self.held_bytes().saturating_add(estimate);
+            let needed = self.needed(rows)?;
             match try_grow_reservation_to_at_least(&mut self.reservation, needed) {
                 Ok(()) => break,
                 Err(e @ DataFusionError::ResourcesExhausted(_)) if rows > 1 => {
@@ -441,8 +461,57 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_execution::memory_pool::{
-        GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+        GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, UnboundedMemoryPool,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A greedy pool that counts the asks it refuses, as a pool that records
+    /// a refusal would see them.
+    #[derive(Debug)]
+    struct Refusals {
+        pool: GreedyMemoryPool,
+        refused: AtomicUsize,
+    }
+
+    impl std::fmt::Display for Refusals {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "refusals")
+        }
+    }
+
+    impl MemoryPool for Refusals {
+        fn name(&self) -> &str {
+            "refusals"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.pool.grow(reservation, additional)
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.pool.shrink(reservation, shrink)
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> Result<()> {
+            self.pool
+                .try_grow(reservation, additional)
+                .inspect_err(|_| {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                })
+        }
+
+        fn reserved(&self) -> usize {
+            self.pool.reserved()
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            self.pool.memory_limit()
+        }
+    }
 
     fn overflow_list_batch() -> RecordBatch {
         let values_field = Arc::new(Field::new_list_field(DataType::Int32, true));
@@ -745,8 +814,11 @@ mod tests {
         let batch = int_batch((0..1024).collect());
         let held = get_record_batch_memory_size(&batch);
         // Room for the held batch and a quarter of its rows as output.
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(held + 256 * size_of::<i32>()));
+        let refusals = Arc::new(Refusals {
+            pool: GreedyMemoryPool::new(held + 256 * size_of::<i32>()),
+            refused: AtomicUsize::new(0),
+        });
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&refusals) as _;
         let reservation = MemoryConsumer::new("test").register(&pool);
         let mut builder = BatchBuilder::new(batch.schema(), 1, 1024, reservation);
         builder.push_batch(0, batch).unwrap();
@@ -762,6 +834,9 @@ mod tests {
         assert_eq!(emitted, (0..1024).collect::<Vec<_>>());
         assert_eq!(builder.held_bytes(), 0);
         assert_eq!(pool.reserved(), 0);
+        // The halving sized itself to the pool's room, so the pool never
+        // saw an ask it refused.
+        assert_eq!(refusals.refused.load(Ordering::Relaxed), 0);
     }
 
     /// When not even one row fits, the merge still fails.
