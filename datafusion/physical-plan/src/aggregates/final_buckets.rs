@@ -321,8 +321,8 @@ impl FinalBuckets {
 
         // A spilled bucket holds no memory: its rows go straight to the file
         // and are combined into batches when read back.
-        for index in 0..NUM_BUCKETS {
-            if self.buckets[index].spill_file.is_some() && counts[index] > 0 {
+        for (index, &count) in counts.iter().enumerate() {
+            if self.buckets[index].spill_file.is_some() && count > 0 {
                 let rows = self.finish_pending(index)?;
                 if let Some(spill_file) = &mut self.buckets[index].spill_file {
                     spill_file.append_batch(&rows)?;
