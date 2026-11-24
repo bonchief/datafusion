@@ -337,7 +337,10 @@ mod tests {
         assert_eq!(pieces[0].batch.num_rows(), 8192);
         assert_eq!(pieces[0].size, size);
 
-        // One byte less, and the batch is measured and split.
+        // One byte less, and the batch is measured and cut into pieces within
+        // the bound. On this fork's Arrow the whole batch's recorded size
+        // counts spare data buffer capacity that a compacted piece drops, so
+        // one piece of every row can already fit.
         let pieces = SpillPieces::new(&batch, Some(size - 1), false)?
             .collect::<Result<Vec<_>>>()?;
         assert!(measured_batches() > before);
@@ -345,7 +348,7 @@ mod tests {
             pieces.iter().map(|p| p.batch.num_rows()).sum::<usize>(),
             8192
         );
-        assert!(pieces.len() > 1);
+        assert!(pieces.iter().all(|p| p.size < size), "{pieces:?}");
         Ok(())
     }
 }
