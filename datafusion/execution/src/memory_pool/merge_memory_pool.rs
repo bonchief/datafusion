@@ -238,6 +238,15 @@ impl MemoryPool for MergeMemoryPool {
     fn memory_limit(&self) -> MemoryLimit {
         self.parent.memory_limit()
     }
+
+    /// The workspace this pool holds and no child or loan uses, plus what
+    /// the parent would grant its single reservation.
+    fn room(&self, _reservation: &MemoryReservation) -> Option<usize> {
+        let state = self.state.lock();
+        let slack = state.reservation.size().saturating_sub(state.used);
+        let parent = self.parent.room(&state.reservation)?;
+        Some(slack.saturating_add(parent))
+    }
 }
 
 #[cfg(test)]

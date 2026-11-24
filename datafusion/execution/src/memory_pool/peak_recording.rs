@@ -229,6 +229,10 @@ impl MemoryPool for PeakRecordingPool {
     fn memory_limit(&self) -> MemoryLimit {
         self.inner.memory_limit()
     }
+
+    fn room(&self, reservation: &MemoryReservation) -> Option<usize> {
+        self.inner.room(reservation)
+    }
 }
 
 #[cfg(test)]

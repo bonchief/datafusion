@@ -114,6 +114,13 @@ impl MemoryPool for GreedyMemoryPool {
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Finite(self.pool_size)
     }
+
+    fn room(&self, _reservation: &MemoryReservation) -> Option<usize> {
+        Some(
+            self.pool_size
+                .saturating_sub(self.used.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 impl Display for GreedyMemoryPool {
@@ -269,6 +276,16 @@ impl MemoryPool for FairSpillPool {
 
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Finite(self.pool_size)
+    }
+
+    fn room(&self, reservation: &MemoryReservation) -> Option<usize> {
+        // A spiller's room is its fair share, which changes with every
+        // registration; only an unspillable consumer's room is exact.
+        let state = self.state.lock();
+        (!reservation.registration.consumer.can_spill).then(|| {
+            self.pool_size
+                .saturating_sub(state.unspillable + state.spillable)
+        })
     }
 }
 
@@ -613,6 +630,10 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
 
     fn memory_limit(&self) -> MemoryLimit {
         self.inner.memory_limit()
+    }
+
+    fn room(&self, reservation: &MemoryReservation) -> Option<usize> {
+        self.inner.room(reservation)
     }
 }
 

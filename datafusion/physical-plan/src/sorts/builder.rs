@@ -57,11 +57,14 @@ impl BatchCursor {
 ///   consumer charges the batch on receipt, as it does any input batch.
 ///   When the pool cannot admit the output, the builder emits half as many
 ///   rows, down to one, before it fails. It halves first against the room
-///   the pool reports ([`MemoryReservation::room`]), so it asks the pool only
-///   for an output it can see fits, or for one row when none does: a pool
-///   may record a refused ask (as the ask its next attempt needs) even when
-///   the caller recovers, so a refusal the builder could foresee is never
-///   made.
+///   the pool reports ([`MemoryReservation::room`]), but not below an eighth
+///   of the batch size: an output it can see does not fit is not asked for,
+///   since a pool may record a refused ask (as the ask its next attempt
+///   needs) even when the caller recovers, while an output of that floor is
+///   asked for whatever the room, since a pool may fund an ask past its room
+///   (from its node) and a merge starved into one-row batches would leave
+///   every consumer charging the shared buffers each tiny batch points at.
+///   Only a refused ask halves below the floor.
 #[derive(Debug)]
 pub struct BatchBuilder {
     /// The schema of the RecordBatches yielded by this stream
@@ -97,6 +100,10 @@ pub struct BatchBuilder {
     /// The accumulated stream indexes from which to pull rows
     /// Consists of a tuple of `(batch_idx, row_idx)`
     indices: Vec<(usize, usize)>,
+
+    /// The fewest rows an output is halved to against the pool's room
+    /// before it is asked for: an eighth of the batch size.
+    floor: usize,
 }
 
 impl BatchBuilder {
@@ -116,6 +123,7 @@ impl BatchBuilder {
             reservation,
             held: RecordBatchMemoryTracker::new(),
             initial_reservation,
+            floor: (batch_size / 8).max(1),
         }
     }
 
@@ -325,14 +333,14 @@ impl BatchBuilder {
         // it. Admit it first, from the per-row bytes of each source batch,
         // so a pool that cannot hold it refuses instead of being exceeded.
         // An output the pool's room cannot hold is halved before it is
-        // asked for, and a refused admission (another consumer took the
-        // room meanwhile) retries with half the rows, down to one.
+        // asked for, down to the floor; a refused admission retries with
+        // half the rows, down to one.
         let mut rows = self.indices.len();
         if let Some(room) = self.reservation.room() {
-            while rows > 1
+            while rows > self.floor
                 && self.needed(rows)?.saturating_sub(self.reservation.size()) > room
             {
-                rows /= 2;
+                rows = (rows / 2).max(self.floor);
             }
         }
         loop {
@@ -455,13 +463,15 @@ mod tests {
     use super::*;
     use arrow::array::{
         Array, ArrayDataBuilder, AsArray, Int32Array, ListArray, StringViewArray,
+        UInt32Array,
     };
     use arrow::buffer::Buffer;
     use arrow::datatypes::Int32Type;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_execution::memory_pool::{
-        GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, UnboundedMemoryPool,
+        GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MergeMemoryPool,
+        UnboundedMemoryPool,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -511,6 +521,17 @@ mod tests {
         fn memory_limit(&self) -> MemoryLimit {
             self.pool.memory_limit()
         }
+
+        fn room(&self, reservation: &MemoryReservation) -> Option<usize> {
+            self.pool.room(reservation)
+        }
+    }
+
+    fn refusals(size: usize) -> Arc<Refusals> {
+        Arc::new(Refusals {
+            pool: GreedyMemoryPool::new(size),
+            refused: AtomicUsize::new(0),
+        })
     }
 
     fn overflow_list_batch() -> RecordBatch {
@@ -857,5 +878,139 @@ mod tests {
             "{error}"
         );
         assert_eq!(builder.len(), 1024);
+    }
+
+    /// A merge registered on a sorter's [`MergeMemoryPool`] sizes its output
+    /// to what the parent pool would grant, not to the parent's whole budget:
+    /// with the budget nearly full of another consumer, the parent never sees
+    /// an ask it refuses.
+    #[test]
+    fn test_merge_pool_room_counts_other_consumers() {
+        let batch = int_batch((0..1024).collect());
+        let held = get_record_batch_memory_size(&batch);
+        let other = 1 << 20;
+        let parent = refusals(other + held + 256 * size_of::<i32>());
+        let parent_pool: Arc<dyn MemoryPool> = Arc::clone(&parent) as _;
+        let contender = MemoryConsumer::new("other sorter").register(&parent_pool);
+        contender.try_grow(other).unwrap();
+        let merge = Arc::new(MergeMemoryPool::new(
+            Arc::clone(&parent_pool),
+            MemoryConsumer::new("ExternalSorterMerge"),
+        ));
+        let merge_pool: Arc<dyn MemoryPool> = Arc::clone(&merge) as _;
+        let reservation = MemoryConsumer::new("merge").register(&merge_pool);
+        let mut builder = BatchBuilder::new(batch.schema(), 1, 1024, reservation);
+        builder.push_batch(0, batch).unwrap();
+        push_n_rows(&mut builder, 0, 1024);
+        assert_eq!(
+            builder.reservation.room(),
+            Some(256 * size_of::<i32>()),
+            "the parent's room, not its budget less this merge"
+        );
+
+        let mut emitted = 0;
+        while let Some(output) = builder.build_record_batch().unwrap() {
+            assert!(output.num_rows() <= 256, "{}", output.num_rows());
+            emitted += output.num_rows();
+        }
+
+        assert_eq!(emitted, 1024);
+        assert_eq!(parent.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(parent_pool.reserved(), other);
+    }
+
+    /// Halving against the room stops at an eighth of the batch size, which
+    /// is asked for whatever the room, so a pool that funds asks past its
+    /// room can grant it; only its refusal halves further.
+    #[test]
+    fn test_halving_asks_at_its_floor() {
+        let batch = int_batch((0..1024).collect());
+        let held = get_record_batch_memory_size(&batch);
+        // Room for 64 rows of output, below the floor of 1024 / 8 = 128.
+        let pool = refusals(held + 64 * size_of::<i32>());
+        let dyn_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as _;
+        let reservation = MemoryConsumer::new("test").register(&dyn_pool);
+        let mut builder = BatchBuilder::new(batch.schema(), 1, 1024, reservation);
+        builder.push_batch(0, batch).unwrap();
+        push_n_rows(&mut builder, 0, 1024);
+
+        let output = builder.build_record_batch().unwrap().unwrap();
+
+        assert_eq!(output.num_rows(), 64);
+        // One ask, at the floor; nothing larger.
+        assert_eq!(pool.refused.load(Ordering::Relaxed), 1);
+    }
+
+    /// A batch whose admission is refused is rolled back without uncharging
+    /// the buffers it shares with a live batch.
+    #[test]
+    fn test_refused_push_keeps_shared_buffers_charged() {
+        let (slices, data) = shared_view_slices(1024, 2);
+        // A batch with its own views over the first slice's data buffers.
+        let rows = UInt32Array::from_iter_values(0..512);
+        let taken = arrow::compute::take_record_batch(&slices[0], &rows).unwrap();
+        let first = data + 1024 * size_of::<u128>();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(first + 1024));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let mut builder = BatchBuilder::new(slices[0].schema(), 2, 512, reservation);
+        builder.push_batch(0, slices[0].clone()).unwrap();
+        assert_eq!(builder.held_bytes(), first);
+
+        assert!(builder.push_batch(1, taken).is_err());
+
+        assert_eq!(builder.held_bytes(), first);
+        assert_eq!(builder.reservation.size(), first);
+        assert_eq!(pool.reserved(), first);
+    }
+
+    /// A buffer released with its last batch is charged again when a later
+    /// batch brings it back.
+    #[test]
+    fn test_released_buffer_is_charged_again() {
+        let (slices, data) = shared_view_slices(1024, 2);
+        let mut builder = BatchBuilder::new(slices[0].schema(), 1, 512, reservation());
+        builder.push_batch(0, slices[0].clone()).unwrap();
+        let first = builder.held_bytes();
+        push_n_rows(&mut builder, 0, 512);
+        emit_n_rows(&mut builder, 512);
+        assert_eq!(builder.held_bytes(), 0);
+
+        builder.push_batch(0, slices[1].clone()).unwrap();
+
+        assert_eq!(builder.held_bytes(), first);
+        assert_eq!(first, data + 1024 * size_of::<u128>());
+        assert_eq!(builder.reservation.size(), first);
+    }
+
+    /// What interleaving a view column with nulls allocates stays within
+    /// what the builder admitted for it.
+    #[test]
+    fn test_interleaved_views_with_nulls_fit_their_admission() {
+        let values = StringViewArray::from_iter(
+            (0..1024).map(|row| (row % 3 != 0).then(|| format!("{row:064}"))),
+        );
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+        let (first, second) = (batch.slice(0, 512), batch.slice(512, 512));
+        let mut builder = BatchBuilder::new(batch.schema(), 2, 1024, reservation());
+        builder.push_batch(0, first).unwrap();
+        builder.push_batch(1, second).unwrap();
+        for _ in 0..512 {
+            builder.push_row(1);
+            builder.push_row(0);
+        }
+        let admitted = builder.needed(1024).unwrap() - builder.held_bytes();
+
+        let output = builder.build_record_batch().unwrap().unwrap();
+
+        let column = output.column(0).as_string_view();
+        let allocated = column.views().inner().capacity()
+            + column.nulls().map_or(0, |nulls| nulls.buffer().capacity());
+        assert!(column.null_count() > 0);
+        assert!(
+            allocated <= admitted,
+            "allocated {allocated} above the admitted {admitted}"
+        );
     }
 }

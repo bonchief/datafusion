@@ -219,6 +219,19 @@ pub trait MemoryPool: Any + Send + Sync + std::fmt::Debug + Display {
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Unknown
     }
+
+    /// Return the bytes `reservation` could grow by now without this pool
+    /// refusing, or `None` when the pool cannot tell.
+    ///
+    /// A caller that can shrink what it asks for, such as a merge sizing its
+    /// output batch, uses it to ask only for what fits: a pool may record a
+    /// refused ask even when its caller recovers. Concurrent consumers can
+    /// take the room before a later grow, so it is a hint, not a grant. A
+    /// pool must never report more than it would admit; the default reports
+    /// nothing, and the caller asks as it would without the hint.
+    fn room(&self, _reservation: &MemoryReservation) -> Option<usize> {
+        None
+    }
 }
 
 impl dyn MemoryPool {
@@ -383,15 +396,10 @@ impl MemoryReservation {
     }
 
     /// The bytes this reservation could grow by now without its pool
-    /// refusing: the pool's finite limit less what the pool holds, or `None`
-    /// when the pool reports no finite limit. Concurrent consumers can take
-    /// that room before a later grow, so this is a sizing hint, not a grant.
+    /// refusing, as its pool reports them ([`MemoryPool::room`]), or `None`
+    /// when the pool cannot tell. A sizing hint, not a grant.
     pub fn room(&self) -> Option<usize> {
-        let pool = &self.registration.pool;
-        match pool.memory_limit() {
-            MemoryLimit::Finite(limit) => Some(limit.saturating_sub(pool.reserved())),
-            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
-        }
+        self.registration.pool.room(self)
     }
 
     /// Frees all bytes from this reservation back to the underlying
