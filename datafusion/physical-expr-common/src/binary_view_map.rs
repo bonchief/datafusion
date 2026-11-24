@@ -130,10 +130,16 @@ impl ArrowBytesViewSet {
 /// until [`Self::take`] or [`Self::clear_and_release`];
 /// [`Self::take_with_capacity`] keeps whichever table the map is in.
 ///
-/// Key bytes do not count towards the gate: a probe reads one line of them
-/// only for an entry whose hash already matched, and counting them would move
-/// a partial aggregate's 8,192 long keys, whose table stays cache-hot between
-/// flushes, to the table that only pays beyond the cache.
+/// A probe reads a key's bytes only for an entry whose hash already matched,
+/// and those bytes are cold exactly when the key was stored long ago. So they
+/// count towards the gate only while the map holds more keys than it was last
+/// reserved for ([`Self::reserve_groups`]). A map emptied at a fixed capacity,
+/// such as a partial aggregate's 8,192-group table, holds only keys stored
+/// since its last flush, whose bytes stay cache-hot, and keeps hashbrown's
+/// table while that table fits. A map that is never emptied, such as a final
+/// aggregate's, moves once its table and key bytes together outgrow the
+/// cache: below that, its table hits L2 but every match still waits for the
+/// stored bytes, which only the staged probe prefetches.
 ///
 /// # Staged probe
 ///
@@ -172,6 +178,9 @@ where
     /// Allocation target, doubled for each new payload block up to 2 MiB.
     /// Zero keeps lazy payload growth for the small per-group distinct maps.
     block_size: usize,
+    /// Keys the last [`Self::reserve_groups`] made room for. While the map
+    /// holds no more, its key bytes do not count towards the gate.
+    reserved: usize,
 
     /// random state used to generate hashes
     random_state: RandomState,
@@ -222,6 +231,7 @@ where
             } else {
                 BYTE_VIEW_STARTING_BLOCK_SIZE
             },
+            reserved: 0,
             random_state: RandomState::default(),
             hashes_buffer: vec![],
             null: None,
@@ -233,6 +243,7 @@ where
         if self.block_size == 0 && capacity != 0 {
             self.block_size = BYTE_VIEW_STARTING_BLOCK_SIZE;
         }
+        self.reserved = capacity;
         // A reservation that alone outgrows the gate goes to the prefetched
         // table now, rather than sizing hashbrown's table only to copy it.
         if self.table.is_none()
@@ -393,7 +404,7 @@ where
         // A map in hashbrown's table below the gate runs the loop below,
         // which is the one this map has always run.
         let moves = self.table.is_some()
-            || staged.unwrap_or_else(|| self.map.allocation_size() > l2_cache_bytes());
+            || staged.unwrap_or_else(|| self.gate_bytes() > l2_cache_bytes());
         if moves {
             return self.insert_prefetched::<MP, OP, B>(
                 values,
@@ -874,6 +885,18 @@ where
 
         self.views.push(view);
         view
+    }
+
+    /// Bytes a probe of hashbrown's table may miss on: the table, and the
+    /// stored key bytes once the map holds more keys than it was reserved for
+    /// (see the type docs).
+    fn gate_bytes(&self) -> usize {
+        let keys = if self.non_null_len() > self.reserved {
+            self.in_progress.len() + self.completed.iter().map(Buffer::len).sum::<usize>()
+        } else {
+            0
+        };
+        self.map.allocation_size() + keys
     }
 
     /// Bytes the hash tables hold.
@@ -1904,6 +1927,44 @@ mod tests {
         assert!(big.table.is_some());
         assert!(capacity(&big) >= l2_cache_bytes() / size_of::<Entry<()>>());
         assert_eq!(&big.into_state(), &small.into_state());
+    }
+
+    /// Quadratic when every hash collides, so skipped under that feature.
+    #[cfg(not(feature = "force_hash_collisions"))]
+    #[test]
+    fn counts_key_bytes_only_beyond_the_reservation() {
+        // 100-byte keys whose bytes, not table, outgrow L2.
+        let rows = l2_cache_bytes() / 100 + 1;
+        let keys = (0..rows)
+            .map(|key| format!("{key:0>100}"))
+            .collect::<Vec<_>>();
+        let values: ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            keys.iter().map(String::as_bytes),
+        ));
+        let new_map = || {
+            ArrowBytesViewMap::<()>::with_capacity(
+                OutputType::BinaryView,
+                INITIAL_MAP_CAPACITY,
+            )
+        };
+
+        // A map that is never reserved, as a final aggregate's: the second
+        // batch finds the first batch's bytes beyond L2 and moves.
+        let mut grown = new_map();
+        grown.insert_if_new(&values, |_| (), |_| ());
+        assert!(grown.table.is_none());
+        assert!(grown.map.allocation_size() < l2_cache_bytes());
+        grown.insert_if_new(&values, |_| (), |_| ());
+        assert!(grown.table.is_some());
+
+        // A map reserved for all its keys, as a partial aggregate's between
+        // flushes, holds only recent keys and stays in hashbrown's table.
+        let mut fixed = new_map();
+        fixed.reserve_groups(rows);
+        fixed.insert_if_new(&values, |_| (), |_| ());
+        fixed.insert_if_new(&values, |_| (), |_| ());
+        assert!(fixed.table.is_none());
+        assert_eq!(&fixed.into_state(), &grown.into_state());
     }
 
     #[test]
