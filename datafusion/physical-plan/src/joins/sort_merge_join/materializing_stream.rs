@@ -292,14 +292,14 @@ pub(super) struct BufferedBatch {
 
 impl BufferedBatch {
     fn try_new(
-        batch: RecordBatch,
+        batch: &RecordBatch,
         range: Range<usize>,
         on_column: &[PhysicalExprRef],
     ) -> Result<Self> {
         // The copy writes only the bytes this batch's views reference, and
         // only for a column holding more than twice that, so it copies less
         // than it lets go.
-        let batch = compact(&batch)?;
+        let batch = compact(batch)?;
         let join_arrays = own(join_arrays(&batch, on_column)?)?;
         let join_arrays_mem = held(None, &join_arrays)?;
         let size_estimation = held(Some(&batch), &join_arrays)? + overhead(&batch);
@@ -1466,7 +1466,7 @@ impl MaterializingSortMergeJoinStream {
 
                     if batch.num_rows() > 0 {
                         let buffered_batch =
-                            BufferedBatch::try_new(batch, 0..1, &self.on_buffered)?;
+                            BufferedBatch::try_new(&batch, 0..1, &self.on_buffered)?;
                         self.allocate_reservation(buffered_batch)?;
                         self.streamed_buffered_cmp = None;
                         return Ok(true);
@@ -1521,7 +1521,7 @@ impl MaterializingSortMergeJoinStream {
                         self.join_metrics.input_rows().add(batch.num_rows());
                         if batch.num_rows() > 0 {
                             let buffered_batch =
-                                BufferedBatch::try_new(batch, 0..0, &self.on_buffered)?;
+                                BufferedBatch::try_new(&batch, 0..0, &self.on_buffered)?;
                             self.allocate_reservation(buffered_batch)?;
                             self.buffered_equality_cmp = None;
                         }
