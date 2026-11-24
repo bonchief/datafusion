@@ -907,13 +907,18 @@ mod tests {
         enable_round_robin_repartition: bool,
     ) -> Result<Arc<SortPreservingMergeExec>> {
         let row_size = 12500;
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![1; row_size]));
-        let b: ArrayRef = Arc::new(StringArray::from_iter(vec![Some("a"); row_size]));
-        let c: ArrayRef = Arc::new(Int64Array::from_iter(vec![0; row_size]));
-        let rb = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)])?;
-        let schema = rb.schema();
-
-        let rbs = std::iter::repeat_n(rb, 256).collect::<Vec<_>>();
+        // Each batch owns its buffers: the merge charges a buffer that several
+        // live batches share once, so copies of one batch would hold no more
+        // memory with the tie breaker disabled than with it enabled.
+        let rb = || {
+            let a: ArrayRef = Arc::new(Int32Array::from(vec![1; row_size]));
+            let b: ArrayRef =
+                Arc::new(StringArray::from_iter(vec![Some("a"); row_size]));
+            let c: ArrayRef = Arc::new(Int64Array::from_iter(vec![0; row_size]));
+            RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)])
+        };
+        let rbs = (0..256).map(|_| rb()).collect::<Result<Vec<_>, _>>()?;
+        let schema = rbs[0].schema();
         let sort = [
             PhysicalSortExpr {
                 expr: col("b", &schema)?,
