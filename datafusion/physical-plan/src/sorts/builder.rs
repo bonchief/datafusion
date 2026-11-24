@@ -3,11 +3,13 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use crate::spill::get_record_batch_memory_size;
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::compute::interleave;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use arrow::util::bit_util;
+use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 use log::warn;
@@ -31,6 +33,30 @@ impl BatchCursor {
 }
 
 /// Provides an API to incrementally build a [`RecordBatch`] from partitioned [`RecordBatch`]
+///
+/// # Memory accounting
+///
+/// The builder's reservation covers what the merge keeps alive and what it
+/// allocates, each exactly once:
+///
+/// * **Held input.** Every buffer of every live input batch is charged once,
+///   keyed by the address of its allocation, at the largest capacity seen
+///   for it. Slices, `take` and filter results of string view columns keep
+///   all variadic data buffers of their source, so many live batches (several
+///   sorted runs, or the slices of one run) can point at the same
+///   allocation; it is charged once, not once per batch. The charge belongs
+///   to the builder's buffer table, not to the batch that first brought the
+///   buffer: when that batch is released while another live batch still
+///   points at the buffer, the charge stays until the last live batch that
+///   references it is released. So nothing the builder keeps alive is ever
+///   uncharged, and nothing is charged twice.
+/// * **Output.** Before interleaving, the output is admitted at what
+///   interleaving newly allocates ([`fresh`]): a view column allocates its
+///   16-byte views and nulls and shares the data buffers already charged as
+///   held input. The admission is released once the batch is built; its
+///   consumer charges the batch on receipt, as it does any input batch.
+///   When the pool cannot admit the output, the builder emits half as many
+///   rows, down to one, before it fails.
 #[derive(Debug)]
 pub struct BatchBuilder {
     /// The schema of the RecordBatches yielded by this stream
@@ -48,10 +74,11 @@ pub struct BatchBuilder {
     /// starvation when concurrent sort partitions compete for pool memory.
     reservation: MemoryReservation,
 
-    /// Tracks the actual memory used by buffered batches (not including
-    /// pre-reserved bytes). This allows [`Self::push_batch`] to skip pool
-    /// allocation requests when the pre-reserved bytes cover the batch.
-    batches_mem_used: usize,
+    /// The buffers of the live batches, each counted once however many
+    /// live batches share it (not including pre-reserved bytes). Its total
+    /// lets [`Self::push_batch`] skip pool allocation requests when the
+    /// pre-reserved bytes cover the batch.
+    held: RecordBatchMemoryTracker,
 
     /// The initial reservation size at construction time. When the reservation
     /// is pre-loaded with `sort_spill_reservation_bytes` (via `take()`), this
@@ -82,20 +109,27 @@ impl BatchBuilder {
             cursors: vec![BatchCursor::RELEASED; stream_count],
             indices: Vec::with_capacity(batch_size),
             reservation,
-            batches_mem_used: 0,
+            held: RecordBatchMemoryTracker::new(),
             initial_reservation,
         }
     }
 
-    /// Append a new batch in `stream_idx`, returning its memory size
+    /// Append a new batch in `stream_idx`, returning its own memory size
+    /// (its buffers counted once, whether or not other live batches share
+    /// them). The reservation grows only by the buffers no live batch held.
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<usize> {
         let size = get_record_batch_memory_size(&batch);
-        self.batches_mem_used += size;
+        let width = fresh(&batch)?.div_ceil(batch.num_rows().max(1));
+        self.held.count_batch(&batch);
         // Only request additional memory from the pool when actual batch
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
-        try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
-        let width = fresh(&batch)?.div_ceil(batch.num_rows().max(1));
+        let held = self.held_bytes();
+        if let Err(e) = try_grow_reservation_to_at_least(&mut self.reservation, held) {
+            // The batch is not kept, so it no longer holds its buffers.
+            self.held.uncount_batch(&batch);
+            return Err(e);
+        }
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch, width));
         self.cursors[stream_idx] = BatchCursor {
@@ -119,6 +153,11 @@ impl BatchBuilder {
         let row_idx = cursor.row_idx;
         cursor.row_idx += 1;
         self.indices.push((cursor.batch_idx, row_idx));
+    }
+
+    /// Bytes of the buffers the live batches hold, each counted once
+    fn held_bytes(&self) -> usize {
+        self.held.memory_usage()
     }
 
     /// Returns the number of in-progress rows in this [`BatchBuilder`]
@@ -176,7 +215,7 @@ impl BatchBuilder {
         // initial_reservation to maintain the anti-starvation guarantee
         // for the merge phase. The output's admission ends here: its
         // consumer charges it on receipt, as it does any input batch.
-        let target = self.batches_mem_used.max(self.initial_reservation);
+        let target = self.held_bytes().max(self.initial_reservation);
         if self.reservation.size() > target {
             self.reservation.shrink(self.reservation.size() - target);
         }
@@ -205,7 +244,7 @@ impl BatchBuilder {
                 if is_cursor_batch {
                     *stream_cursor = BatchCursor::RELEASED;
                 }
-                self.batches_mem_used -= get_record_batch_memory_size(batch);
+                self.held.uncount_batch(batch);
             }
             retain
         });
@@ -236,7 +275,7 @@ impl BatchBuilder {
                 remap[batch_idx] = retained;
                 retained += 1;
             } else {
-                self.batches_mem_used -= get_record_batch_memory_size(batch);
+                self.held.uncount_batch(batch);
             }
             batch_idx += 1;
             retain
@@ -268,20 +307,31 @@ impl BatchBuilder {
         // Interleaving allocates the output before any consumer can charge
         // it. Admit it first, from the per-row bytes of each source batch,
         // so a pool that cannot hold it refuses instead of being exceeded.
-        let estimate = self
-            .indices
-            .iter()
-            .try_fold(0usize, |bytes, (batch_idx, _)| {
-                bytes.checked_add(self.batches[*batch_idx].2)
-            })
-            .ok_or_else(|| internal_datafusion_err!("merge output size overflow"))?;
-        try_grow_reservation_to_at_least(
-            &mut self.reservation,
-            self.batches_mem_used.saturating_add(estimate),
-        )?;
+        // A refused admission retries with half the rows, down to one.
+        let mut rows = self.indices.len();
+        loop {
+            let estimate = self.indices[..rows]
+                .iter()
+                .try_fold(0usize, |bytes, (batch_idx, _)| {
+                    bytes.checked_add(self.batches[*batch_idx].2)
+                })
+                .ok_or_else(|| internal_datafusion_err!("merge output size overflow"))?;
+            let needed = self.held_bytes().saturating_add(estimate);
+            match try_grow_reservation_to_at_least(&mut self.reservation, needed) {
+                Ok(()) => break,
+                Err(e @ DataFusionError::ResourcesExhausted(_)) if rows > 1 => {
+                    rows /= 2;
+                    warn!(
+                        "Merge output of {} rows refused memory, retrying with {rows}: {e}",
+                        self.indices.len()
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         let (rows_to_emit, columns) =
-            retry_interleave(self.indices.len(), self.indices.len(), |rows_to_emit| {
+            retry_interleave(rows, self.indices.len(), |rows_to_emit| {
                 self.try_interleave_columns(&self.indices[..rows_to_emit])
             })?;
 
@@ -289,13 +339,39 @@ impl BatchBuilder {
     }
 }
 
-/// Bytes a batch's rows occupy in freshly allocated buffers. Interleaving
-/// copies offsets, values and child arrays, but shares view data buffers,
-/// whose slice size counts only the views.
+/// Bytes a batch's rows occupy in the buffers interleaving them allocates.
+///
+/// Interleaving copies offsets, values and child arrays, but a view column
+/// shares its data buffers with its inputs (`interleave_views` keeps each
+/// referenced buffer by pointer) and allocates only its 16-byte views and
+/// nulls. A struct interleaves each child the same way. Every other type
+/// counts its slice size, which covers what interleaving copies.
+///
+/// The shared data buffers are not lost to the count: the builder charges
+/// them as held input while any live batch points at them, and the output's
+/// consumer charges them on receipt.
 fn fresh(batch: &RecordBatch) -> Result<usize> {
     batch.columns().iter().try_fold(0usize, |bytes, array| {
-        Ok(bytes + array.to_data().get_slice_memory_size()?)
+        Ok(bytes + fresh_data(&array.to_data())?)
     })
+}
+
+fn fresh_data(data: &ArrayData) -> Result<usize> {
+    let nulls = if data.nulls().is_some() {
+        bit_util::ceil(data.len(), 8)
+    } else {
+        0
+    };
+    match data.data_type() {
+        DataType::Utf8View | DataType::BinaryView => {
+            Ok(data.len() * size_of::<u128>() + nulls)
+        }
+        DataType::Struct(_) => data
+            .child_data()
+            .iter()
+            .try_fold(nulls, |bytes, child| Ok(bytes + fresh_data(child)?)),
+        _ => Ok(data.get_slice_memory_size()?),
+    }
 }
 
 /// Try to grow `reservation` so it covers at least `needed` bytes.
@@ -357,7 +433,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayDataBuilder, Int32Array, ListArray};
+    use arrow::array::{
+        Array, ArrayDataBuilder, AsArray, Int32Array, ListArray, StringViewArray,
+    };
+    use arrow::datatypes::Int32Type;
     use arrow::buffer::Buffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -439,7 +518,7 @@ mod tests {
 
         assert_eq!(builder.len(), 2);
         assert_eq!(builder.batches.len(), 2);
-        assert_eq!(builder.batches_mem_used, batch1_size + batch2_size);
+        assert_eq!(builder.held_bytes(), batch1_size + batch2_size);
         assert_eq!(builder.reservation.size(), batch1_size + batch2_size);
 
         push_n_rows(&mut builder, 0, 2);
@@ -448,7 +527,7 @@ mod tests {
 
         assert!(builder.is_empty());
         assert!(builder.batches.is_empty());
-        assert_eq!(builder.batches_mem_used, 0);
+        assert_eq!(builder.held_bytes(), 0);
         assert_eq!(builder.reservation.size(), 0);
     }
 
@@ -470,7 +549,7 @@ mod tests {
         let output = emit_n_rows(&mut builder, 1);
         assert_int_output(&output, &[20]);
         assert!(builder.batches.is_empty());
-        assert_eq!(builder.batches_mem_used, 0);
+        assert_eq!(builder.held_bytes(), 0);
         assert_eq!(builder.reservation.size(), 0);
     }
 
@@ -529,7 +608,7 @@ mod tests {
     }
 
     /// Interleaving allocates the output before its consumer can charge it,
-    /// so a pool without room for it refuses the build instead.
+    /// so a pool without room for it admits fewer rows instead.
     #[test]
     fn test_build_record_batch_admits_its_output_first() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -557,11 +636,154 @@ mod tests {
             builder.push_row(1);
         }
 
+        let output = builder.build_record_batch().unwrap().unwrap();
+
+        // 1024 bytes of room hold 256 of the 1024 pending Int32 rows.
+        assert_eq!(output.num_rows(), 256);
+        assert_eq!(builder.len(), 768);
+    }
+
+    /// A string view column of `rows` 64-byte values in one data buffer, cut
+    /// into `parts` slices that each keep that whole buffer.
+    fn shared_view_slices(rows: usize, parts: usize) -> (Vec<RecordBatch>, usize) {
+        let values = StringViewArray::from_iter_values(
+            (0..rows).map(|row| format!("{row:064}")),
+        );
+        let data = values.data_buffers().iter().map(|b| b.capacity()).sum();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+        let part = rows / parts;
+        let slices = (0..parts)
+            .map(|i| batch.slice(i * part, part))
+            .collect::<Vec<_>>();
+        (slices, data)
+    }
+
+    fn view_values(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .column(0)
+            .as_string_view()
+            .iter()
+            .map(|value| value.unwrap().to_string())
+            .collect()
+    }
+
+    /// Slices that share one large view data buffer are held at that buffer
+    /// once, and their output is admitted at its views, not at the buffer:
+    /// a merge of eight slices fits a pool of about twice the buffer.
+    #[test]
+    fn test_shared_view_buffers_are_charged_once() {
+        let (slices, data) = shared_view_slices(8192, 8);
+        let views = 8192 * size_of::<u128>();
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(data + 2 * views));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let schema = slices[0].schema();
+        let mut builder = BatchBuilder::new(schema, slices.len(), 8192, reservation);
+        // Charging each slice its buffers would ask for eight times `data`.
+        for (stream, slice) in slices.iter().enumerate() {
+            builder.push_batch(stream, slice.clone()).unwrap();
+        }
+        // The slices share the views buffer as well as the data buffers.
+        assert_eq!(builder.held_bytes(), data + views);
+        // Interleave the streams so the output draws from every slice.
+        for _ in 0..1024 {
+            for stream in (0..slices.len()).rev() {
+                builder.push_row(stream);
+            }
+        }
+
+        let output = builder.build_record_batch().unwrap().unwrap();
+
+        let part = |stream: usize, row: usize| format!("{:064}", stream * 1024 + row);
+        let expected = (0..1024)
+            .flat_map(|row| (0..8).rev().map(move |stream| part(stream, row)))
+            .collect::<Vec<_>>();
+        assert_eq!(view_values(&output), expected);
+        assert!(builder.batches.is_empty());
+        assert_eq!(builder.held_bytes(), 0);
+        assert_eq!(builder.reservation.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A buffer stays charged while any live batch points at it, even after
+    /// the batch that first brought it is released.
+    #[test]
+    fn test_shared_buffer_stays_charged_until_its_last_batch() {
+        let (slices, data) = shared_view_slices(1024, 2);
+        let schema = slices[0].schema();
+        let mut builder = BatchBuilder::new(schema, 2, 512, reservation());
+        builder.push_batch(0, slices[0].clone()).unwrap();
+        let first = builder.held_bytes();
+        assert_eq!(first, data + 1024 * size_of::<u128>());
+        // The second slice shares the first's views and data buffers.
+        builder.push_batch(1, slices[1].clone()).unwrap();
+        assert_eq!(builder.held_bytes(), first);
+
+        // Emitting all of stream 0 releases the first slice; stream 1 still
+        // points at the data buffer, so it stays charged.
+        push_n_rows(&mut builder, 0, 512);
+        let output = emit_n_rows(&mut builder, 512);
+        assert_eq!(output.num_rows(), 512);
+        assert_eq!(builder.batches.len(), 1);
+        assert_eq!(builder.held_bytes(), first);
+        assert_eq!(builder.reservation.size(), first);
+
+        push_n_rows(&mut builder, 1, 512);
+        let output = emit_n_rows(&mut builder, 512);
+        assert_eq!(view_values(&output)[0], format!("{:064}", 512));
+        assert_eq!(builder.held_bytes(), 0);
+        assert_eq!(builder.reservation.size(), 0);
+    }
+
+    /// An output the pool cannot admit whole is emitted in halves, and the
+    /// rows it keeps are emitted next, in order.
+    #[test]
+    fn test_refused_output_emits_fewer_rows() {
+        let batch = int_batch((0..1024).collect());
+        let held = get_record_batch_memory_size(&batch);
+        // Room for the held batch and a quarter of its rows as output.
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(held + 256 * size_of::<i32>()));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let mut builder = BatchBuilder::new(batch.schema(), 1, 1024, reservation);
+        builder.push_batch(0, batch).unwrap();
+        push_n_rows(&mut builder, 0, 1024);
+
+        let mut emitted = vec![];
+        while let Some(output) = builder.build_record_batch().unwrap() {
+            assert!(output.num_rows() <= 256, "{}", output.num_rows());
+            emitted.extend_from_slice(
+                output.column(0).as_primitive::<Int32Type>().values(),
+            );
+        }
+
+        assert_eq!(emitted, (0..1024).collect::<Vec<_>>());
+        assert_eq!(builder.held_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// When not even one row fits, the merge still fails.
+    #[test]
+    fn test_refused_single_row_fails() {
+        let batch = int_batch((0..1024).collect());
+        let held = get_record_batch_memory_size(&batch);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(held));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let mut builder = BatchBuilder::new(batch.schema(), 1, 1024, reservation);
+        builder.push_batch(0, batch).unwrap();
+        push_n_rows(&mut builder, 0, 1024);
+
         let error = builder.build_record_batch().unwrap_err();
 
         assert!(
             matches!(error, DataFusionError::ResourcesExhausted(_)),
             "{error}"
         );
+        assert_eq!(builder.len(), 1024);
     }
 }
