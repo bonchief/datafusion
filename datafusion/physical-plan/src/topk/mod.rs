@@ -24,7 +24,7 @@ use super::metrics::{
 use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{
     HashMap, Result, ScalarValue, internal_datafusion_err, internal_err,
@@ -114,6 +114,8 @@ pub struct TopK {
     scratch_rows: Rows,
     /// stores the top k values and their sort key values, in order
     heap: TopKHeap,
+    /// Materialize sparse view payloads when the winners fit in one batch.
+    compact_views: bool,
     /// row converter, for common keys between the sort keys and the input ordering
     common_sort_prefix_converter: Option<RowConverter>,
     /// Common sort prefix between the input and the sort expressions to allow early exit optimization
@@ -369,6 +371,10 @@ impl TopK {
         let reservation = MemoryConsumer::new(format!("TopK[{partition_id}]"))
             .register(&runtime.memory_pool);
 
+        let compact_views = k <= batch_size
+            && schema.fields().iter().any(|field| {
+                matches!(field.data_type(), DataType::BinaryView | DataType::Utf8View)
+            });
         let sort_fields = build_sort_fields(&expr, &schema)?;
 
         // TODO there is potential to add special cases for single column sort fields
@@ -393,6 +399,7 @@ impl TopK {
             row_converter,
             scratch_rows,
             heap: TopKHeap::new(k),
+            compact_views,
             common_sort_prefix_converter: common_prefix_row_converter,
             common_sort_prefix: Arc::from(common_sort_prefix),
             finished: false,
@@ -478,7 +485,7 @@ impl TopK {
             self.heap.insert_batch_entry(batch_entry);
 
             // conserve memory
-            self.heap.maybe_compact()?;
+            self.heap.maybe_compact(self.compact_views)?;
 
             // update memory reservation
             self.reservation.try_resize(self.size())?;
@@ -843,6 +850,7 @@ impl TopK {
             row_converter: _,
             scratch_rows: _,
             mut heap,
+            compact_views: _,
             common_sort_prefix_converter: _,
             common_sort_prefix: _,
             finished: _,
@@ -1051,9 +1059,10 @@ impl TopKHeap {
 
     /// Compact this heap, rewriting all stored batches into a single
     /// input batch
-    pub fn maybe_compact(&mut self) -> Result<()> {
-        // Don't compact if there's only one batch (compacting into itself is pointless)
-        if self.store.len() <= 1 {
+    pub fn maybe_compact(&mut self, compact_views: bool) -> Result<()> {
+        // A sparse view batch can pin its full backing buffers for a few rows.
+        // Materialize the winners before charging them to the heap.
+        if self.store.len() <= 1 && !compact_views {
             return Ok(());
         }
 
@@ -1075,6 +1084,12 @@ impl TopKHeap {
         let (new_batch, mut topk_rows) = self.emit_with_state()?;
         let Some(new_batch) = new_batch else {
             return Ok(());
+        };
+
+        let new_batch = if compact_views {
+            crate::repartition::compact(&new_batch)?
+        } else {
+            new_batch
         };
 
         // clear all old entries in store (this invalidates all
