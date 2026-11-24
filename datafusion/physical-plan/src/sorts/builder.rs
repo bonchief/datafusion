@@ -436,8 +436,8 @@ mod tests {
     use arrow::array::{
         Array, ArrayDataBuilder, AsArray, Int32Array, ListArray, StringViewArray,
     };
-    use arrow::datatypes::Int32Type;
     use arrow::buffer::Buffer;
+    use arrow::datatypes::Int32Type;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_execution::memory_pool::{
@@ -646,9 +646,8 @@ mod tests {
     /// A string view column of `rows` 64-byte values in one data buffer, cut
     /// into `parts` slices that each keep that whole buffer.
     fn shared_view_slices(rows: usize, parts: usize) -> (Vec<RecordBatch>, usize) {
-        let values = StringViewArray::from_iter_values(
-            (0..rows).map(|row| format!("{row:064}")),
-        );
+        let values =
+            StringViewArray::from_iter_values((0..rows).map(|row| format!("{row:064}")));
         let data = values.data_buffers().iter().map(|b| b.capacity()).sum();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -679,8 +678,7 @@ mod tests {
     fn test_shared_view_buffers_are_charged_once() {
         let (slices, data) = shared_view_slices(8192, 8);
         let views = 8192 * size_of::<u128>();
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(data + 2 * views));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(data + 2 * views));
         let reservation = MemoryConsumer::new("test").register(&pool);
         let schema = slices[0].schema();
         let mut builder = BatchBuilder::new(schema, slices.len(), 8192, reservation);
@@ -757,9 +755,8 @@ mod tests {
         let mut emitted = vec![];
         while let Some(output) = builder.build_record_batch().unwrap() {
             assert!(output.num_rows() <= 256, "{}", output.num_rows());
-            emitted.extend_from_slice(
-                output.column(0).as_primitive::<Int32Type>().values(),
-            );
+            emitted
+                .extend_from_slice(output.column(0).as_primitive::<Int32Type>().values());
         }
 
         assert_eq!(emitted, (0..1024).collect::<Vec<_>>());
