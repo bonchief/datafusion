@@ -831,15 +831,20 @@ fn intern_runs(
 }
 
 /// Marks the rows whose keys differ from the previous row's in any column,
-/// and always the first row. Returns `None` for fewer than two rows or when a
-/// key type is not compared, so the batch is interned as it is.
+/// and always the first row. Returns `None` for fewer than two rows, when a
+/// key type is not compared, or when a key's values are long (see
+/// [`LONG_KEY_BYTES`]), so the batch is interned as it is.
 ///
 /// Keys are compared with [`distinct`], which treats two nulls as equal, as
 /// grouping does, and compares floats by their bits, so it never joins two
 /// rows that [`GroupValues`] would keep apart.
 fn run_starts(cols: &[ArrayRef]) -> Result<Option<BooleanBuffer>> {
     let rows = cols.first().map_or(0, |col| col.len());
-    if rows < 2 || !cols.iter().all(|col| compares_runs(col.data_type())) {
+    if rows < 2
+        || !cols
+            .iter()
+            .all(|col| compares_runs(col.data_type()) && !long_values(col))
+    {
         return Ok(None);
     }
     let mut differs: Option<BooleanBuffer> = None;
@@ -857,6 +862,48 @@ fn run_starts(cols: &[ArrayRef]) -> Result<Option<BooleanBuffer>> {
         starts.append_buffer(&differs);
     }
     Ok(Some(starts.finish()))
+}
+
+/// Average bytes per value above which a batch's variable-width key column is
+/// not compared for runs, and the batch is interned as it is.
+///
+/// Comparing a row with its predecessor reads the bytes of every row, while
+/// it saves a lookup only on the rows that repeat. For short values the
+/// compare is a view or offset check and the saved lookups win at any repeat
+/// share run collapse accepts; for long values that share a prefix, as URLs
+/// do, the compare runs through the bytes and costs more than the lookups it
+/// saves. On ClickBench's hits table at 100M rows, collapsing URL (86 bytes on
+/// average, a fifth of rows repeating) made the partial aggregate 10% slower,
+/// while (UserID, SearchPhrase), whose phrase averages 8 bytes, kept a 13%
+/// gain. The length is read from the offsets or the views, before any compare.
+const LONG_KEY_BYTES: usize = 32;
+
+/// Whether `col` is a variable-width column whose values average more than
+/// [`LONG_KEY_BYTES`] bytes; fixed-width columns never are.
+fn long_values(col: &ArrayRef) -> bool {
+    let bytes = match col.data_type() {
+        DataType::Utf8 => offset_bytes(col.as_string::<i32>().value_offsets()),
+        DataType::LargeUtf8 => offset_bytes(col.as_string::<i64>().value_offsets()),
+        DataType::Binary => offset_bytes(col.as_binary::<i32>().value_offsets()),
+        DataType::LargeBinary => offset_bytes(col.as_binary::<i64>().value_offsets()),
+        DataType::Utf8View => view_bytes(col.as_string_view().views()),
+        DataType::BinaryView => view_bytes(col.as_binary_view().views()),
+        _ => return false,
+    };
+    bytes > LONG_KEY_BYTES.saturating_mul(col.len())
+}
+
+/// Bytes between an array's first and last offset.
+fn offset_bytes<O: arrow::array::OffsetSizeTrait>(offsets: &[O]) -> usize {
+    match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => (*last - *first).as_usize(),
+        _ => 0,
+    }
+}
+
+/// Sum of the lengths a view array's views hold, in their low 32 bits.
+fn view_bytes(views: &[u128]) -> usize {
+    views.iter().map(|view| *view as u32 as usize).sum()
 }
 
 /// Key types whose equality under [`distinct`] is the equality of their bytes.
@@ -1393,5 +1440,43 @@ mod tests {
             Some(1.5),
         ]));
         assert_eq!(assert_runs_match(schema, &[vec![a]]), vec![3]);
+    }
+
+    #[test]
+    fn intern_runs_does_not_compare_long_values() {
+        use arrow::array::{StringArray, StringViewArray};
+        let long = "https://example.com/a/path/that/is/longer/than/thirty-two/bytes";
+        let short = "phrase";
+        // Every row repeats its predecessor; only the length decides.
+        let rows = |value: &'static str| vec![value; 8];
+        let view =
+            |value| Schema::new(vec![Field::new(value, DataType::Utf8View, false)]);
+        let long_view: ArrayRef = Arc::new(StringViewArray::from(rows(long)));
+        let short_view: ArrayRef = Arc::new(StringViewArray::from(rows(short)));
+        assert_eq!(assert_runs_match(view("v"), &[vec![long_view]]), vec![0]);
+        assert_eq!(assert_runs_match(view("v"), &[vec![short_view]]), vec![7]);
+
+        // Offsets: a slice is measured by its own values, not its buffer's.
+        let mut values = rows(short);
+        values.extend(rows(long));
+        let utf8: ArrayRef = Arc::new(StringArray::from(values));
+        let schema = || Schema::new(vec![Field::new("s", DataType::Utf8, false)]);
+        assert_eq!(
+            assert_runs_match(schema(), &[vec![utf8.slice(0, 8)]]),
+            vec![7]
+        );
+        assert_eq!(
+            assert_runs_match(schema(), &[vec![utf8.slice(8, 8)]]),
+            vec![0]
+        );
+
+        // One long key column stops the whole batch, beside a short one.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("v", DataType::Utf8View, false),
+        ]);
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+        let v: ArrayRef = Arc::new(StringViewArray::from(rows(long)));
+        assert_eq!(assert_runs_match(schema, &[vec![a, v]]), vec![0]);
     }
 }
