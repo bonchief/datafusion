@@ -1554,7 +1554,9 @@ impl Scenario {
                 // that several of its inputs share once, so partitions of
                 // the same batches would hold one partition's memory.
                 let batches: Vec<Vec<_>> = (0..*partitions)
-                    .map(|_| maybe_split_batches(make_dict_batches(), *single_row_batches))
+                    .map(|_| {
+                        maybe_split_batches(make_dict_batches(), *single_row_batches)
+                    })
                     .collect();
 
                 let schema = batches[0][0].schema();
