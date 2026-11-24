@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::aggregates::group_values::{AccumulatorPhase, new_group_values};
 use crate::aggregates::order::GroupClustering;
 use crate::aggregates::{AggregateExec, evaluate_group_by};
+use crate::metrics;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, assert_eq_or_internal_err};
@@ -95,15 +96,19 @@ impl AggregateHashTable<PartialMarker> {
     }
 
     /// Partial aggregation consumes raw input rows and updates the table's
-    /// partial-state accumulators.
+    /// partial-state accumulators. A row whose group keys equal the row before
+    /// it in `batch` takes that row's group without a lookup, counted in
+    /// `collapsed_rows`.
     pub(in crate::aggregates) fn aggregate_batch(
         &mut self,
         batch: &RecordBatch,
+        collapsed_rows: &metrics::Count,
     ) -> Result<()> {
         self.aggregate_batch_inner(
             batch,
             HashAggregateAccumulator::update_batch,
             AccumulatorPhase::Update,
+            Some(collapsed_rows),
         )
     }
 

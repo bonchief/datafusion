@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use arrow::array::BooleanBufferBuilder;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, new_empty_array, new_null_array,
 };
-use arrow::compute::{filter_record_batch, prep_null_mask_filter};
-use arrow::datatypes::SchemaRef;
+use arrow::buffer::BooleanBuffer;
+use arrow::compute::kernels::cmp::distinct;
+use arrow::compute::{filter, filter_record_batch, prep_null_mask_filter};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
@@ -31,6 +34,7 @@ use crate::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy, aggregate_expressions,
     evaluate_group_by, group_id_array, max_duplicate_ordinal,
 };
+use crate::metrics;
 
 use super::AggregateTableMetrics;
 
@@ -262,22 +266,37 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     /// Each aggregation mode chooses a different `aggregate_fn` according to its
     /// semantics. For example, partial aggregation takes raw inputs, and update them
     /// into stored partial states, so [`GroupsAccumulator::update_batch`] is used.
+    ///
+    /// With `collapse`, a single grouping set's batch is interned by runs (see
+    /// [`intern_runs`]) and the rows that took their predecessor's group are
+    /// added to the counter.
     pub(super) fn aggregate_batch_inner(
         &mut self,
         batch: &RecordBatch,
         aggregate_fn: AggregateBatchFn,
         accumulator_phase: AccumulatorPhase,
+        collapse: Option<&metrics::Count>,
     ) -> Result<()> {
         let evaluated_batch = self.evaluate_batch(batch)?;
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
+        let collapse = collapse.filter(|_| evaluated_batch.grouping_set_args.len() == 1);
 
         for group_values in &evaluated_batch.grouping_set_args {
-            group_by_metrics.time_group_key_preparation(|| {
-                state
+            group_by_metrics.time_group_key_preparation(|| match collapse {
+                Some(collapsed) => {
+                    let rows = intern_runs(
+                        state.group_values.as_mut(),
+                        group_values,
+                        &mut state.batch_group_indices,
+                    )?;
+                    collapsed.add(rows);
+                    Ok(())
+                }
+                None => state
                     .group_values
-                    .intern(group_values, &mut state.batch_group_indices)
+                    .intern(group_values, &mut state.batch_group_indices),
             })?;
 
             // Register groups from the full input. Each filtered aggregate compacts
@@ -759,6 +778,103 @@ impl MaterializedAggregateOutput {
     }
 }
 
+/// A batch is interned by runs only when at least one row in this many repeats
+/// the row before it. Below that, the comparison is all the batch pays: taking
+/// the run starts would copy nearly every key for few saved lookups.
+const RUN_REPEAT_SHARE: usize = 8;
+
+/// Interns `cols` into `group_values` and writes one group index per row to
+/// `groups`, giving a row whose keys all equal the previous row's that row's
+/// group without hashing or probing it. Returns how many rows did so.
+///
+/// Input that is sorted or clustered on a prefix that includes or determines
+/// the keys arrives in runs of equal keys; such a row would be a table hit
+/// anyway, so the groups and their order are exactly those of
+/// [`GroupValues::intern`] over the whole batch. Runs never cross batches: the
+/// first row of every batch is interned.
+fn intern_runs(
+    group_values: &mut dyn GroupValues,
+    cols: &[ArrayRef],
+    groups: &mut Vec<usize>,
+) -> Result<usize> {
+    let Some(starts) = run_starts(cols)? else {
+        group_values.intern(cols, groups)?;
+        return Ok(0);
+    };
+    let rows = starts.len();
+    let heads = starts.count_set_bits();
+    let repeats = rows - heads;
+    if repeats * RUN_REPEAT_SHARE < rows {
+        group_values.intern(cols, groups)?;
+        return Ok(0);
+    }
+
+    let starts = BooleanArray::new(starts, None);
+    let keys = cols
+        .iter()
+        .map(|col| filter(col, &starts))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    group_values.intern(&keys, groups)?;
+
+    // Spread the run starts' groups over their runs in place, from the back:
+    // the start of row `row`'s run sits at `run <= row`, which is not yet
+    // overwritten.
+    groups.resize(rows, 0);
+    let mut run = heads;
+    for row in (0..rows).rev() {
+        groups[row] = groups[run - 1];
+        if starts.value(row) {
+            run -= 1;
+        }
+    }
+    Ok(repeats)
+}
+
+/// Marks the rows whose keys differ from the previous row's in any column,
+/// and always the first row. Returns `None` for fewer than two rows or when a
+/// key type is not compared, so the batch is interned as it is.
+///
+/// Keys are compared with [`distinct`], which treats two nulls as equal, as
+/// grouping does, and compares floats by their bits, so it never joins two
+/// rows that [`GroupValues`] would keep apart.
+fn run_starts(cols: &[ArrayRef]) -> Result<Option<BooleanBuffer>> {
+    let rows = cols.first().map_or(0, |col| col.len());
+    if rows < 2 || !cols.iter().all(|col| compares_runs(col.data_type())) {
+        return Ok(None);
+    }
+    let mut differs: Option<BooleanBuffer> = None;
+    for col in cols {
+        let next = distinct(&col.slice(1, rows - 1), &col.slice(0, rows - 1))?;
+        let next = next.values();
+        differs = Some(match differs {
+            Some(differs) => &differs | next,
+            None => next.clone(),
+        });
+    }
+    let mut starts = BooleanBufferBuilder::new(rows);
+    starts.append(true);
+    if let Some(differs) = differs {
+        starts.append_buffer(&differs);
+    }
+    Ok(Some(starts.finish()))
+}
+
+/// Key types whose equality under [`distinct`] is the equality of their bytes.
+fn compares_runs(data_type: &DataType) -> bool {
+    data_type.is_primitive()
+        || matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+        )
+}
+
 /// Compacts row-aligned group indices using an aggregate filter.
 ///
 /// Returns `None` when every row is selected so callers can reuse the input
@@ -1164,5 +1280,118 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         (0..array.len()).map(|idx| array.value(idx)).collect()
+    }
+
+    /// Interns `batches` in order, by runs and as they are, into fresh group
+    /// values for `schema`, and asserts both give the same group of every row
+    /// and the same groups. Returns the rows collapsed per batch.
+    fn assert_runs_match(schema: Schema, batches: &[Vec<ArrayRef>]) -> Vec<usize> {
+        let schema = Arc::new(schema);
+        let mut runs =
+            new_group_values(Arc::clone(&schema), &GroupClustering::None).unwrap();
+        let mut plain = new_group_values(schema, &GroupClustering::None).unwrap();
+        let (mut by_runs, mut as_is) = (vec![], vec![]);
+        let collapsed = batches
+            .iter()
+            .map(|cols| {
+                let collapsed = intern_runs(runs.as_mut(), cols, &mut by_runs).unwrap();
+                plain.intern(cols, &mut as_is).unwrap();
+                assert_eq!(by_runs, as_is);
+                collapsed
+            })
+            .collect();
+        let (runs, plain) = (
+            runs.emit(EmitTo::All).unwrap(),
+            plain.emit(EmitTo::All).unwrap(),
+        );
+        assert_eq!(runs.len(), plain.len());
+        for (runs, plain) in runs.iter().zip(&plain) {
+            assert_eq!(runs.to_data(), plain.to_data());
+        }
+        collapsed
+    }
+
+    #[test]
+    fn intern_runs_matches_intern_with_nulls_and_two_keys() {
+        use arrow::array::StringViewArray;
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8View, true),
+        ]);
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![
+            None,
+            None,
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            None,
+            Some(2),
+            Some(2),
+        ]));
+        let b: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("x"),
+            Some("x"),
+            None,
+            None,
+            Some("a value longer than twelve bytes"),
+            Some("a value longer than twelve bytes"),
+            Some("a value longer than twelve bytes"),
+            Some("x"),
+            None,
+            Some("x"),
+        ]));
+        // Repeats: rows 1, 3, 5. Row 6 differs in `a` only, row 9 in `b` only.
+        assert_eq!(assert_runs_match(schema, &[vec![a, b]]), vec![3]);
+    }
+
+    #[test]
+    fn intern_runs_does_not_collapse_across_batches() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let first: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2, 2]));
+        let second: ArrayRef = Arc::new(Int64Array::from(vec![2, 2, 3, 3]));
+        // The second batch's first row repeats the first batch's last row but
+        // is interned; it finds the group the first batch made.
+        assert_eq!(
+            assert_runs_match(schema, &[vec![first], vec![second]]),
+            vec![2, 2]
+        );
+    }
+
+    #[test]
+    fn intern_runs_interns_a_batch_that_barely_repeats_as_it_is() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+        // One repeat in 16 rows is under an eighth.
+        let mut values = (0..16).collect::<Vec<i64>>();
+        values[8] = 7;
+        let barely: ArrayRef = Arc::new(Int64Array::from(values));
+        // Two repeats in 16 rows is an eighth.
+        let mut values = (0..16).collect::<Vec<i64>>();
+        values[8] = 7;
+        values[12] = 11;
+        let enough: ArrayRef = Arc::new(Int64Array::from(values));
+        let single: ArrayRef = Arc::new(Int64Array::from(vec![5]));
+        assert_eq!(
+            assert_runs_match(schema, &[vec![barely], vec![enough], vec![single]]),
+            vec![0, 2, 0]
+        );
+    }
+
+    #[test]
+    fn intern_runs_compares_floats_by_their_bits() {
+        use arrow::array::Float64Array;
+        let schema = Schema::new(vec![Field::new("a", DataType::Float64, true)]);
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(f64::NAN),
+            None,
+            None,
+            Some(1.5),
+            Some(1.5),
+        ]));
+        assert_eq!(assert_runs_match(schema, &[vec![a]]), vec![3]);
     }
 }

@@ -150,6 +150,9 @@ pub(crate) struct PartialHashAggregateStream {
     /// Number of times accumulated states were emitted due to memory pressure.
     early_emit_count: metrics::Count,
 
+    /// Input rows that took the group of the row before them without a lookup.
+    collapsed_rows: metrics::Count,
+
     /// Optional thresholds for emitting partial states before memory pressure.
     table_flush: Option<PartialTableFlush>,
 
@@ -240,6 +243,9 @@ impl PartialHashAggregateStream {
             .ratio_metrics("reduction_factor", partition);
         let early_emit_count =
             MetricBuilder::new(&agg.metrics).counter("early_emit_count", partition);
+        let collapsed_rows = MetricBuilder::new(&agg.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("collapsed_rows", partition);
 
         let execution_options = &context.session_config().options().execution;
         let flush_batch = execution_options.partial_aggregation_flush_batch
@@ -327,6 +333,7 @@ impl PartialHashAggregateStream {
             reservation,
             reduction_factor,
             early_emit_count,
+            collapsed_rows,
             table_flush,
             skip_aggregation_probe,
             group_values_soft_limit,
@@ -510,7 +517,7 @@ impl PartialHashAggregateStream {
         let input_rows = batch.num_rows();
         self.reduction_factor.add_total(input_rows);
         let groups_before = hash_table.building_group_count();
-        hash_table.aggregate_batch(batch)?;
+        hash_table.aggregate_batch(batch, &self.collapsed_rows)?;
 
         // --------------------------------
         // Step 2: Soft limit optimization

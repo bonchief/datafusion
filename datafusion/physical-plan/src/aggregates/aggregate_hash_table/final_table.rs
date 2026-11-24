@@ -88,6 +88,7 @@ impl AggregateHashTable<FinalMarker> {
             batch,
             HashAggregateAccumulator::merge_batch,
             AccumulatorPhase::Merge,
+            None,
         )
     }
 

@@ -61,6 +61,7 @@ impl AggregateHashTable<SingleMarker> {
             batch,
             HashAggregateAccumulator::update_batch,
             AccumulatorPhase::Update,
+            None,
         )
     }
 

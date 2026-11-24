@@ -56,6 +56,7 @@ impl AggregateHashTable<PartialReduceMarker> {
             batch,
             HashAggregateAccumulator::merge_batch,
             AccumulatorPhase::Merge,
+            None,
         )
     }
 
