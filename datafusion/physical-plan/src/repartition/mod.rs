@@ -322,9 +322,14 @@ impl OutputChannel {
         Ok(())
     }
     /// Appends the batches that are ready to send to `out`.
-    fn coalesce(&mut self, batch: RecordBatch, out: &mut Vec<RecordBatch>) -> Result<()> {
+    fn coalesce(
+        &mut self,
+        batch: RecordBatch,
+        out: &mut Vec<RecordBatch>,
+        metrics: &RepartitionMetrics,
+    ) -> Result<()> {
         match &self.shared_coalescer {
-            Some(shared) => shared.push_and_drain(batch, out),
+            Some(shared) => shared.push_and_drain(batch, out, metrics),
             None => {
                 out.push(batch);
                 Ok(())
@@ -459,12 +464,24 @@ impl SharedCoalescer {
 
     /// Push `batch` into the coalescer and drain any newly completed
     /// batches into `out`. The mutex is held only briefly.
+    ///
+    /// Counts the push in `coalesce_pushes`, and in `coalesce_contended`
+    /// when another producer held the lock: the lock is tried first, and
+    /// only a failed try waits as a plain `lock` would.
     fn push_and_drain(
         &self,
         batch: RecordBatch,
         out: &mut Vec<RecordBatch>,
+        metrics: &RepartitionMetrics,
     ) -> Result<()> {
-        let mut c = self.inner.lock();
+        metrics.coalesce_pushes.add(1);
+        let mut c = match self.inner.try_lock() {
+            Some(c) => c,
+            None => {
+                metrics.coalesce_contended.add(1);
+                self.inner.lock()
+            }
+        };
         c.push_batch(batch)?;
         while let Some(b) = c.next_completed_batch() {
             out.push(b);
@@ -1787,6 +1804,13 @@ struct RepartitionMetrics {
     ///
     /// One metric per output partition.
     send_time: Vec<metrics::Time>,
+    /// Time in nanos spent pushing rows into the outputs' shared coalescers,
+    /// waiting for their locks included. Part of `send_time`.
+    coalesce_time: metrics::Time,
+    /// Pushes into the outputs' shared coalescers.
+    coalesce_pushes: metrics::Count,
+    /// Pushes that found the output's coalescer locked by another producer.
+    coalesce_contended: metrics::Count,
 }
 
 impl RepartitionMetrics {
@@ -1818,6 +1842,12 @@ impl RepartitionMetrics {
             fetch_time,
             repartition_time,
             send_time,
+            coalesce_time: MetricBuilder::new(metrics)
+                .subset_time("coalesce_time", input_partition),
+            coalesce_pushes: MetricBuilder::new(metrics)
+                .counter("coalesce_pushes", input_partition),
+            coalesce_contended: MetricBuilder::new(metrics)
+                .counter("coalesce_contended", input_partition),
         }
     }
 }
@@ -2669,7 +2699,9 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    output_channel.coalesce(batch, &mut coalesced)?;
+                    let coalesce = metrics.coalesce_time.timer();
+                    output_channel.coalesce(batch, &mut coalesced, &metrics)?;
+                    coalesce.done();
                     for batch in coalesced.drain(..) {
                         if output_channel.send(batch, true).await.is_err() {
                             // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
@@ -4215,6 +4247,38 @@ mod tests {
                 inner: Arc::new(self.clone()),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn coalesce_metrics_count_pushes() -> Result<()> {
+        let schema = test_schema(false);
+        let partitions = vec![create_vec_batches(50), create_vec_batches(50)];
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![col("c0", &schema)?], 4),
+        )?;
+        let task = Arc::new(TaskContext::default());
+        for partition in 0..4 {
+            let _: Vec<_> = exec
+                .execute(partition, Arc::clone(&task))?
+                .try_collect()
+                .await?;
+        }
+        let metrics = exec.metrics().unwrap();
+        let pushes = metrics.sum_by_name("coalesce_pushes").unwrap().as_usize();
+        let contended = metrics
+            .sum_by_name("coalesce_contended")
+            .unwrap()
+            .as_usize();
+        assert!(pushes > 0, "no push counted");
+        assert!(
+            contended <= pushes,
+            "{contended} contended of {pushes} pushes"
+        );
+        assert!(metrics.sum_by_name("coalesce_time").is_some());
+        Ok(())
     }
 
     #[tokio::test]
