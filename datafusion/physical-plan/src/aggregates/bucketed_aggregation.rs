@@ -82,7 +82,8 @@ impl BucketedAggregation {
         let bucket_compactions =
             MetricBuilder::new(&agg.metrics).counter("bucket_compactions", partition);
         let route_metrics = RouteMetrics {
-            rows: MetricBuilder::new(&agg.metrics).counter("bucket_routed_rows", partition),
+            rows: MetricBuilder::new(&agg.metrics)
+                .counter("bucket_routed_rows", partition),
             bytes: MetricBuilder::new(&agg.metrics)
                 .counter("bucket_routed_bytes", partition),
         };

@@ -10,11 +10,12 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use arrow::array::NullBufferBuilder;
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, BooleanBufferBuilder,
     GenericByteViewArray, PrimitiveArray, downcast_primitive,
 };
-use arrow::buffer::{Buffer, NullBuffer, NullBufferBuilder, ScalarBuffer};
+use arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 
 use super::final_buckets::NUM_BUCKETS;
@@ -81,7 +82,9 @@ pub(super) fn scatter_column(data_type: &DataType) -> Option<Box<dyn ScatterColu
 }
 
 fn new_nulls() -> Vec<NullBufferBuilder> {
-    (0..NUM_BUCKETS).map(|_| NullBufferBuilder::new(0)).collect()
+    (0..NUM_BUCKETS)
+        .map(|_| NullBufferBuilder::new(0))
+        .collect()
 }
 
 /// Appends the validity of the routed rows to their buckets. Returns the
@@ -234,11 +237,9 @@ impl ScatterColumn for BooleanScatter {
     }
 
     fn finish(&mut self, bucket: usize) -> ArrayRef {
-        let values = std::mem::replace(
-            &mut self.values[bucket],
-            BooleanBufferBuilder::new(0),
-        )
-        .finish();
+        let values =
+            std::mem::replace(&mut self.values[bucket], BooleanBufferBuilder::new(0))
+                .finish();
         Arc::new(BooleanArray::new(values, self.nulls[bucket].finish()))
     }
 
@@ -288,13 +289,13 @@ impl ViewBucket {
     }
 }
 
-struct ViewScatter<T: ByteViewType + ?Sized> {
+struct ViewScatter<T: ByteViewType> {
     buckets: Vec<ViewBucket>,
     nulls: Vec<NullBufferBuilder>,
     _type: PhantomData<T>,
 }
 
-impl<T: ByteViewType + ?Sized> ViewScatter<T> {
+impl<T: ByteViewType> ViewScatter<T> {
     fn new() -> Self {
         Self {
             buckets: (0..NUM_BUCKETS).map(|_| ViewBucket::default()).collect(),
@@ -304,7 +305,7 @@ impl<T: ByteViewType + ?Sized> ViewScatter<T> {
     }
 }
 
-impl<T: ByteViewType + ?Sized> ScatterColumn for ViewScatter<T> {
+impl<T: ByteViewType> ScatterColumn for ViewScatter<T> {
     fn reserve(&mut self, bucket: usize, rows: usize, at_least: usize) {
         reserve_vec(&mut self.buckets[bucket].views, rows, at_least);
     }

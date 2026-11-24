@@ -415,7 +415,9 @@ impl FinalBuckets {
     fn pending_size(&self, index: usize) -> usize {
         match (&self.buckets[index].coalescer, &self.scatter) {
             (Some(coalescer), _) => coalescer.size(),
-            (None, Some(columns)) => columns.iter().map(|column| column.size(index)).sum(),
+            (None, Some(columns)) => {
+                columns.iter().map(|column| column.size(index)).sum()
+            }
             (None, None) => 0,
         }
     }
@@ -550,7 +552,9 @@ impl FinalBuckets {
                 let bucket = &self.buckets[index];
                 bucket.spill_file.is_none() && bucket.rows > 0
             })
-            .max_by_key(|&index| self.buckets[index].batches_bytes + self.pending_size(index))
+            .max_by_key(|&index| {
+                self.buckets[index].batches_bytes + self.pending_size(index)
+            })
         else {
             return Ok(false);
         };
@@ -711,7 +715,8 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("v", DataType::Int64, false),
         ]));
-        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
+        let mut buckets =
+            FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
         // the same keys arrive in two different batches
         buckets.route(&test_batch(&schema, 0..20_000))?;
         buckets.route(&test_batch(&schema, 10_000..30_000))?;
@@ -755,17 +760,278 @@ mod tests {
             Field::new("v", DataType::Int64, false),
         ]));
         // Rows of one level-0 bucket must spread again at level 1
-        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
+        let mut level0 =
+            FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
         level0.route(&test_batch(&schema, 0..50_000))?;
         let source = level0.into_sources()?.swap_remove(0);
         let BucketSource::Memory { batches, .. } = source else {
             unreachable!()
         };
-        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
+        let mut level1 =
+            FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
         for batch in &batches {
             level1.route(batch)?;
         }
         assert!(level1.into_sources()?.len() > NUM_BUCKETS / 2);
+        Ok(())
+    }
+
+    /// A batch of every column type the scatter writes, with nulls, empty
+    /// strings, inline strings and strings longer than a block
+    fn typed_batch(schema: &SchemaRef, keys: std::ops::Range<i64>) -> RecordBatch {
+        use arrow::array::{
+            BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Float64Array,
+            Int8Array, Int32Array, StringViewArray, TimestampMicrosecondArray,
+            UInt64Array,
+        };
+        let text = |k: i64| match k % 7 {
+            0 => None,
+            1 => Some(String::new()),
+            2 => Some(format!("s{k}")),
+            3 => Some("x".repeat(20_000 + (k % 13) as usize)),
+            _ => Some(format!("a string longer than twelve bytes {k}")),
+        };
+        let nullable = |k: i64| (k % 5 != 0).then_some(k);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(keys.clone().map(|k| k % 3001))),
+            Arc::new(StringViewArray::from_iter(keys.clone().map(text))),
+            Arc::new(Int8Array::from_iter(
+                keys.clone().map(|k| nullable(k).map(|k| k as i8)),
+            )),
+            Arc::new(Int32Array::from_iter(
+                keys.clone().map(|k| nullable(k).map(|k| k as i32)),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                keys.clone().map(|k| k as u64),
+            )),
+            Arc::new(Float64Array::from_iter(
+                keys.clone().map(|k| nullable(k).map(|k| k as f64 / 3.0)),
+            )),
+            Arc::new(
+                Decimal128Array::from_iter(
+                    keys.clone().map(|k| nullable(k).map(i128::from)),
+                )
+                .with_precision_and_scale(38, 4)
+                .unwrap(),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from_iter(keys.clone().map(nullable))
+                    .with_timezone("+01:00"),
+            ),
+            Arc::new(Date32Array::from_iter_values(
+                keys.clone().map(|k| k as i32),
+            )),
+            Arc::new(BooleanArray::from_iter(
+                keys.clone().map(|k| (k % 3 != 0).then_some(k % 2 == 0)),
+            )),
+            Arc::new(BinaryViewArray::from_iter(
+                keys.clone().map(|k| text(k + 1).map(String::into_bytes)),
+            )),
+        ];
+        RecordBatch::try_new(Arc::clone(schema), columns).unwrap()
+    }
+
+    fn typed_schema() -> SchemaRef {
+        use arrow::datatypes::TimeUnit;
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("u64", DataType::UInt64, false),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("dec", DataType::Decimal128(38, 4), true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into())),
+                true,
+            ),
+            Field::new("date", DataType::Date32, false),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("bin", DataType::BinaryView, true),
+        ]))
+    }
+
+    /// The buckets of `schema`, routed by scatter or the general way
+    fn buckets_of(
+        schema: &SchemaRef,
+        batch_size: usize,
+        level: u32,
+        scatter: bool,
+        spill_manager: Option<SpillManager>,
+    ) -> FinalBuckets {
+        let columns = scatter.then(|| {
+            schema
+                .fields()
+                .iter()
+                .map(|field| scatter_column(field.data_type()).unwrap())
+                .collect()
+        });
+        FinalBuckets::with_scatter(
+            schema,
+            2,
+            batch_size,
+            level,
+            spill_manager,
+            RouteMetrics::default(),
+            columns,
+        )
+    }
+
+    /// Every bucket's batches, in order
+    async fn read_buckets(
+        buckets: FinalBuckets,
+        schema: &SchemaRef,
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        let mut out = vec![];
+        for source in buckets.into_sources()? {
+            let mut stream = source.into_stream(schema);
+            let mut batches = vec![];
+            while let Some(batch) = stream.next().await.transpose()? {
+                batches.push(batch);
+            }
+            out.push(batches);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn scattered_rows_equal_the_general_route() -> Result<()> {
+        let schema = typed_schema();
+        // 7 rows per batch: a bucket hands off several batches per input.
+        // 100: a bucket fills over several inputs.
+        for batch_size in [7, 100] {
+            let mut scattered = buckets_of(&schema, batch_size, 0, true, None);
+            let mut taken = buckets_of(&schema, batch_size, 0, false, None);
+            for keys in [0..3000, 3000..3001, 1500..6500] {
+                let batch = typed_batch(&schema, keys);
+                scattered.route(&batch)?;
+                taken.route(&batch)?;
+            }
+            scattered.route(&typed_batch(&schema, 0..0))?;
+
+            // The rows of a bucket taken for compaction, mid-input
+            let index = scattered.bucket_to_compact().unwrap_or(0);
+            assert_eq!(
+                scattered.take_bucket(index)?,
+                taken.take_bucket(index)?,
+                "taken bucket {index} at batch size {batch_size}"
+            );
+            scattered.put_compacted(index, None, 0);
+            taken.put_compacted(index, None, 0);
+
+            let batch = typed_batch(&schema, 9000..12_000);
+            scattered.route(&batch)?;
+            taken.route(&batch)?;
+
+            let scattered = read_buckets(scattered, &schema).await?;
+            let taken = read_buckets(taken, &schema).await?;
+            assert_eq!(scattered.len(), taken.len());
+            for (scattered, taken) in scattered.iter().zip(&taken) {
+                assert_eq!(scattered, taken, "batch size {batch_size}");
+                // Every batch but the last is full
+                for batch in &scattered[..scattered.len() - 1] {
+                    assert_eq!(batch.num_rows(), batch_size);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_resplit_scatters_as_the_general_route_does() -> Result<()> {
+        let schema = typed_schema();
+        let mut level0 = buckets_of(&schema, 64, 0, true, None);
+        level0.route(&typed_batch(&schema, 0..20_000))?;
+        let bucket = read_buckets(level0, &schema).await?.swap_remove(0);
+
+        let mut scattered = buckets_of(&schema, 64, 1, true, None);
+        let mut taken = buckets_of(&schema, 64, 1, false, None);
+        for batch in &bucket {
+            scattered.route(batch)?;
+            taken.route(batch)?;
+        }
+        let scattered = read_buckets(scattered, &schema).await?;
+        assert!(scattered.len() > NUM_BUCKETS / 4, "rows spread again");
+        assert_eq!(scattered, read_buckets(taken, &schema).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spilled_buckets_get_the_same_rows() -> Result<()> {
+        use crate::metrics::ExecutionPlanMetricsSet;
+        use crate::spill::spill_manager::SpillManager;
+        use datafusion_execution::runtime_env::RuntimeEnv;
+
+        let schema = typed_schema();
+        let spill_manager = || {
+            Some(SpillManager::new(
+                Arc::new(RuntimeEnv::default()),
+                crate::metrics::SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                Arc::clone(&schema),
+            ))
+        };
+        let mut scattered = buckets_of(&schema, 50, 0, true, spill_manager());
+        let mut taken = buckets_of(&schema, 50, 0, false, spill_manager());
+        for keys in [0..4000, 4000..8000, 8000..9000] {
+            let batch = typed_batch(&schema, keys);
+            scattered.route(&batch)?;
+            taken.route(&batch)?;
+            assert!(scattered.spill_largest()?);
+            assert!(taken.spill_largest()?);
+        }
+        let scattered = read_buckets(scattered, &schema).await?;
+        let taken = read_buckets(taken, &schema).await?;
+        assert_eq!(scattered.len(), taken.len());
+        for (scattered, taken) in scattered.iter().zip(&taken) {
+            let concat = |batches: &[RecordBatch]| {
+                arrow::compute::concat_batches(&schema, batches).unwrap()
+            };
+            assert_eq!(concat(scattered), concat(taken));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_column_the_scatter_cannot_write_routes_the_general_way() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut buckets =
+            FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
+        assert!(buckets.scatter.is_none());
+        buckets.route(&test_batch(&schema, 0..1000))?;
+        assert!(
+            buckets
+                .buckets
+                .iter()
+                .all(|bucket| bucket.coalescer.is_some())
+        );
+
+        let typed =
+            FinalBuckets::new(&typed_schema(), 2, 1024, 0, None, RouteMetrics::default());
+        assert!(typed.scatter.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn route_metrics_count_rows_and_bytes() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let metrics = RouteMetrics::default();
+        let mut buckets = FinalBuckets::new(&schema, 1, 128, 0, None, metrics.clone());
+        let keys: Int64Array = (0..1000).collect::<Vec<i64>>().into();
+        let counts = arrow::array::Int32Array::from_iter_values(0..1000);
+        buckets.route(&RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(keys), Arc::new(counts)],
+        )?)?;
+        assert_eq!(metrics.rows.value(), 1000);
+        assert_eq!(metrics.bytes.value(), 1000 * 12);
         Ok(())
     }
 }
