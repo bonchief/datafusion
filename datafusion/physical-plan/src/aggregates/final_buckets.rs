@@ -18,7 +18,9 @@ use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_execution::async_try_stream;
 use futures::StreamExt;
 
+use super::bucket_scatter::{ScatterColumn, scatter_column};
 use crate::SendableRecordBatchStream;
+use crate::metrics::Count;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
@@ -27,7 +29,7 @@ use crate::stream::RecordBatchStreamAdapter;
 const BUCKET_BITS: u32 = 6;
 
 /// Number of buckets rows are split into at each level.
-const NUM_BUCKETS: usize = 1 << BUCKET_BITS;
+pub(super) const NUM_BUCKETS: usize = 1 << BUCKET_BITS;
 
 /// A bucket that is still too large is split again with the next hash bits,
 /// up to this many levels.
@@ -66,7 +68,12 @@ const POOR_COMPACTION_FACTOR: f64 = 4.0;
 /// One hash bucket: its completed batches, held in memory or appended to a
 /// spill file, plus the rows not yet forming a full batch.
 struct Bucket {
-    coalescer: BatchCoalescer,
+    /// The rows not yet forming a full batch, when they are routed the
+    /// general way. `None` when [`FinalBuckets`] scatters them, and then
+    /// `pending` of them are held by its scatter columns.
+    coalescer: Option<BatchCoalescer>,
+    /// Rows in progress in the scatter columns
+    pending: usize,
     batches: VecDeque<RecordBatch>,
     /// Memory held by `batches`
     batches_bytes: usize,
@@ -99,20 +106,56 @@ struct Bucket {
 /// so the buffered rows stay within a small multiple of the groups they hold,
 /// and waits much longer after a compaction that found nothing to merge, so
 /// input that does not reduce is not aggregated over and over.
+///
+/// # Routing
+///
+/// A row's bucket is picked by bits of a hash of its group keys. When every
+/// column of the schema is a fixed-width primitive, a boolean or a view, a
+/// routed batch is read once in row order and each row is appended to its
+/// bucket's rows in progress ([`ScatterColumn`]), which are handed over as
+/// one of the bucket's batches when they reach `batch_size` rows. Otherwise
+/// the batch is sorted by bucket with one `take` and each bucket's slice is
+/// pushed into a `BatchCoalescer` of its own. Both write the same rows to the
+/// same bucket, in the order they arrive, in batches of `batch_size` rows
+/// (except a bucket's last one), so a bucket's aggregation sees the same
+/// batches either way.
 pub(super) struct FinalBuckets {
     /// Bucketing level, selects which bits of the routing hash are used
     level: u32,
     /// Number of leading columns of a batch that are the group keys
     num_group_columns: usize,
     buckets: Vec<Bucket>,
+    /// Schema of the rows held, and of the batches handed over
+    schema: SchemaRef,
+    /// The rows in progress of every bucket, one per column, if every column
+    /// can be scattered. See the routing section above.
+    scatter: Option<Vec<Box<dyn ScatterColumn>>>,
     /// `None` if spilling is not supported by the configured `DiskManager`
     spill_manager: Option<SpillManager>,
     batch_size: usize,
     min_compaction_rows: usize,
+    metrics: RouteMetrics,
     /// Reused buffers
     hashes: Vec<u64>,
+    /// The bucket of every row of the batch being routed
+    ids: Vec<u8>,
+    /// Rows after which a bucket is full, with that bucket
+    cuts: Vec<(usize, usize)>,
     bucket_sizes: Vec<u32>,
     reordered_indices: Vec<u32>,
+}
+
+/// What [`FinalBuckets::route`] reports, so a plan shows the payload that
+/// moves through the buckets.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RouteMetrics {
+    /// Rows routed into buckets
+    pub(super) rows: Count,
+    /// Bytes the routing wrote: each scattered row's values, validity bits
+    /// and long string bytes once; for a batch routed the general way, an
+    /// estimate of twice the memory of its sorted copy (the `take`, then the
+    /// coalescer).
+    pub(super) bytes: Count,
 }
 
 impl FinalBuckets {
@@ -122,12 +165,41 @@ impl FinalBuckets {
         batch_size: usize,
         level: u32,
         spill_manager: Option<SpillManager>,
+        metrics: RouteMetrics,
+    ) -> Self {
+        let scatter = schema
+            .fields()
+            .iter()
+            .map(|field| scatter_column(field.data_type()))
+            .collect();
+        Self::with_scatter(
+            schema,
+            num_group_columns,
+            batch_size,
+            level,
+            spill_manager,
+            metrics,
+            scatter,
+        )
+    }
+
+    fn with_scatter(
+        schema: &SchemaRef,
+        num_group_columns: usize,
+        batch_size: usize,
+        level: u32,
+        spill_manager: Option<SpillManager>,
+        metrics: RouteMetrics,
+        scatter: Option<Vec<Box<dyn ScatterColumn>>>,
     ) -> Self {
         debug_assert!(level < MAX_BUCKET_LEVELS);
         let min_compaction_rows = MIN_COMPACTION_BATCHES * batch_size;
         let buckets = (0..NUM_BUCKETS)
             .map(|_| Bucket {
-                coalescer: BatchCoalescer::new(Arc::clone(schema), batch_size),
+                coalescer: scatter
+                    .is_none()
+                    .then(|| BatchCoalescer::new(Arc::clone(schema), batch_size)),
+                pending: 0,
                 batches: VecDeque::new(),
                 batches_bytes: 0,
                 spill_file: None,
@@ -139,10 +211,15 @@ impl FinalBuckets {
             level,
             num_group_columns,
             buckets,
+            schema: Arc::clone(schema),
+            scatter,
             spill_manager,
             batch_size,
             min_compaction_rows,
+            metrics,
             hashes: vec![],
+            ids: vec![],
+            cuts: vec![],
             bucket_sizes: vec![0; NUM_BUCKETS],
             reordered_indices: vec![],
         }
@@ -177,13 +254,182 @@ impl FinalBuckets {
         self.hashes.clear();
         self.hashes.resize(num_rows, 0);
         create_hashes(group_columns, &BUCKET_HASH_SEED, &mut self.hashes)?;
+        let shift = self.level * BUCKET_BITS;
+        self.ids.clear();
+        self.ids.extend(
+            self.hashes
+                .iter()
+                .map(|&hash| (((hash >> shift) as usize) & (NUM_BUCKETS - 1)) as u8),
+        );
+
+        let bytes = match self.scatter.is_some() {
+            true => self.scatter_batch(batch)?,
+            false => self.take_batch(batch)?,
+        };
+        self.metrics.rows.add(num_rows);
+        self.metrics.bytes.add(bytes);
+        Ok(())
+    }
+
+    /// Writes every row of `batch` once, into the rows in progress of its
+    /// bucket. Returns the bytes written.
+    fn scatter_batch(&mut self, batch: &RecordBatch) -> Result<usize> {
+        let num_rows = batch.num_rows();
+        let batch_size = self.batch_size;
+
+        // The rows after which an in-memory bucket holds a full batch. A
+        // spilled bucket takes this batch's rows as one batch of its own.
+        let mut fill = [0usize; NUM_BUCKETS];
+        let mut limit = [usize::MAX; NUM_BUCKETS];
+        for ((fill, limit), bucket) in fill.iter_mut().zip(&mut limit).zip(&self.buckets)
+        {
+            if bucket.spill_file.is_none() {
+                *fill = bucket.pending;
+                *limit = batch_size;
+            }
+        }
+        let mut counts = [0usize; NUM_BUCKETS];
+        self.cuts.clear();
+        for (row, &id) in self.ids.iter().enumerate() {
+            let id = id as usize;
+            counts[id] += 1;
+            fill[id] += 1;
+            if fill[id] == limit[id] {
+                fill[id] = 0;
+                self.cuts.push((row + 1, id));
+            }
+        }
+
+        let mut bytes = 0;
+        let mut start = 0;
+        let cuts = std::mem::take(&mut self.cuts);
+        let ends = cuts
+            .iter()
+            .map(|&(end, full)| (end, Some(full)))
+            .chain(std::iter::once((num_rows, None)));
+        for (end, full) in ends {
+            if end > start {
+                bytes += self.scatter_rows(batch, start, end, &counts);
+            }
+            if let Some(full) = full {
+                debug_assert_eq!(self.buckets[full].pending, batch_size);
+                self.hand_off(full)?;
+            }
+            start = end;
+        }
+        self.cuts = cuts;
+
+        // A spilled bucket holds no memory: its rows go straight to the file
+        // and are combined into batches when read back.
+        for index in 0..NUM_BUCKETS {
+            if self.buckets[index].spill_file.is_some() && counts[index] > 0 {
+                let rows = self.finish_pending(index)?;
+                if let Some(spill_file) = &mut self.buckets[index].spill_file {
+                    spill_file.append_batch(&rows)?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Appends the rows `start..end` of `batch` to their buckets, none of
+    /// which reaches `batch_size` rows before the last of them.
+    fn scatter_rows(
+        &mut self,
+        batch: &RecordBatch,
+        start: usize,
+        end: usize,
+        batch_counts: &[usize; NUM_BUCKETS],
+    ) -> usize {
+        let ids = &self.ids[start..end];
+        let mut counts = [0usize; NUM_BUCKETS];
+        for &id in ids {
+            counts[id as usize] += 1;
+        }
+        let Some(columns) = self.scatter.as_mut() else {
+            return 0;
+        };
+        let mut bytes = 0;
+        for (column, source) in columns.iter_mut().zip(batch.columns()) {
+            for (index, bucket) in self.buckets.iter().enumerate() {
+                if counts[index] > 0 {
+                    // A first allocation takes a whole batch in memory, and
+                    // all of this batch's rows of a spilled bucket
+                    let at_least = match bucket.spill_file {
+                        None => self.batch_size,
+                        Some(_) => batch_counts[index],
+                    };
+                    column.reserve(index, counts[index], at_least);
+                }
+            }
+            bytes += column.scatter(source, start, ids, &counts);
+        }
+        for (bucket, &count) in self.buckets.iter_mut().zip(&counts) {
+            bucket.pending += count;
+            if bucket.spill_file.is_none() {
+                bucket.rows += count;
+            }
+        }
+        bytes
+    }
+
+    /// Hands the rows in progress of a bucket over as its next batch.
+    fn hand_off(&mut self, index: usize) -> Result<()> {
+        if self.buckets[index].pending > 0 {
+            let rows = self.finish_pending(index)?;
+            let bucket = &mut self.buckets[index];
+            bucket.batches_bytes += rows.get_array_memory_size();
+            bucket.batches.push_back(rows);
+        }
+        Ok(())
+    }
+
+    /// The rows in progress of a bucket, as one batch.
+    fn finish_pending(&mut self, index: usize) -> Result<RecordBatch> {
+        let bucket = &mut self.buckets[index];
+        let rows = std::mem::take(&mut bucket.pending);
+        let columns = self
+            .scatter
+            .iter_mut()
+            .flatten()
+            .map(|column| column.finish(index))
+            .collect();
+        let options = RecordBatchOptions::new().with_row_count(Some(rows));
+        Ok(RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &options,
+        )?)
+    }
+
+    /// Ends the bucket's rows in progress as a batch, wherever they are.
+    fn finish_buffered(&mut self, index: usize) -> Result<()> {
+        match self.buckets[index].coalescer.as_mut() {
+            Some(coalescer) => coalescer.finish_buffered_batch()?,
+            None => self.hand_off(index)?,
+        }
+        self.buckets[index].collect_completed()
+    }
+
+    /// Memory held by the rows in progress of a bucket
+    fn pending_size(&self, index: usize) -> usize {
+        match (&self.buckets[index].coalescer, &self.scatter) {
+            (Some(coalescer), _) => coalescer.size(),
+            (None, Some(columns)) => columns.iter().map(|column| column.size(index)).sum(),
+            (None, None) => 0,
+        }
+    }
+
+    /// Routes `batch` the general way: sorts its rows by bucket with one
+    /// `take` and pushes each bucket's slice into the bucket's coalescer,
+    /// which copies it. Returns an estimate of the bytes written.
+    fn take_batch(&mut self, batch: &RecordBatch) -> Result<usize> {
+        let num_rows = batch.num_rows();
 
         // Counting sort of the row indices by bucket
-        let shift = self.level * BUCKET_BITS;
-        let bucket_of = |hash: u64| ((hash >> shift) as usize) & (NUM_BUCKETS - 1);
         self.bucket_sizes.fill(0);
-        for &hash in &self.hashes {
-            self.bucket_sizes[bucket_of(hash)] += 1;
+        for &id in &self.ids {
+            self.bucket_sizes[id as usize] += 1;
         }
         let mut starts = [0u32; NUM_BUCKETS];
         let mut next = 0;
@@ -194,8 +440,8 @@ impl FinalBuckets {
         self.reordered_indices.clear();
         self.reordered_indices.resize(num_rows, 0);
         let mut cursors = starts;
-        for (row, &hash) in self.hashes.iter().enumerate() {
-            let cursor = &mut cursors[bucket_of(hash)];
+        for (row, &id) in self.ids.iter().enumerate() {
+            let cursor = &mut cursors[id as usize];
             self.reordered_indices[*cursor as usize] = row as u32;
             *cursor += 1;
         }
@@ -208,6 +454,7 @@ impl FinalBuckets {
         let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
         let reordered =
             RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+        let bytes = 2 * reordered.get_array_memory_size();
 
         for (bucket, (&start, &size)) in self
             .buckets
@@ -218,20 +465,21 @@ impl FinalBuckets {
                 continue;
             }
             let slice = reordered.slice(start as usize, size as usize);
-            match &mut bucket.spill_file {
+            match (&mut bucket.spill_file, &mut bucket.coalescer) {
                 // A spilled bucket holds no memory: its rows go straight to
                 // the file and are combined into batches when read back.
-                Some(spill_file) => {
+                (Some(spill_file), _) => {
                     spill_file.append_batch(&slice)?;
                 }
-                None => {
-                    bucket.coalescer.push_batch(slice)?;
+                (None, Some(coalescer)) => {
+                    coalescer.push_batch(slice)?;
                     bucket.rows += size as usize;
                     bucket.collect_completed()?;
                 }
+                (None, None) => unreachable!("a bucket routed by take has a coalescer"),
             }
         }
-        Ok(())
+        Ok(bytes)
     }
 
     /// Returns a bucket that is due for compaction, if any.
@@ -244,10 +492,9 @@ impl FinalBuckets {
     /// Removes and returns the rows of an in-memory bucket, to be followed by
     /// [`Self::put_compacted`].
     pub(super) fn take_bucket(&mut self, index: usize) -> Result<Vec<RecordBatch>> {
+        debug_assert!(self.buckets[index].spill_file.is_none());
+        self.finish_buffered(index)?;
         let bucket = &mut self.buckets[index];
-        debug_assert!(bucket.spill_file.is_none());
-        bucket.coalescer.finish_buffered_batch()?;
-        bucket.collect_completed()?;
         bucket.batches_bytes = 0;
         Ok(bucket.batches.drain(..).collect())
     }
@@ -284,11 +531,11 @@ impl FinalBuckets {
 
     /// Memory held by the buckets
     pub(super) fn memory_size(&self) -> usize {
-        self.buckets
-            .iter()
-            .map(|bucket| bucket.batches_bytes + bucket.coalescer.size())
+        (0..NUM_BUCKETS)
+            .map(|index| self.buckets[index].batches_bytes + self.pending_size(index))
             .sum::<usize>()
             + self.hashes.capacity() * size_of::<u64>()
+            + self.ids.capacity()
     }
 
     /// Spills the in-memory batches of the largest bucket, which from then on
@@ -298,21 +545,25 @@ impl FinalBuckets {
         let Some(spill_manager) = &self.spill_manager else {
             return Ok(false);
         };
-        let Some(bucket) = self
-            .buckets
-            .iter_mut()
-            .filter(|bucket| bucket.spill_file.is_none() && bucket.rows > 0)
-            .max_by_key(|bucket| bucket.batches_bytes + bucket.coalescer.size())
+        let Some(index) = (0..NUM_BUCKETS)
+            .filter(|&index| {
+                let bucket = &self.buckets[index];
+                bucket.spill_file.is_none() && bucket.rows > 0
+            })
+            .max_by_key(|&index| self.buckets[index].batches_bytes + self.pending_size(index))
         else {
             return Ok(false);
         };
-        bucket.spill_file =
+        self.buckets[index].spill_file =
             Some(spill_manager.create_in_progress_file("FinalHashAggregateBucket")?);
         // Rows that do not form a full batch yet are spilled as well, and the
-        // coalescer is replaced to give up the buffers it allocated.
-        bucket.coalescer.finish_buffered_batch()?;
-        bucket.collect_completed()?;
-        bucket.coalescer = BatchCoalescer::new(bucket.coalescer.schema(), 1);
+        // coalescer is replaced to give up the buffers it allocated. Finished
+        // scatter columns hold no buffers for the bucket.
+        self.finish_buffered(index)?;
+        let bucket = &mut self.buckets[index];
+        if let Some(coalescer) = &mut bucket.coalescer {
+            *coalescer = BatchCoalescer::new(coalescer.schema(), 1);
+        }
         Ok(true)
     }
 
@@ -322,11 +573,12 @@ impl FinalBuckets {
     }
 
     /// Finishes the buckets and returns the non-empty ones.
-    pub(super) fn into_sources(self) -> Result<Vec<BucketSource>> {
+    pub(super) fn into_sources(mut self) -> Result<Vec<BucketSource>> {
         let mut sources = Vec::with_capacity(NUM_BUCKETS);
-        for mut bucket in self.buckets {
-            bucket.coalescer.finish_buffered_batch()?;
-            bucket.collect_completed()?;
+        for index in 0..NUM_BUCKETS {
+            self.finish_buffered(index)?;
+        }
+        for bucket in self.buckets {
             match bucket.spill_file {
                 Some(mut spill_file) => {
                     let spill_manager = self
@@ -355,9 +607,11 @@ impl Bucket {
     /// Moves the batches the coalescer has completed to where the bucket
     /// lives: the spill file if it has been spilled, memory otherwise.
     fn collect_completed(&mut self) -> Result<()> {
-        while let Some(batch) = self.coalescer.next_completed_batch() {
-            self.batches_bytes += batch.get_array_memory_size();
-            self.batches.push_back(batch);
+        if let Some(coalescer) = &mut self.coalescer {
+            while let Some(batch) = coalescer.next_completed_batch() {
+                self.batches_bytes += batch.get_array_memory_size();
+                self.batches.push_back(batch);
+            }
         }
         if let Some(spill_file) = &mut self.spill_file {
             for batch in self.batches.drain(..) {
@@ -457,7 +711,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("v", DataType::Int64, false),
         ]));
-        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None);
+        let mut buckets = FinalBuckets::new(&schema, 2, 1024, 0, None, RouteMetrics::default());
         // the same keys arrive in two different batches
         buckets.route(&test_batch(&schema, 0..20_000))?;
         buckets.route(&test_batch(&schema, 10_000..30_000))?;
@@ -501,13 +755,13 @@ mod tests {
             Field::new("v", DataType::Int64, false),
         ]));
         // Rows of one level-0 bucket must spread again at level 1
-        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None);
+        let mut level0 = FinalBuckets::new(&schema, 1, 1024, 0, None, RouteMetrics::default());
         level0.route(&test_batch(&schema, 0..50_000))?;
         let source = level0.into_sources()?.swap_remove(0);
         let BucketSource::Memory { batches, .. } = source else {
             unreachable!()
         };
-        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None);
+        let mut level1 = FinalBuckets::new(&schema, 1, 1024, 1, None, RouteMetrics::default());
         for batch in &batches {
             level1.route(batch)?;
         }

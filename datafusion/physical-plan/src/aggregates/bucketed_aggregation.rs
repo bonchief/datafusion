@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 
 use super::AggregateExec;
 use super::aggregate_hash_table::{AggregateHashTable, FinalMarker};
-use super::final_buckets::{FinalBuckets, MAX_BUCKET_LEVELS};
+use super::final_buckets::{FinalBuckets, MAX_BUCKET_LEVELS, RouteMetrics};
 use crate::SendableRecordBatchStream;
 use crate::metrics;
 use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
@@ -53,6 +53,8 @@ pub(super) struct BucketedAggregation {
     bucket_splits: metrics::Count,
     /// Number of times the rows of a bucket were replaced by their aggregated state
     bucket_compactions: metrics::Count,
+    /// Rows routed into buckets and the bytes routing them wrote
+    route_metrics: RouteMetrics,
 }
 
 /// What [`BucketedAggregation::output_stream`] works with while it runs.
@@ -79,6 +81,11 @@ impl BucketedAggregation {
             MetricBuilder::new(&agg.metrics).counter("bucket_splits", partition);
         let bucket_compactions =
             MetricBuilder::new(&agg.metrics).counter("bucket_compactions", partition);
+        let route_metrics = RouteMetrics {
+            rows: MetricBuilder::new(&agg.metrics).counter("bucket_routed_rows", partition),
+            bytes: MetricBuilder::new(&agg.metrics)
+                .counter("bucket_routed_bytes", partition),
+        };
         Self {
             threshold,
             agg,
@@ -89,6 +96,7 @@ impl BucketedAggregation {
             spill_manager,
             bucket_splits,
             bucket_compactions,
+            route_metrics,
         }
     }
 
@@ -135,6 +143,7 @@ impl BucketedAggregation {
             self.batch_size,
             level,
             self.spill_manager.clone(),
+            self.route_metrics.clone(),
         );
         self.bucket_splits.add(1);
         buckets.expect_kept(kept);
