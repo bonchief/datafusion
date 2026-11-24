@@ -120,11 +120,7 @@ impl SkipAggregationProbe {
         if self.window_rows < self.probe_rows_threshold {
             return;
         }
-        if self.recent_rows
-            >= self
-                .probe_rows_threshold
-                .saturating_mul(HISTORY_WINDOWS)
-        {
+        if self.recent_rows >= self.probe_rows_threshold.saturating_mul(HISTORY_WINDOWS) {
             self.recent_rows /= 2;
             self.recent_groups /= 2;
         }

@@ -1608,9 +1608,7 @@ mod tests {
         let mut rows = vec![];
         for batch in &batches {
             let groups = batch.column(0).as_primitive::<Int32Type>();
-            let counts = batch
-                .column(1)
-                .as_primitive::<Int64Type>();
+            let counts = batch.column(1).as_primitive::<Int64Type>();
             rows.extend(
                 groups
                     .values()

@@ -40,7 +40,7 @@ use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
 
-use hashbrown::hash_table::HashTable;
+use hashbrown::hash_table::{Entry, HashTable};
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -543,36 +543,39 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
+        let stored_groups = self.group_values[0].len();
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            let entry = self
-                .map
-                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
+            // One probe finds the bucket or the slot a new group goes into,
+            // rather than a lookup and then a second probe to insert.
+            let entry = self.map.entry(
+                target_hash,
+                |(exist_hash, _)| target_hash == *exist_hash,
+                |(hash, _)| *hash,
+            );
 
-            let Some((_, group_index_view)) = entry else {
-                // 1. Bucket not found case
-                // Build `new inlined group index view`
-                let current_group_idx = self.group_values[0].len()
-                    + self.vectorized_operation_buffers.append_row_indices.len();
-                let group_index_view =
-                    GroupIndexView::new_inlined(current_group_idx as u64);
+            let group_index_view = match entry {
+                Entry::Occupied(occupied) => occupied.get().1,
+                Entry::Vacant(vacant) => {
+                    // 1. Bucket not found case
+                    // Build `new inlined group index view` and insert it
+                    // with its hash into `map`
+                    let current_group_idx = stored_groups
+                        + self.vectorized_operation_buffers.append_row_indices.len();
+                    vacant.insert((
+                        target_hash,
+                        GroupIndexView::new_inlined(current_group_idx as u64),
+                    ));
 
-                // Insert the `group index view` and its hash into `map`
-                // for hasher function, use precomputed hash value
-                self.map.insert_accounted(
-                    (target_hash, group_index_view),
-                    |(hash, _)| *hash,
-                    &mut self.map_size,
-                );
+                    // Add row index to `vectorized_append_row_indices`
+                    self.vectorized_operation_buffers
+                        .append_row_indices
+                        .push(row);
 
-                // Add row index to `vectorized_append_row_indices`
-                self.vectorized_operation_buffers
-                    .append_row_indices
-                    .push(row);
+                    // Set group index to row in `groups`
+                    groups[row] = current_group_idx;
 
-                // Set group index to row in `groups`
-                groups[row] = current_group_idx;
-
-                continue;
+                    continue;
+                }
             };
 
             // 2. bucket found
@@ -600,6 +603,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .push(group_index);
             }
         }
+        self.map_size = self.map.capacity() * size_of::<(u64, GroupIndexView)>();
     }
 
     /// Perform `vectorized_append`` for `rows` in `vectorized_append_row_indices`
@@ -1327,8 +1331,7 @@ mod tests {
 
     use arrow::array::{
         Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
-        Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
     use arrow::datatypes::{
@@ -2285,6 +2288,34 @@ mod tests {
             expected
         );
         assert_eq!(group_values.len(), data_set.expected_batch.num_rows());
+    }
+
+    #[test]
+    fn vectorized_intern_grows_while_it_inserts() -> Result<()> {
+        // Every batch adds groups that grow the table many times over within
+        // the pass that inserts them; each group keeps its index, a repeat
+        // finds it, and the table's growth is counted in `size`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8View, true),
+        ]));
+        let mut group_values = GroupValuesColumn::<false>::try_new(schema)?;
+        let batch = |keys: std::ops::Range<i32>| -> Vec<ArrayRef> {
+            vec![
+                Arc::new(Int32Array::from_iter_values(keys.clone().map(|k| k / 2))),
+                Arc::new(StringViewArray::from_iter(keys.map(|k| {
+                    (k % 5 != 0).then(|| format!("a key longer than twelve bytes {k}"))
+                }))),
+            ]
+        };
+        let mut groups = vec![];
+        group_values.intern(&batch(0..3000), &mut groups)?;
+        assert_eq!(groups, (0..3000).collect::<Vec<_>>());
+        group_values.intern(&batch(1500..6000), &mut groups)?;
+        assert_eq!(groups, (1500..6000).collect::<Vec<_>>());
+        assert_eq!(group_values.len(), 6000);
+        assert!(group_values.size() >= group_values.map.capacity() * 16);
+        Ok(())
     }
 
     #[test]
