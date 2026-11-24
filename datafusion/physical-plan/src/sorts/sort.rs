@@ -1025,6 +1025,7 @@ impl ExternalSorter {
 
         let expressions = self.expr.clone();
         let batch_size = self.batch_size;
+        let merge_pool = Arc::clone(&self.merge_pool);
         let elapsed_compute = self.metrics.baseline.elapsed_compute().clone();
 
         Ok(async move {
@@ -1046,16 +1047,29 @@ impl ExternalSorter {
                 .map(|batch| counter.count_batch(batch))
                 .collect();
             sizes.reverse();
+            // The sorted output can exceed the run's reservation, by the
+            // allocator rounding of each chunk's buffers when its input
+            // shares buffers with other runs. Borrow the excess from spill
+            // workspace already reserved, which this sort holds at spill
+            // time when the pool may be full; only what that does not cover
+            // is asked of the pool.
+            let total = counter.memory_usage();
+            let mut workspace =
+                merge_pool.borrow(total.saturating_sub(reservation.size()));
             reservation
-                .try_resize(counter.memory_usage())
+                .try_resize(total - workspace.size())
                 .map_err(Self::err_with_oom_context)?;
 
+            // Return borrowed workspace first so the merge's cursors can reuse
+            // it immediately. Both release on stream drop.
             let batches =
                 sorted_batches
                     .into_iter()
                     .zip(sizes)
                     .map(move |(batch, size)| {
-                        reservation.shrink(size);
+                        let borrowed = size.min(workspace.size());
+                        workspace.shrink(borrowed);
+                        reservation.shrink(size - borrowed);
                         Ok(batch)
                     });
             Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(

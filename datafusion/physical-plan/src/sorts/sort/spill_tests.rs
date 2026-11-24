@@ -679,6 +679,76 @@ async fn test_sort_preparation_keeps_output_reserved() -> Result<()> {
     Ok(())
 }
 
+/// A sorted run whose chunks' buffers round up past the bytes its input
+/// slice was reserved at borrows the excess from the retained merge
+/// workspace, so it is sorted while every other byte of the pool is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sorted_excess_borrows_workspace_while_the_pool_is_full() -> Result<()> {
+    // Each sorted chunk of a text column carries one more offset than its
+    // share of the slice, and its buffers are allocated in 64-byte blocks,
+    // so the run's output is larger than the slice it was reserved at.
+    let (rows, batch_size) = (4099, 1001);
+    let parent = RecordBatch::try_from_iter([(
+        "key",
+        Arc::new(StringArray::from_iter_values(
+            (0..8 * rows).rev().map(|i| format!("{i:07}")),
+        )) as ArrayRef,
+    )])?;
+    // All runs share one input buffer, so each run is reserved at its slice.
+    let batches = (0..8)
+        .map(|run| parent.slice(run * rows, rows))
+        .collect::<Vec<_>>();
+    let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(Column::new(
+        "key", 0,
+    )))]
+    .into();
+    let sorted = sort_batch_chunked(&batches[0], &ordering, batch_size)?;
+    let sorted_bytes = sorted
+        .iter()
+        .map(get_record_batch_memory_size)
+        .sum::<usize>();
+    assert!(sorted_bytes > batches[0].get_sliced_size()?);
+    let input_bytes = get_reserved_bytes_for_record_batch(&parent)?;
+    let merge_workspace = sorted_bytes * batches.len();
+    // Room to buffer every run without spilling; what is left is taken below.
+    let capacity = 2 * input_bytes + merge_workspace;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(capacity)))
+        .build_arc()?;
+    let mut sorter = ExternalSorter::new(
+        0,
+        batches[0].schema(),
+        ordering.clone(),
+        batch_size,
+        merge_workspace,
+        0,
+        SpillCompression::Uncompressed,
+        &ExecutionPlanMetricsSet::new(),
+        Arc::clone(&runtime),
+    )?;
+    for batch in &batches {
+        sorter.insert_batch(batch.clone()).await?;
+    }
+    sorter.merge_reservation.free();
+    // Every byte the sorter does not hold is taken.
+    let other = MemoryConsumer::new("other").register(&runtime.memory_pool);
+    other.try_grow(capacity - runtime.memory_pool.reserved())?;
+
+    let stream = sorter.in_mem_sort_stream(false, false).await?;
+    let output: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let expected = sort_batch(
+        &concat_batches(&batches[0].schema(), &batches)?,
+        &ordering,
+        None,
+    )?;
+    assert_eq!(concat_batches(&batches[0].schema(), &output)?, expected);
+    drop(sorter);
+    drop(other);
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_single_batch_spill_preserves_workspace_after_limit_decreases() -> Result<()>
 {
