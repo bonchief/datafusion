@@ -24,6 +24,7 @@ use crate::joins::sort_merge_join::filter::{
 use crate::joins::sort_merge_join::metrics::SortMergeJoinMetrics;
 use crate::joins::utils::{JoinFilter, JoinKeyComparator};
 use crate::metrics::Time;
+use crate::repartition::compact;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAdapter};
 use crate::{PhysicalExpr, SendableRecordBatchStream};
@@ -33,12 +34,14 @@ use arrow::compute::{
     self, BatchCoalescer, SortOptions, concat_batches, filter_record_batch, interleave,
     take_arrays,
 };
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatchOptions;
 use datafusion_common::cast::as_uint64_array;
 use datafusion_common::instant::Instant;
+use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::{
-    DataFusionError, JoinSide, JoinType, NullEquality, Result, exec_err, internal_err,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, exec_err,
+    internal_datafusion_err, internal_err,
 };
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -240,6 +243,20 @@ pub(super) enum FilterState {
 /// A buffered batch that contains contiguous rows with same join key
 ///
 /// `BufferedBatch` can exist as either an in-memory `RecordBatch` or a `SpillFile`.
+///
+/// # Memory accounting
+///
+/// A buffered batch is charged for what it alone keeps alive, each buffer
+/// once. A view column that holds more than twice the bytes its views
+/// reference is compacted when the batch is buffered, so a batch cut from a
+/// sorted run, whose views point into the whole run's text, no longer keeps
+/// that text alive; its key arrays are evaluated from the compacted batch, and
+/// a key array that is one of its columns shares that column's buffers and is
+/// not charged again. While the batch is spilled, its key arrays stay in
+/// memory and are charged within the pool; when it refuses them, the batches
+/// still in memory spill first, and a pool that cannot hold the keys of every
+/// buffered batch refuses the join rather than being exceeded. A batch read
+/// back from a spill is charged at the size it was read at.
 #[derive(Debug)]
 pub(super) struct BufferedBatch {
     /// Represents in memory or spilled record batch
@@ -279,24 +296,13 @@ impl BufferedBatch {
         range: Range<usize>,
         on_column: &[PhysicalExprRef],
     ) -> Result<Self> {
+        // The copy writes only the bytes this batch's views reference, and
+        // only for a column holding more than twice that, so it copies less
+        // than it lets go.
+        let batch = compact(&batch)?;
         let join_arrays = join_arrays(&batch, on_column)?;
-
-        // Estimation is calculated as
-        //   inner batch size
-        // + join keys size
-        // + worst case null_joined (as vector capacity * element size)
-        // + Range size
-        // + size of this estimation
-        let join_arrays_mem: usize = join_arrays
-            .iter()
-            .map(|arr| arr.get_array_memory_size())
-            .sum();
-
-        let size_estimation = batch.get_array_memory_size()
-            + join_arrays_mem
-            + batch.num_rows().next_power_of_two() * size_of::<usize>()
-            + size_of::<Range<usize>>()
-            + size_of::<usize>();
+        let join_arrays_mem = held(None, &join_arrays)?;
+        let size_estimation = held(Some(&batch), &join_arrays)? + overhead(&batch);
 
         let num_rows = batch.num_rows();
         Ok(BufferedBatch {
@@ -311,6 +317,39 @@ impl BufferedBatch {
             num_rows,
         })
     }
+}
+
+/// Bytes `batch` and `keys` keep alive, each buffer and array object once:
+/// a key array that is one of the batch's columns adds nothing.
+pub(super) fn held(batch: Option<&RecordBatch>, keys: &[ArrayRef]) -> Result<usize> {
+    let mut counter = RecordBatchMemoryCounter::new();
+    if let Some(batch) = batch {
+        counter.count_batch_with_array_overhead(batch);
+    }
+    let fields: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            Field::new(format!("key{index}"), key.data_type().clone(), true)
+        })
+        .collect();
+    let rows = keys.first().map_or(0, |key| key.len());
+    let keys = RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        keys.to_vec(),
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )?;
+    counter.count_batch_with_array_overhead(&keys);
+    Ok(counter.memory_usage())
+}
+
+/// Bookkeeping a buffered batch adds beside its arrays: worst case
+/// `null_joined` (as vector capacity × element size), its range and its
+/// estimate.
+pub(super) fn overhead(batch: &RecordBatch) -> usize {
+    batch.num_rows().next_power_of_two() * size_of::<usize>()
+        + size_of::<Range<usize>>()
+        + size_of::<usize>()
 }
 
 // TODO: Spill join arrays (https://github.com/apache/datafusion/pull/17429)
@@ -1111,9 +1150,13 @@ impl MaterializingSortMergeJoinStream {
                 match spill_stream.next().await.transpose()? {
                     Some(batch) => {
                         // Transition the batch back to InMemory
+                        // The batch is back in memory: charge it at the
+                        // size it was read at (the spill compacted its
+                        // views), beside the key arrays kept in memory.
+                        bb.size_estimation =
+                            held(Some(&batch), &bb.join_arrays)? + overhead(&batch);
                         bb.batch = BufferedBatchState::InMemory(batch);
                         self.spilled_batch_count -= 1;
-                        // The batch is back in memory, so we must account for its size.
                         let newly_allocated =
                             bb.size_estimation.saturating_sub(bb.reserved_amount);
                         self.reservation.grow(newly_allocated);
@@ -1202,6 +1245,42 @@ impl MaterializingSortMergeJoinStream {
         Some(buffered_batch)
     }
 
+    /// Charges the key arrays of a batch about to be spilled, spilling the
+    /// buffered batches still in memory, oldest first, while the pool
+    /// refuses them. A pool that cannot hold the keys once every buffered
+    /// batch is spilled refuses the join rather than being exceeded.
+    fn charge_keys(&mut self, keys: usize) -> Result<()> {
+        loop {
+            let refused = match self.reservation.try_grow(keys) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let Some(held) = self
+                .buffered_data
+                .batches
+                .iter_mut()
+                .find(|batch| matches!(batch.batch, BufferedBatchState::InMemory(_)))
+            else {
+                return Err(refused);
+            };
+            let BufferedBatchState::InMemory(batch) = &held.batch else {
+                return internal_err!("Buffered batch has empty body");
+            };
+            let spill_file = self
+                .spill_manager
+                .spill_record_batch_and_finish(
+                    std::slice::from_ref(batch),
+                    "sort_merge_join_buffered_spill",
+                )?
+                .ok_or_else(|| internal_datafusion_err!("Spilled no buffered batch"))?;
+            held.batch = BufferedBatchState::Spilled(spill_file);
+            self.spilled_batch_count += 1;
+            self.reservation
+                .shrink(held.reserved_amount.saturating_sub(held.join_arrays_mem));
+            held.reserved_amount = held.reserved_amount.min(held.join_arrays_mem);
+        }
+    }
+
     fn allocate_reservation(&mut self, mut buffered_batch: BufferedBatch) -> Result<()> {
         match self.reservation.try_grow(buffered_batch.size_estimation) {
             Ok(_) => {
@@ -1216,6 +1295,11 @@ impl MaterializingSortMergeJoinStream {
 
                 match buffered_batch.batch {
                     BufferedBatchState::InMemory(batch) => {
+                        // The key arrays stay in memory after the batch is
+                        // spilled: the comparator needs them for key boundary
+                        // detection. They are charged within the pool.
+                        let join_arrays_mem = buffered_batch.join_arrays_mem;
+                        self.charge_keys(join_arrays_mem)?;
                         let spill_file = self
                             .spill_manager
                             .spill_record_batch_and_finish(
@@ -1227,16 +1311,6 @@ impl MaterializingSortMergeJoinStream {
                         buffered_batch.batch = BufferedBatchState::Spilled(spill_file);
                         self.spilled_batch_count += 1;
 
-                        // Join key arrays remain in memory after the batch is
-                        // spilled — the comparator needs them for key boundary
-                        // detection. Force-grow the reservation so the pool
-                        // reflects actual memory usage even if this pushes
-                        // pool.reserved() above the configured limit. This is
-                        // safe because the memory is physically consumed and
-                        // not tracking it would let other operators over-allocate
-                        // against a stale pool view.
-                        let join_arrays_mem = buffered_batch.join_arrays_mem;
-                        self.reservation.grow(join_arrays_mem);
                         buffered_batch.reserved_amount = join_arrays_mem;
                         self.join_metrics
                             .peak_mem_used()

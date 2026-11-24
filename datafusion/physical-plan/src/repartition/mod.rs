@@ -398,7 +398,7 @@ impl OutputChannel {
 /// views reference rewritten into buffers of exactly those bytes
 /// ([`arrow::array::GenericByteViewArray::gc`]); its other columns, and a view column
 /// within that bound, are shared as they are.
-fn compact(batch: &RecordBatch) -> Result<RecordBatch> {
+pub(crate) fn compact(batch: &RecordBatch) -> Result<RecordBatch> {
     fn view<T: ByteViewType>(
         array: &arrow::array::ArrayRef,
     ) -> Option<arrow::array::ArrayRef> {

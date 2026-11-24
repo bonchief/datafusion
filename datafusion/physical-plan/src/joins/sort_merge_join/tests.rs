@@ -3330,7 +3330,8 @@ async fn overallocation_single_batch_spill() -> Result<()> {
 
     // Enable DiskManager to allow spilling
     let runtime = RuntimeEnvBuilder::new()
-        .with_memory_limit(100, 1.0)
+        // Holds the key arrays a spilled batch keeps in memory, not a batch.
+        .with_memory_limit(200, 1.0)
         .with_disk_manager_builder(
             DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
         )
@@ -3630,17 +3631,17 @@ async fn spill_join_arrays_memory_accounting() -> Result<()> {
 }
 
 /// Test the no-headroom scenario: pool is so tight that even
-/// join_arrays_mem exceeds the pool limit. With force-grow, the
-/// reservation still tracks the join_arrays unconditionally so the
-/// pool reflects actual memory usage.
+/// join_arrays_mem exceeds the pool limit. The key arrays a spilled batch
+/// keeps in memory are charged within the pool, so the join is refused
+/// rather than exceeding it.
 #[tokio::test]
 async fn spill_join_arrays_no_headroom() -> Result<()> {
     use arrow::array::Array;
 
     let join_arrays_mem = Int32Array::from(vec![1, 1]).get_array_memory_size();
 
-    // Pool smaller than join_arrays_mem: try_grow(size_estimation) fails → spill.
-    // Force-grow(join_arrays_mem) succeeds unconditionally → reserved_amount > 0.
+    // Pool smaller than join_arrays_mem: try_grow(size_estimation) fails, and
+    // so does charging the key arrays once nothing is left to spill.
     let memory_limit = join_arrays_mem / 2;
     assert!(
         memory_limit < join_arrays_mem,
@@ -3699,31 +3700,17 @@ async fn spill_join_arrays_no_headroom() -> Result<()> {
     )?;
 
     let stream = join.execute(0, task_ctx)?;
-    let result = common::collect(stream).await.unwrap();
-
-    assert!(!result.is_empty(), "Expected non-empty join result");
-
-    let metrics = join.metrics().unwrap();
+    let error = common::collect(stream).await.unwrap_err();
     assert!(
-        metrics.spill_count().unwrap() > 0,
-        "Expected spilling to occur"
+        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{error}"
     );
 
-    // Force-grow means peak_mem_used is always tracked, even when pool is tight.
-    let peak_mem = metrics
-        .sum_by_name("peak_mem_used")
-        .map(|m| m.as_usize())
-        .unwrap_or(0);
-    assert!(
-        peak_mem >= join_arrays_mem,
-        "peak_mem_used ({peak_mem}) should be >= join_arrays_mem ({join_arrays_mem})"
-    );
-
-    // Pool should be fully released (grow/shrink balanced)
+    // The refused keys were never charged, and the stream released the rest.
     assert_eq!(
         runtime.memory_pool.reserved(),
         0,
-        "All memory should be released after join completes"
+        "All memory should be released after the join fails"
     );
 
     Ok(())
@@ -3786,7 +3773,8 @@ async fn spill_with_filter_deferred() -> Result<()> {
     let join_types = [Left, Right, Full];
 
     let runtime = RuntimeEnvBuilder::new()
-        .with_memory_limit(100, 1.0)
+        // Holds the key arrays a spilled batch keeps in memory, not a batch.
+        .with_memory_limit(200, 1.0)
         .with_disk_manager_builder(
             DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
         )
@@ -3977,7 +3965,8 @@ async fn spill_full_join_filter_not_matched() -> Result<()> {
     let filter = build_c1_lt_c2_filter(&left.schema(), &right.schema());
 
     let runtime = RuntimeEnvBuilder::new()
-        .with_memory_limit(100, 1.0)
+        // Holds the key arrays a spilled batch keeps in memory, not a batch.
+        .with_memory_limit(200, 1.0)
         .with_disk_manager_builder(
             DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
         )
@@ -7196,8 +7185,9 @@ async fn spill_read_back_memory_accounting() -> Result<()> {
         + size_of::<std::ops::Range<usize>>()
         + size_of::<usize>();
 
-    // Memory limit too small for a full batch — forces spilling.
-    let memory_limit = size_estimation / 2;
+    // Memory limit too small for a full batch — forces spilling — and large
+    // enough for the key arrays the four spilled batches keep in memory.
+    let memory_limit = size_estimation - 1;
 
     // All rows share the same join key (b=1) to force multiple buffered
     // batches in the same key group — triggering spill read-back during
@@ -7394,6 +7384,149 @@ async fn spill_read_back_single_source() -> Result<()> {
         "All memory should be released after join completes"
     );
 
+    Ok(())
+}
+
+/// Buffered batches cut from one sorted run whose text column is a single
+/// view array of `RUN_ROWS` 1 KB values, each batch `rows` rows of it, keyed
+/// by `key(row)`. Every batch's views point into the whole run's buffers, so
+/// each batch alone reports their full size. Also returns those buffers'
+/// bytes.
+fn shared_text_side(
+    batches: usize,
+    rows: usize,
+    key: impl Fn(usize) -> i32,
+) -> (Arc<dyn ExecutionPlan>, usize) {
+    use arrow::array::{Array, StringViewArray};
+
+    const RUN_ROWS: usize = 4096;
+    let text = StringViewArray::from_iter_values(
+        (0..RUN_ROWS).map(|row| format!("{row:0>1024}")),
+    );
+    let shared: usize = text.data_buffers().iter().map(|b| b.capacity()).sum();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a2", DataType::Int32, false),
+        Field::new("b2", DataType::Int32, false),
+        Field::new("t2", DataType::Utf8View, false),
+    ]));
+    let side = (0..batches)
+        .map(|batch| {
+            let start = batch * rows;
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        (start..start + rows).map(|row| row as i32),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(
+                        (start..start + rows).map(&key),
+                    )),
+                    Arc::new(text.slice(start, rows)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    (build_table_from_batches(side), shared)
+}
+
+async fn run_inner_join(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    runtime: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+) -> Result<(Vec<RecordBatch>, Arc<SortMergeJoinExec>)> {
+    let on = vec![(
+        Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+        Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+    )];
+    let join = Arc::new(join(Arc::clone(left), Arc::clone(right), on, Inner)?);
+    let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+    let batches = common::collect(join.execute(0, task_ctx)?).await?;
+    Ok((batches, join))
+}
+
+/// Buffered batches whose views share one large run's buffers are charged
+/// for the bytes their own rows hold, so a join whose pool is smaller than
+/// those buffers runs in memory and returns every row.
+#[tokio::test]
+async fn buffered_views_sharing_a_large_buffer_stay_within_a_small_pool() -> Result<()> {
+    const BATCHES: usize = 8;
+    const ROWS: usize = 64;
+    let (right, shared) = shared_text_side(BATCHES, ROWS, |row| row as i32);
+    let keys: Vec<i32> = (0..(BATCHES * ROWS) as i32).collect();
+    let left = build_table(("a1", &keys), ("b1", &keys), ("c1", &keys));
+
+    // A quarter of the shared buffers: one buffered batch charged at their
+    // size cannot be admitted, and spilling is disabled.
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(shared / 4, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()?;
+    let (joined, join) = run_inner_join(&left, &right, Arc::clone(&runtime)).await?;
+
+    let (unbounded, _) =
+        run_inner_join(&left, &right, RuntimeEnvBuilder::new().build_arc()?).await?;
+    assert_eq!(
+        joined.iter().map(|b| b.num_rows()).sum::<usize>(),
+        BATCHES * ROWS
+    );
+    assert_eq!(
+        batches_to_sort_string(&joined),
+        batches_to_sort_string(&unbounded)
+    );
+    assert_eq!(join.metrics().unwrap().spill_count(), Some(0));
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+    Ok(())
+}
+
+/// Under a pool smaller than one buffered batch, a key group whose views
+/// share a large run's buffers spills every batch and reads them back for
+/// its output, each charged at the size it was read at, never at the shared
+/// buffers' size.
+#[tokio::test]
+async fn buffered_views_spill_and_read_back_at_their_own_size() -> Result<()> {
+    const BATCHES: usize = 4;
+    const ROWS: usize = 64;
+    let (right, shared) = shared_text_side(BATCHES, ROWS, |_| 1);
+    let left = build_table(
+        ("a1", &vec![0, 1]),
+        ("b1", &vec![1, 1]),
+        ("c1", &vec![2, 3]),
+    );
+
+    // Smaller than one compacted batch (64 values of 1 KB), larger than the
+    // key arrays of every batch in the group.
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(16 * 1024, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+        )
+        .build_arc()?;
+    let (joined, join) = run_inner_join(&left, &right, Arc::clone(&runtime)).await?;
+
+    let (unbounded, _) =
+        run_inner_join(&left, &right, RuntimeEnvBuilder::new().build_arc()?).await?;
+    assert_eq!(
+        joined.iter().map(|b| b.num_rows()).sum::<usize>(),
+        2 * BATCHES * ROWS
+    );
+    assert_eq!(
+        batches_to_sort_string(&joined),
+        batches_to_sort_string(&unbounded)
+    );
+    let metrics = join.metrics().unwrap();
+    assert!(metrics.spill_count().unwrap() >= BATCHES, "{metrics:?}");
+    let peak = metrics
+        .sum_by_name("peak_mem_used")
+        .map(|m| m.as_usize())
+        .unwrap();
+    assert!(
+        peak < shared,
+        "peak_mem_used ({peak}) should stay below the shared buffers ({shared})"
+    );
+    assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
 
